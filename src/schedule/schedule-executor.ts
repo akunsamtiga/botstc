@@ -160,7 +160,7 @@ export class ScheduleExecutor {
       const target = order.timeInMillis - EXECUTION_ADVANCE_MS;
       const timeUntil = target - now;
 
-      // Expired
+      // Expired — lebih dari 5 detik melewati window
       if (timeUntil < -EXECUTION_WINDOW_MS) {
         this.orders[i] = { ...order, isSkipped: true, skipReason: `Expired ${Math.abs(timeUntil)}ms ago` };
         changed = true;
@@ -168,20 +168,24 @@ export class ScheduleExecutor {
         continue;
       }
 
-      // Execute window
+      // Execute window: dari 0ms hingga -EXECUTION_WINDOW_MS (4900ms)
       if (timeUntil <= 0 && timeUntil >= -EXECUTION_WINDOW_MS) {
         if (this.activeMartingaleOrderId && this.activeMartingaleOrderId !== order.id) {
           this.orders[i] = { ...order, isSkipped: true, skipReason: 'Martingale aktif dari order lain' };
           changed = true;
           continue;
         }
+        if (timeUntil < -2000) {
+          this.logger.warn(`[${this.userId}] ⚠️ LATE EXECUTION ${order.time}: ${Math.abs(timeUntil)}ms (still within window)`);
+        }
         this.orders[i] = { ...order, isExecuted: true };
         changed = true;
-        this.executeOrder(this.orders[i]);
+        // isScheduledOrder = true → createdAt pakai floor(now/1000) tanpa +1
+        this.executeOrder(this.orders[i], true);
       }
     }
 
-    // Hapus order kemarin
+    // Hapus order hari kemarin yang sudah selesai
     const startToday = this.getStartOfJakartaDay();
     const before = this.orders.length;
     this.orders = this.orders.filter(o => !((o.isExecuted || o.isSkipped) && o.timeInMillis < startToday));
@@ -192,7 +196,7 @@ export class ScheduleExecutor {
 
   // ── Trade Execution ──────────────────────────
 
-  private async executeOrder(order: ScheduledOrder) {
+  private async executeOrder(order: ScheduledOrder, isScheduledOrder = true) {
     const isAlways = this.config.martingale.isEnabled && this.config.martingale.isAlwaysSignal;
     const lossState = this.alwaysSignalLossState;
     const hasLoss = isAlways && lossState?.hasOutstandingLoss;
@@ -201,7 +205,21 @@ export class ScheduleExecutor {
 
     this.logger.log(`[${this.userId}] 🚀 Execute ${order.time} ${order.trend.toUpperCase()} amount=${amount} step=${step}`);
 
-    const tradeData = this.buildTradeOrder(order.trend, amount);
+    let tradeData: TradeOrderData;
+    try {
+      // Order terjadwal: isScheduledOrder=true (createdAt = floor tanpa +1)
+      tradeData = this.buildTradeOrder(order.trend, amount, true);
+    } catch (err: any) {
+      this.logger.error(`[${this.userId}] ❌ Trade timing error: ${err.message}`);
+      this.callbacks.onLog({
+        id: uuidv4(), orderId: order.id, time: order.time,
+        trend: order.trend, amount, martingaleStep: step,
+        result: 'FAILED', executedAt: Date.now(),
+        note: `Timing error: ${err.message}`,
+      });
+      return;
+    }
+
     const dealId = await this.wsClient.placeTrade(tradeData);
 
     if (dealId) {
@@ -215,14 +233,13 @@ export class ScheduleExecutor {
       if (isAlways) this.advanceAlwaysSignalLoss(order, step, amount);
     }
 
-    const log: ExecutionLog = {
+    this.callbacks.onLog({
       id: uuidv4(), orderId: order.id, time: order.time,
       trend: order.trend, amount, martingaleStep: step,
       dealId: dealId ?? undefined,
       result: dealId ? undefined : 'FAILED',
       executedAt: Date.now(),
-    };
-    this.callbacks.onLog(log);
+    });
   }
 
   // ── Deal Result ──────────────────────────────
@@ -236,7 +253,6 @@ export class ScheduleExecutor {
     const orderIdx = this.orders.findIndex(o => o.activeDealId === dealId);
 
     if (orderIdx === -1) {
-      // Mungkin deal martingale
       if (this.activeMartingaleOrderId) {
         const mIdx = this.orders.findIndex(o => o.id === this.activeMartingaleOrderId);
         if (mIdx !== -1) this.processMartingaleResult(mIdx, isWin, isDraw, dealId);
@@ -293,6 +309,7 @@ export class ScheduleExecutor {
       } else {
         const next = step + 1;
         this.updateMartingaleStep(orderIdx, next);
+        // Martingale = instant trade → isScheduledOrder = false → createdAt pakai +1
         this.placeMartingaleTrade(order, next, this.calcAmount(next));
         this.logger.log(`[${this.userId}] 🔄 Martingale step ${next}/${max}`);
       }
@@ -300,10 +317,28 @@ export class ScheduleExecutor {
   }
 
   private async placeMartingaleTrade(order: ScheduledOrder, step: number, amount: number) {
-    const dealId = await this.wsClient.placeTrade(this.buildTradeOrder(order.trend, amount));
+    let tradeData: TradeOrderData;
+    try {
+      // Martingale/instant → isScheduledOrder = false → createdAt = floor(now/1000) + 1
+      tradeData = this.buildTradeOrder(order.trend, amount, false);
+    } catch (err: any) {
+      this.logger.error(`[${this.userId}] ❌ Martingale timing error step ${step}: ${err.message}`);
+      this.callbacks.onLog({
+        id: uuidv4(), orderId: order.id, time: order.time, trend: order.trend,
+        amount, martingaleStep: step,
+        result: 'FAILED', executedAt: Date.now(),
+        note: `Martingale timing error step ${step}: ${err.message}`,
+      });
+      return;
+    }
+
+    const dealId = await this.wsClient.placeTrade(tradeData);
     if (dealId) {
       const idx = this.orders.findIndex(o => o.id === order.id);
-      if (idx !== -1) { this.orders[idx] = { ...this.orders[idx], activeDealId: dealId }; this.callbacks.onOrdersUpdate(this.orders); }
+      if (idx !== -1) {
+        this.orders[idx] = { ...this.orders[idx], activeDealId: dealId };
+        this.callbacks.onOrdersUpdate(this.orders);
+      }
     }
     this.callbacks.onLog({
       id: uuidv4(), orderId: order.id, time: order.time, trend: order.trend,
@@ -376,8 +411,20 @@ export class ScheduleExecutor {
     const dur = this.martingaleStartTime ? now - this.martingaleStartTime : 0;
     const stepDur = o.martingaleState.lastUpdateTime ? now - o.martingaleState.lastUpdateTime : 0;
     if (dur > MARTINGALE_MAX_DURATION_MS || stepDur > STEP_STUCK_THRESHOLD_MS || o.martingaleState.isCompleted) {
-      this.logger.warn(`[${this.userId}] ⚠️ Force-complete stuck martingale`);
-      this.orders[idx] = { ...o, martingaleState: { ...o.martingaleState, isActive: false, isCompleted: true, finalResult: 'FAILED', failureReason: 'Timeout/stuck' } };
+      this.logger.warn(`[${this.userId}] ⚠️ Force-complete stuck martingale (dur=${dur}ms stepDur=${stepDur}ms)`);
+      this.orders[idx] = {
+        ...o,
+        martingaleState: {
+          ...o.martingaleState,
+          isActive: false, isCompleted: true,
+          finalResult: 'FAILED',
+          failureReason: dur > MARTINGALE_MAX_DURATION_MS
+            ? `Timeout: ${dur / 1000}s > ${MARTINGALE_MAX_DURATION_MS / 1000}s`
+            : stepDur > STEP_STUCK_THRESHOLD_MS
+              ? `Step stuck: ${stepDur / 1000}s at step ${o.martingaleState.currentStep}`
+              : 'Inconsistent state: already completed',
+        },
+      };
       this.activeMartingaleOrderId = undefined;
       this.martingaleStartTime = undefined;
       this.callbacks.onOrdersUpdate(this.orders);
@@ -408,20 +455,91 @@ export class ScheduleExecutor {
     }
   }
 
-  // ── Trade Builder ─────────────────────────────
+  // ── Trade Builder (sesuai logika Kotlin TradeManager) ──────
 
-  private buildTradeOrder(trend: TrendType, amount: number): TradeOrderData {
+  /**
+   * Membangun TradeOrderData dengan timing persis seperti Kotlin createTradeOrder().
+   *
+   * @param trend       - 'call' | 'put'
+   * @param amount      - nominal trade dalam satuan terkecil (cents)
+   * @param isScheduledOrder - true untuk order terjadwal (createdAt = floor tanpa +1)
+   *                          false untuk martingale/instant (createdAt = floor + 1)
+   *
+   * Alur (identik dengan Kotlin):
+   *  1. createdAtSeconds = floor(nowMs/1000) [+1 jika bukan scheduled]
+   *  2. secondsInMinute = createdAtSeconds % 60
+   *  3. expireAt awal:
+   *     - secondsInMinute <= 10 → createdAt + (60 - secondsInMinute)   ← boundary menit ini
+   *     - else               → createdAt + (120 - secondsInMinute)  ← boundary 2 menit
+   *  4. Koreksi: duration < 55 || > 120 → finalExpireAt = createdAt + 60
+   *  5. Validasi: duration < 45 → throw; duration > 125 → throw; expireAt <= createdAt → throw
+   *
+   * Catatan: expireAt dikirim dalam DETIK ke WebSocket, createdAt dalam MILIDETIK.
+   */
+  private buildTradeOrder(trend: TrendType, amount: number, isScheduledOrder: boolean): TradeOrderData {
     const nowMs = Date.now();
-    const nowSeconds = Math.floor(nowMs / 1000);
-    const secondsInMinute = nowSeconds % 60;
-    const minuteBoundary = nowSeconds + (60 - secondsInMinute);
-    const dur = minuteBoundary - nowSeconds;
-    const expireAt = (dur < 55 || dur > 120) ? nowSeconds + 60 : minuteBoundary;
+    const nowFloorSeconds = Math.floor(nowMs / 1000);
+
+    // Kotlin: scheduled = floor saja; instant/martingale = floor + 1
+    const createdAtSeconds = isScheduledOrder ? nowFloorSeconds : nowFloorSeconds + 1;
+    const secondsInMinute = createdAtSeconds % 60;
+
+    // Hitung expireAt awal (dalam detik)
+    let expireAtSeconds: number;
+    if (secondsInMinute <= 10) {
+      // Dekat awal menit → target boundary menit ini (~60 - posisi saat ini)
+      expireAtSeconds = createdAtSeconds + (60 - secondsInMinute);
+    } else {
+      // Lebih dari 10 detik → target boundary menit berikutnya (120 - posisi)
+      expireAtSeconds = createdAtSeconds + (120 - secondsInMinute);
+    }
+
+    const duration = expireAtSeconds - createdAtSeconds;
+
+    // Koreksi: jika durasi terlalu pendek (<55s) atau terlalu panjang (>120s), paksa 60s
+    let finalExpireAt: number;
+    if (duration < 55 || duration > 120) {
+      finalExpireAt = createdAtSeconds + 60;
+    } else {
+      finalExpireAt = expireAtSeconds;
+    }
+
+    const finalDuration = finalExpireAt - createdAtSeconds;
+
+    this.logger.debug(
+      `[${this.userId}] Trade timing | scheduled=${isScheduledOrder} ` +
+      `createdAt=${createdAtSeconds} expireAt=${finalExpireAt} duration=${finalDuration}s ` +
+      `secondsInMinute=${secondsInMinute}`,
+    );
+
+    // Validasi ketat seperti Kotlin
+    if (finalDuration < 45) {
+      throw new Error(
+        `Duration terlalu pendek: ${finalDuration}s (min 45s). ` +
+        `createdAt=${createdAtSeconds} expireAt=${finalExpireAt} secondsInMinute=${secondsInMinute}`,
+      );
+    }
+    if (finalDuration > 125) {
+      throw new Error(
+        `Duration terlalu panjang: ${finalDuration}s (max 125s). ` +
+        `createdAt=${createdAtSeconds} expireAt=${finalExpireAt} secondsInMinute=${secondsInMinute}`,
+      );
+    }
+    if (finalExpireAt <= createdAtSeconds) {
+      throw new Error(
+        `expire_at tidak valid: expire(${finalExpireAt}) <= created(${createdAtSeconds})`,
+      );
+    }
+
     return {
-      amount, createdAt: nowMs,
+      amount,
+      createdAt: createdAtSeconds * 1000,   // ← MILIDETIK (sesuai Kotlin: createdAtMs = createdAtSeconds * 1000)
       dealType: this.config.isDemoAccount ? 'demo' : 'real',
-      expireAt, iso: this.config.currencyIso,
-      optionType: 'turbo', ric: this.config.asset.ric, trend,
+      expireAt: finalExpireAt,               // ← DETIK (sesuai Kotlin: finalExpireAt dalam seconds)
+      iso: this.config.currencyIso,
+      optionType: 'turbo',
+      ric: this.config.asset.ric,
+      trend,
     };
   }
 

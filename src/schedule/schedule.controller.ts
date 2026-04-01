@@ -12,6 +12,19 @@ import { UpdateScheduleConfigDto } from './dto/update-config.dto';
 export class ScheduleController {
   constructor(private readonly svc: ScheduleService) {}
 
+  // ── Assets ──────────────────────────────────────────────────────────
+  /**
+   * GET /schedule/assets
+   * Fetch daftar asset langsung dari Stockity API (seperti Kotlin AssetManager).
+   * Diurutkan descending berdasarkan profit rate.
+   * Gunakan endpoint ini untuk memilih asset sebelum set config.
+   */
+  @Get('assets')
+  getAssets(@Request() req) {
+    return this.svc.getAvailableAssets(req.user.userId);
+  }
+
+  // ── Config ─────────────────────────────────────────────────────────
   @Get('config')
   getConfig(@Request() req) { return this.svc.getConfig(req.user.userId); }
 
@@ -20,6 +33,7 @@ export class ScheduleController {
     return this.svc.updateConfig(req.user.userId, dto);
   }
 
+  // ── Orders ─────────────────────────────────────────────────────────
   @Get('orders')
   getOrders(@Request() req) { return this.svc.getOrders(req.user.userId); }
 
@@ -37,6 +51,7 @@ export class ScheduleController {
   @Delete('orders')
   clearOrders(@Request() req) { return this.svc.clearOrders(req.user.userId); }
 
+  // ── Control ────────────────────────────────────────────────────────
   @Post('start')
   @HttpCode(200)
   start(@Request() req) { return this.svc.startSchedule(req.user.userId); }
@@ -53,6 +68,7 @@ export class ScheduleController {
   @HttpCode(200)
   resume(@Request() req) { return this.svc.resumeSchedule(req.user.userId); }
 
+  // ── Status & Logs ──────────────────────────────────────────────────
   @Get('status')
   status(@Request() req) { return this.svc.getStatus(req.user.userId); }
 

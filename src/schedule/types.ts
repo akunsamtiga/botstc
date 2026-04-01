@@ -14,6 +14,9 @@ export interface MartingaleSettings {
 export interface AssetConfig {
   ric: string;
   name: string;
+  profitRate?: number;   // opsional, diisi saat auto-fetch dari Stockity
+  typeName?: string;     // opsional, misal "Forex", "Crypto", dll
+  iconUrl?: string | null;
 }
 
 export interface ScheduleConfig {
@@ -22,7 +25,13 @@ export interface ScheduleConfig {
   isDemoAccount: boolean;
   currency: string;
   currencyIso: string;
-  duration: number;
+  /**
+   * CATATAN: `duration` tidak mempengaruhi perhitungan trade ke WebSocket.
+   * Durasi trade selalu dihitung otomatis dari algoritma timing (createdAt/expireAt),
+   * identik dengan logika Kotlin TradeManager.createTradeOrder().
+   * Field ini hanya disimpan sebagai metadata/referensi UI.
+   */
+  duration?: number;
 }
 
 export interface ScheduledOrderMartingaleState {
@@ -60,9 +69,9 @@ export interface AlwaysSignalLossState {
 
 export interface TradeOrderData {
   amount: number;
-  createdAt: number;
+  createdAt: number;    // dalam MILIDETIK
   dealType: string;
-  expireAt: number;
+  expireAt: number;     // dalam DETIK
   iso: string;
   optionType: string;
   ric: string;
@@ -80,4 +89,14 @@ export interface ExecutionLog {
   result?: string;
   executedAt: number;
   note?: string;
+}
+
+// Model untuk asset yang di-fetch dari Stockity
+export interface StockityAsset {
+  ric: string;
+  name: string;
+  type: number;
+  typeName: string;
+  profitRate: number;
+  iconUrl: string | null;
 }

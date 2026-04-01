@@ -4,20 +4,41 @@ import { AuthService } from '../auth/auth.service';
 import { StockityWebSocketClient } from './websocket-client';
 import { ScheduleExecutor, ExecutorCallbacks } from './schedule-executor';
 import { UpdateScheduleConfigDto } from './dto/update-config.dto';
-import { ScheduledOrder, ScheduleConfig, ExecutionLog } from './types';
+import { ScheduledOrder, ScheduleConfig, ExecutionLog, StockityAsset } from './types';
 import { v4 as uuidv4 } from 'uuid';
+import axios from 'axios';
 
 const JAKARTA_OFFSET_MS = 7 * 60 * 60 * 1000;
+const BASE_URL = 'https://api.stockity.id';
 
-const DEFAULT_CONFIG: ScheduleConfig = {
-  asset: { ric: 'EURUSD_otc', name: 'EUR/USD' },
+// Type mapping sesuai Kotlin AssetManager
+const TYPE_NAME_MAPPING: Record<number, string> = {
+  1: 'Forex',
+  2: 'Crypto',
+  3: 'Saham',
+  4: 'Komoditas',
+  5: 'Indeks',
+  6: 'ETF',
+  7: 'OTC',
+  8: 'Event',
+  9: 'AI Index',
+  10: 'Synthetic Index',
+  11: 'Metal',
+};
+
+/**
+ * Default config tanpa asset hardcoded.
+ * Asset harus di-set user melalui updateConfig(), atau di-fetch via getAvailableAssets().
+ */
+const DEFAULT_CONFIG: Omit<ScheduleConfig, 'asset'> & { asset: null } = {
+  asset: null,
   martingale: {
     isEnabled: true, maxSteps: 2,
     baseAmount: 1400000, multiplierValue: 2.5,
     multiplierType: 'FIXED', isAlwaysSignal: false,
   },
   isDemoAccount: true,
-  currency: 'IDR', currencyIso: 'IDR', duration: 1,
+  currency: 'IDR', currencyIso: 'IDR',
 };
 
 @Injectable()
@@ -71,35 +92,125 @@ export class ScheduleService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
+  // ── Asset Auto-fetch (sesuai Kotlin AssetManager) ─────────────────
+
+  /**
+   * Fetch daftar asset yang tersedia dari Stockity API menggunakan session user.
+   * Identik dengan Kotlin AssetManager.fetchAssetsFromApi() + processAssets().
+   *
+   * Logika profit rate (sama persis dengan Kotlin):
+   *  1. Cari di personal_user_payment_rates dengan trading_type === 'turbo'
+   *  2. Fallback ke trading_tools_settings.ftt.user_statuses.vip.payment_rate_turbo
+   *  3. Fallback ke trading_tools_settings.bo.payment_rate_turbo
+   *  4. Fallback ke trading_tools_settings.payment_rate_turbo
+   *  5. Jika semua null → aset tidak ditampilkan
+   *
+   * Result diurutkan descending berdasarkan profitRate.
+   */
+  async getAvailableAssets(userId: string): Promise<StockityAsset[]> {
+    const session = await this.authService.getSession(userId);
+    if (!session) throw new Error('Session tidak ditemukan');
+
+    const headers = this.buildStockityHeaders(session);
+
+    try {
+      const resp = await axios.get(`${BASE_URL}/bo-assets/v6/assets?locale=id`, {
+        headers,
+        timeout: 15000,
+      });
+
+      const rawAssets: any[] = resp.data?.data?.assets || [];
+      const processed: StockityAsset[] = [];
+
+      for (const asset of rawAssets) {
+        const ric: string = asset.ric;
+        const name: string = asset.name;
+        const assetType: number = asset.type;
+        const typeName = TYPE_NAME_MAPPING[assetType] ?? `Type-${assetType}`;
+        const iconUrl: string | null = asset.icon?.url ?? null;
+
+        // Cari profit rate — identik dengan Kotlin processAssets()
+        let profitRate: number | null = null;
+
+        const personalRates: any[] = asset.personal_user_payment_rates || [];
+        for (const rateEntry of personalRates) {
+          if (rateEntry.trading_type === 'turbo') {
+            profitRate = rateEntry.payment_rate;
+            break;
+          }
+        }
+
+        if (profitRate === null) {
+          const settings = asset.trading_tools_settings;
+          profitRate =
+            settings?.ftt?.user_statuses?.vip?.payment_rate_turbo ??
+            settings?.bo?.payment_rate_turbo ??
+            settings?.payment_rate_turbo ??
+            null;
+        }
+
+        // Hanya tambahkan asset yang punya profit rate (sama dengan Kotlin)
+        if (profitRate !== null) {
+          processed.push({ ric, name, type: assetType, typeName, profitRate, iconUrl });
+        }
+      }
+
+      // Urutkan descending berdasarkan profitRate (sama dengan Kotlin sortedByDescending)
+      processed.sort((a, b) => b.profitRate - a.profitRate);
+
+      this.logger.log(`[${userId}] Fetched ${processed.length} assets from Stockity`);
+      return processed;
+    } catch (err: any) {
+      this.logger.error(`[${userId}] Error fetching assets: ${err.message}`);
+      throw new Error(`Gagal mengambil daftar asset dari Stockity: ${err.message}`);
+    }
+  }
+
+  private buildStockityHeaders(session: any): Record<string, string> {
+    return {
+      'authorization-token': session.stockityToken,
+      'device-id': session.deviceId,
+      'device-type': session.deviceType || 'web',
+      'user-timezone': session.userTimezone || 'Asia/Jakarta',
+      'User-Agent': session.userAgent,
+      'Accept': 'application/json, text/plain, */*',
+      'Origin': 'https://stockity.id',
+      'Referer': 'https://stockity.id/',
+    };
+  }
+
   // ── Config ────────────────────────────────────
 
   async getConfig(userId: string): Promise<ScheduleConfig> {
     if (this.configs.has(userId)) return this.configs.get(userId)!;
+
     const doc = await this.firebaseService.db.collection('schedule_configs').doc(userId).get();
     if (doc.exists) {
       const d = doc.data() as any;
       const cfg: ScheduleConfig = {
-        asset: d.asset || DEFAULT_CONFIG.asset,
+        asset: d.asset || null,
         martingale: d.martingale || DEFAULT_CONFIG.martingale,
         isDemoAccount: d.isDemoAccount ?? true,
         currency: d.currency || 'IDR',
         currencyIso: d.currencyIso || 'IDR',
-        duration: d.duration || 1,
       };
       this.configs.set(userId, cfg);
       return cfg;
     }
-    const def = { ...DEFAULT_CONFIG };
+
+    const def = { ...DEFAULT_CONFIG } as unknown as ScheduleConfig;
     this.configs.set(userId, def);
     return def;
   }
 
   async updateConfig(userId: string, dto: UpdateScheduleConfigDto): Promise<ScheduleConfig> {
     const cfg: ScheduleConfig = {
-      asset: dto.asset, martingale: dto.martingale,
+      asset: dto.asset,
+      martingale: dto.martingale,
       isDemoAccount: dto.isDemoAccount,
-      currency: dto.currency, currencyIso: dto.currencyIso,
-      duration: dto.duration ?? 1,
+      currency: dto.currency,
+      currencyIso: dto.currencyIso,
+      // duration tidak dipakai untuk kalkulasi trade, hanya metadata
     };
     this.configs.set(userId, cfg);
     await this.firebaseService.db.collection('schedule_configs').doc(userId).set(
@@ -178,19 +289,26 @@ export class ScheduleService implements OnModuleInit, OnModuleDestroy {
     const session = await this.authService.getSession(userId);
     if (!session) throw new Error('Session tidak ditemukan. Silakan login ulang.');
 
-    // ✅ FIX: Validasi token tersedia sebelum membuat WS
     if (!session.stockityToken) {
       throw new Error('Token Stockity tidak ditemukan di session. Silakan login ulang.');
     }
 
     const config = await this.getConfig(userId);
-    if (!config.asset?.ric) throw new Error('Asset belum dikonfigurasi');
+
+    // Validasi: asset harus sudah dikonfigurasi
+    if (!config.asset?.ric) {
+      throw new Error(
+        'Asset belum dikonfigurasi. ' +
+        'Gunakan GET /schedule/assets untuk melihat daftar asset, ' +
+        'lalu set melalui PUT /schedule/config.',
+      );
+    }
 
     const orders = await this.getOrders(userId);
 
     const ws = new StockityWebSocketClient(
       userId,
-      session.stockityToken,       // ✅ Pastikan pakai stockityToken (bukan JWT)
+      session.stockityToken,
       session.deviceId,
       session.deviceType || 'web',
       session.userAgent,
@@ -200,7 +318,6 @@ export class ScheduleService implements OnModuleInit, OnModuleDestroy {
       this.logger.log(`[${userId}] WS: ${connected ? 'Connected' : 'Disconnected'} ${reason || ''}`);
     });
 
-    // ✅ FIX: Tangkap error WS agar tidak crash HTTP endpoint
     try {
       await ws.connect();
     } catch (err: any) {

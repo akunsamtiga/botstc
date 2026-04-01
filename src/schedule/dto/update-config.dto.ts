@@ -7,6 +7,9 @@ import { Type } from 'class-transformer';
 export class AssetConfigDto {
   @IsString() ric: string;
   @IsString() name: string;
+  @IsOptional() @IsNumber() profitRate?: number;
+  @IsOptional() @IsString() typeName?: string;
+  @IsOptional() @IsString() iconUrl?: string | null;
 }
 
 export class MartingaleDto {
@@ -24,5 +27,10 @@ export class UpdateScheduleConfigDto {
   @IsBoolean() isDemoAccount: boolean;
   @IsString() currency: string;
   @IsString() currencyIso: string;
+  /**
+   * `duration` tidak mempengaruhi kalkulasi expireAt trade ke WebSocket.
+   * Durasi selalu dihitung otomatis dari algoritma timing (identik Kotlin).
+   * Field ini opsional dan hanya disimpan sebagai metadata.
+   */
   @IsOptional() @IsNumber() @Min(1) duration?: number;
 }

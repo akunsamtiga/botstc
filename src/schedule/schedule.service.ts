@@ -133,7 +133,6 @@ export class ScheduleService implements OnModuleInit, OnModuleDestroy {
       return { added: added.length, errors, message: `${added.length} jadwal ditambahkan` };
     }
 
-    // Bot tidak running – simpan langsung ke Firebase
     const existing = await this.getOrders(userId);
     const keys = new Set(existing.map(o => `${o.time}_${o.trend}`));
     const newOnes = orders.filter(o => !keys.has(`${o.time}_${o.trend}`));
@@ -179,21 +178,37 @@ export class ScheduleService implements OnModuleInit, OnModuleDestroy {
     const session = await this.authService.getSession(userId);
     if (!session) throw new Error('Session tidak ditemukan. Silakan login ulang.');
 
+    // ✅ FIX: Validasi token tersedia sebelum membuat WS
+    if (!session.stockityToken) {
+      throw new Error('Token Stockity tidak ditemukan di session. Silakan login ulang.');
+    }
+
     const config = await this.getConfig(userId);
     if (!config.asset?.ric) throw new Error('Asset belum dikonfigurasi');
 
     const orders = await this.getOrders(userId);
 
     const ws = new StockityWebSocketClient(
-      userId, session.stockityToken, session.deviceId,
-      session.deviceType || 'web', session.userAgent,
+      userId,
+      session.stockityToken,       // ✅ Pastikan pakai stockityToken (bukan JWT)
+      session.deviceId,
+      session.deviceType || 'web',
+      session.userAgent,
     );
 
     ws.setOnStatusChange((connected, reason) => {
       this.logger.log(`[${userId}] WS: ${connected ? 'Connected' : 'Disconnected'} ${reason || ''}`);
     });
 
-    await ws.connect();
+    // ✅ FIX: Tangkap error WS agar tidak crash HTTP endpoint
+    try {
+      await ws.connect();
+    } catch (err: any) {
+      this.logger.error(`[${userId}] WS gagal connect: ${err.message}`);
+      ws.disconnect();
+      throw new Error(`Gagal koneksi WebSocket: ${err.message}. Coba login ulang.`);
+    }
+
     this.wsClients.set(userId, ws);
 
     if (!this.logs.has(userId)) this.logs.set(userId, []);
@@ -282,7 +297,7 @@ export class ScheduleService implements OnModuleInit, OnModuleDestroy {
     return snap.docs.map(d => d.data() as ExecutionLog);
   }
 
-  // ── Input Parser (sama dengan ScheduleManager Android) ──
+  // ── Input Parser ──────────────────────────────
 
   parseInput(input: string): { orders: ScheduledOrder[]; errors: string[] } {
     const orders: ScheduledOrder[] = [];

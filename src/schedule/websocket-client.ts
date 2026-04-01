@@ -12,7 +12,6 @@ export interface DealResultPayload {
   [key: string]: any;
 }
 
-// Format pesan sesuai Kotlin: JSON object {topic, event, payload, ref}
 interface WsMessage {
   topic: string;
   event: string;
@@ -39,7 +38,6 @@ export class StockityWebSocketClient {
   private onDealResultCb?: (payload: DealResultPayload) => void;
   private onStatusChangeCb?: (connected: boolean, reason?: string) => void;
 
-  // Channels sesuai Kotlin: connection, tournament, user, cfd_zero_spread, bo, asset, account
   private readonly CHANNELS = ['connection', 'tournament', 'user', 'cfd_zero_spread', 'bo', 'asset', 'account'];
   private readonly REQUIRED_CHANNELS = new Set(['bo', 'account', 'asset']);
 
@@ -67,22 +65,36 @@ export class StockityWebSocketClient {
     return new Promise((resolve, reject) => {
       if (this.isDestroyed) return reject(new Error('Client sudah di-destroy'));
 
+      // ✅ FIX: Gunakan settled flag agar resolve/reject hanya dipanggil sekali
+      let settled = false;
+      const doResolve = () => {
+        if (!settled) { settled = true; resolve(); }
+      };
+      const doReject = (err: Error) => {
+        if (!settled) { settled = true; reject(err); }
+      };
+
       try {
-        // URL benar sesuai Kotlin: wss://ws.stockity.id/?v=2&vsn=2.0.0
-        // Auth via Cookie header sesuai Kotlin, BUKAN query param
+        // ✅ FIX: Kirim authorization-token sebagai header langsung (sama dengan REST API)
+        // Tambahkan juga Cookie sebagai fallback
         this.ws = new WebSocket('wss://ws.stockity.id/?v=2&vsn=2.0.0', {
           headers: {
+            'authorization-token': this.authToken,   // ✅ Header utama (sama dengan REST)
+            'device-id': this.deviceId,              // ✅ Header device-id
+            'device-type': this.deviceType,          // ✅ Header device-type
+            'user-timezone': 'Asia/Jakarta',
             'User-Agent': this.userAgent,
             'Origin': 'https://stockity.id',
+            'Referer': 'https://stockity.id/',
+            // Cookie sebagai fallback (browser-style auth)
             'Cookie': `authtoken=${this.authToken}; device_type=${this.deviceType}; device_id=${this.deviceId}`,
-            'Sec-WebSocket-Protocol': 'phoenix',
             'Cache-Control': 'no-cache',
           },
           handshakeTimeout: 15000,
         });
 
         const connectTimeout = setTimeout(() => {
-          reject(new Error('WebSocket connection timeout'));
+          doReject(new Error('WebSocket connection timeout'));
           this.ws?.terminate();
         }, 20000);
 
@@ -92,12 +104,11 @@ export class StockityWebSocketClient {
           this.logger.log(`[${this.userId}] ✅ WebSocket connected`);
           this.onStatusChangeCb?.(true, 'Connected to Stockity WebSocket');
 
-          // Sesuai Kotlin: delay 1 detik setelah open, lalu join channels
           await this.sleep(1000);
           await this.joinChannelsWithRetry();
           this.startHeartbeat();
 
-          resolve();
+          doResolve(); // ✅ FIX: Resolve hanya sekali
         });
 
         this.ws.on('message', (raw: Buffer | string) => {
@@ -108,23 +119,28 @@ export class StockityWebSocketClient {
           this.logger.error(`[${this.userId}] WS error: ${err.message}`);
           this.onStatusChangeCb?.(false, err.message);
           clearTimeout(connectTimeout);
-          reject(err);
+          // ✅ FIX: Reject hanya jika belum settled (initial connect)
+          // Jika sudah connected sebelumnya, error ditangani oleh close handler
+          doReject(err);
         });
 
         this.ws.on('close', (code, reason) => {
           this.logger.warn(`[${this.userId}] WS closed: ${code} ${reason?.toString()}`);
           this.stopHeartbeat();
           this.onStatusChangeCb?.(false, `Closed: ${code}`);
-          if (!this.isDestroyed) this.scheduleReconnect();
+          // ✅ FIX: Hanya reconnect jika initial connect sudah berhasil (settled via resolve)
+          // dan tidak sedang di-destroy
+          if (!this.isDestroyed && settled) {
+            this.scheduleReconnect();
+          }
         });
 
       } catch (err) {
-        reject(err);
+        doReject(err as Error);
       }
     });
   }
 
-  // Join semua channel sesuai Kotlin, dengan delay 800ms antar channel
   private async joinChannelsWithRetry() {
     this.joinedChannels.clear();
     let retryCount = 0;
@@ -135,7 +151,6 @@ export class StockityWebSocketClient {
         if (this.isDestroyed || !this.ws) break;
         if (this.joinedChannels.has(channel)) continue;
 
-        // Payload join sesuai Kotlin: empty payload {}
         const sent = this.sendMsg({
           topic: channel,
           event: 'phx_join',
@@ -163,7 +178,6 @@ export class StockityWebSocketClient {
       if (retryCount < maxRetries) await this.sleep(2000);
     }
 
-    // Minimal: bo + account
     const hasEssential = ['bo', 'account'].every(c => this.joinedChannels.has(c));
     if (hasEssential) {
       this.logger.log(`[${this.userId}] Essential channels available`);
@@ -173,8 +187,6 @@ export class StockityWebSocketClient {
     }
   }
 
-  // Format pesan sesuai Kotlin: JSON object {topic, event, payload, ref}
-  // BUKAN array [null, ref, topic, event, payload]
   private sendMsg(msg: WsMessage): boolean {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return false;
     try {
@@ -192,7 +204,6 @@ export class StockityWebSocketClient {
 
   private startHeartbeat() {
     this.stopHeartbeat();
-    // Heartbeat sesuai Kotlin: topic=phoenix, event=heartbeat, interval=25 detik
     this.heartbeatTimer = setInterval(() => {
       this.sendMsg({
         topic: 'phoenix',
@@ -214,9 +225,10 @@ export class StockityWebSocketClient {
     if (this.isDestroyed) return;
     if (this.reconnectAttempts >= this.MAX_RECONNECT) {
       this.logger.error(`[${this.userId}] Max reconnect attempts reached`);
+      this.onStatusChangeCb?.(false, 'Max reconnect attempts reached');
       return;
     }
-    const delay = Math.min(1500 * Math.pow(2, Math.min(this.reconnectAttempts - 1, 5)), 45000);
+    const delay = Math.min(1500 * Math.pow(2, Math.min(this.reconnectAttempts, 5)), 45000);
     this.reconnectAttempts++;
     this.logger.log(`[${this.userId}] Reconnect in ${delay}ms (attempt ${this.reconnectAttempts})`);
     this.reconnectTimer = setTimeout(async () => {
@@ -225,22 +237,21 @@ export class StockityWebSocketClient {
         await this.connect();
       } catch (err: any) {
         this.logger.error(`[${this.userId}] Reconnect failed: ${err.message}`);
+        // ✅ FIX: Jika reconnect gagal, coba lagi (scheduleReconnect dipanggil dari close event)
       }
     }, delay);
   }
 
   private handleMessage(raw: string) {
     try {
-      // Sesuai Kotlin: parse sebagai JSON object {topic, event, payload, ref}
       const msg = JSON.parse(raw);
       const event: string = msg.event ?? '';
       const topic: string = msg.topic ?? '';
       const payload: any = msg.payload ?? {};
       const ref: number = msg.ref ?? -1;
 
-      // phx_reply → cek trade response atau heartbeat
       if (event === 'phx_reply') {
-        if (topic === 'phoenix') return; // heartbeat reply, abaikan
+        if (topic === 'phoenix') return;
 
         const status = payload?.status;
         const response = payload?.response;
@@ -265,7 +276,6 @@ export class StockityWebSocketClient {
         return;
       }
 
-      // Hasil trade sesuai Kotlin: opened, closed, deal_result, close_deal_batch pada topic "bo"
       if (topic === 'bo' && payload) {
         if (['opened', 'closed', 'deal_result', 'close_deal_batch'].includes(event)) {
           this.logger.debug(`[${this.userId}] Trade event: ${event} id=${payload.id}`);
@@ -290,7 +300,6 @@ export class StockityWebSocketClient {
 
       this.pendingTrades.set(ref, { resolve, timer });
 
-      // Format trade sesuai Kotlin TradeManager.executeTradeOrder
       const sent = this.sendMsg({
         topic: 'bo',
         event: 'create',

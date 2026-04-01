@@ -1,0 +1,59 @@
+import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+import * as admin from 'firebase-admin';
+
+@Injectable()
+export class FirebaseService implements OnModuleInit {
+  private readonly logger = new Logger(FirebaseService.name);
+  private _db: admin.firestore.Firestore;
+
+  constructor(private configService: ConfigService) {}
+
+  onModuleInit() {
+    if (admin.apps.length === 0) {
+      const serviceAccountPath = this.configService.get<string>('FIREBASE_SERVICE_ACCOUNT_PATH');
+      const projectId = this.configService.get<string>('FIREBASE_PROJECT_ID');
+
+      if (serviceAccountPath) {
+        // Resolve path relatif dari project root
+        const path = require('path');
+        const resolvedPath = path.resolve(process.cwd(), serviceAccountPath);
+        const serviceAccount = require(resolvedPath);
+        admin.initializeApp({
+          credential: admin.credential.cert(serviceAccount),
+          projectId: serviceAccount.project_id || projectId,
+        });
+      } else {
+        const privateKey = this.configService.get<string>('FIREBASE_PRIVATE_KEY');
+        const clientEmail = this.configService.get<string>('FIREBASE_CLIENT_EMAIL');
+        if (!privateKey || !clientEmail || !projectId) {
+          throw new Error(
+            'Firebase config tidak lengkap. Set FIREBASE_SERVICE_ACCOUNT_PATH atau ' +
+            'FIREBASE_PRIVATE_KEY + FIREBASE_CLIENT_EMAIL + FIREBASE_PROJECT_ID di .env'
+          );
+        }
+        admin.initializeApp({
+          credential: admin.credential.cert({
+            projectId,
+            privateKey: privateKey.replace(/\\n/g, '\n'),
+            clientEmail,
+          }),
+        });
+      }
+    }
+    this._db = admin.firestore();
+    this.logger.log('✅ Firebase Firestore terhubung');
+  }
+
+  get db(): admin.firestore.Firestore {
+    return this._db;
+  }
+
+  get FieldValue() {
+    return admin.firestore.FieldValue;
+  }
+
+  get Timestamp() {
+    return admin.firestore.Timestamp;
+  }
+}

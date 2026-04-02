@@ -449,7 +449,12 @@ export class ScheduleExecutor {
     this.lastCompletionCheck = now;
     const hasPending = this.orders.some(o => !o.isExecuted && !o.isSkipped);
     const hasIncompleteMart = this.orders.some(o => o.martingaleState.isActive && !o.martingaleState.isCompleted);
-    if (!hasPending && !this.activeMartingaleOrderId && !hasIncompleteMart && this.orders.length > 0) {
+    // ✅ FIX: Tunggu order yang sudah execute tapi belum dapat dealId atau result
+    // (trade masih dalam proses konfirmasi dari WebSocket / placeTrade masih await)
+    const hasAwaitingResult = this.orders.some(
+      o => o.isExecuted && !o.isSkipped && !o.activeDealId && !o.result,
+    );
+    if (!hasPending && !this.activeMartingaleOrderId && !hasIncompleteMart && !hasAwaitingResult && this.orders.length > 0) {
       this.logger.log(`[${this.userId}] ✅ All schedules completed`);
       setTimeout(() => { this.stop(); this.callbacks.onAllCompleted(); }, 3000);
     }

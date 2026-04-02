@@ -279,6 +279,22 @@ export class StockityWebSocketClient {
       if (topic === 'bo' && payload) {
         if (['opened', 'closed', 'deal_result', 'close_deal_batch'].includes(event)) {
           this.logger.debug(`[${this.userId}] Trade event: ${event} id=${payload.id}`);
+
+          // ✅ FIX: Jika bo:opened masuk dan masih ada pendingTrade yang belum resolve
+          // (phx_reply tidak datang atau tidak punya response.id), resolve dari sini.
+          // Ini menangani kasus Stockity kirim konfirmasi via bo:opened bukan phx_reply.
+          if (event === 'opened' && payload.id && this.pendingTrades.size > 0) {
+            // Ambil pending trade tertua (ref terkecil) — yang paling mungkin match
+            const oldestRef = Math.min(...this.pendingTrades.keys());
+            const pending = this.pendingTrades.get(oldestRef);
+            if (pending) {
+              clearTimeout(pending.timer);
+              pending.resolve(String(payload.id));
+              this.pendingTrades.delete(oldestRef);
+              this.logger.log(`[${this.userId}] ✅ Trade confirmed via bo:opened: dealId=${payload.id}`);
+            }
+          }
+
           this.onDealResultCb?.(payload);
         }
       }

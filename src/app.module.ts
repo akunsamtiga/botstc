@@ -5,6 +5,7 @@ import { FirebaseModule } from './firebase/firebase.module';
 import { AuthModule } from './auth/auth.module';
 import { ProfileModule } from './profile/profile.module';
 import { ScheduleAppModule } from './schedule/schedule.module';
+import { FastradeModule } from './fastrade/fastrade.module'; 
 
 @Module({
   imports: [
@@ -14,6 +15,7 @@ import { ScheduleAppModule } from './schedule/schedule.module';
     AuthModule,
     ProfileModule,
     ScheduleAppModule,
+    FastradeModule, 
   ],
 })
 export class AppModule {}

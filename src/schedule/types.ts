@@ -14,8 +14,8 @@ export interface MartingaleSettings {
 export interface AssetConfig {
   ric: string;
   name: string;
-  profitRate?: number;   // opsional, diisi saat auto-fetch dari Stockity
-  typeName?: string;     // opsional, misal "Forex", "Crypto", dll
+  profitRate?: number;
+  typeName?: string;
   iconUrl?: string | null;
 }
 
@@ -25,13 +25,22 @@ export interface ScheduleConfig {
   isDemoAccount: boolean;
   currency: string;
   currencyIso: string;
-  /**
-   * CATATAN: `duration` tidak mempengaruhi perhitungan trade ke WebSocket.
-   * Durasi trade selalu dihitung otomatis dari algoritma timing (createdAt/expireAt),
-   * identik dengan logika Kotlin TradeManager.createTradeOrder().
-   * Field ini hanya disimpan sebagai metadata/referensi UI.
-   */
   duration?: number;
+
+  /**
+   * Stop Loss: bot otomatis berhenti jika total kerugian sesi
+   * mencapai atau melebihi nilai ini (dalam satuan currency terkecil, misal cents/IDR).
+   * Contoh IDR: 50000000 = Rp 50.000.000
+   * Set 0 atau undefined untuk menonaktifkan.
+   */
+  stopLoss?: number;
+
+  /**
+   * Stop Profit: bot otomatis berhenti jika total keuntungan sesi
+   * mencapai atau melebihi nilai ini.
+   * Set 0 atau undefined untuk menonaktifkan.
+   */
+  stopProfit?: number;
 }
 
 export interface ScheduledOrderMartingaleState {
@@ -69,9 +78,9 @@ export interface AlwaysSignalLossState {
 
 export interface TradeOrderData {
   amount: number;
-  createdAt: number;    // dalam MILIDETIK
+  createdAt: number;   // MILIDETIK
   dealType: string;
-  expireAt: number;     // dalam DETIK
+  expireAt: number;    // DETIK
   iso: string;
   optionType: string;
   ric: string;
@@ -87,11 +96,12 @@ export interface ExecutionLog {
   martingaleStep: number;
   dealId?: string;
   result?: string;
+  profit?: number;      // profit/loss aktual trade ini (positif = untung, negatif = rugi)
+  sessionPnL?: number;  // running total P&L sesi setelah trade ini selesai
   executedAt: number;
   note?: string;
 }
 
-// Model untuk asset yang di-fetch dari Stockity
 export interface StockityAsset {
   ric: string;
   name: string;

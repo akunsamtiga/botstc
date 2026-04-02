@@ -193,6 +193,8 @@ export class ScheduleService implements OnModuleInit, OnModuleDestroy {
         isDemoAccount: d.isDemoAccount ?? true,
         currency: d.currency || 'IDR',
         currencyIso: d.currencyIso || 'IDR',
+        stopLoss: d.stopLoss ?? 0,
+        stopProfit: d.stopProfit ?? 0,
       };
       this.configs.set(userId, cfg);
       return cfg;
@@ -210,7 +212,8 @@ export class ScheduleService implements OnModuleInit, OnModuleDestroy {
       isDemoAccount: dto.isDemoAccount,
       currency: dto.currency,
       currencyIso: dto.currencyIso,
-      // duration tidak dipakai untuk kalkulasi trade, hanya metadata
+      stopLoss: dto.stopLoss ?? 0,
+      stopProfit: dto.stopProfit ?? 0,
     };
     this.configs.set(userId, cfg);
 

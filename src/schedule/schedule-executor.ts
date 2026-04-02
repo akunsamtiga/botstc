@@ -8,7 +8,7 @@ import {
 } from './types';
 
 const JAKARTA_OFFSET_MS = 7 * 60 * 60 * 1000;
-const EXECUTION_ADVANCE_MS = 2000;
+const EXECUTION_ADVANCE_MS = 0;
 const PRECISION_CHECK_MS = 100;
 const EXECUTION_WINDOW_MS = 4900;
 const MARTINGALE_MAX_DURATION_MS = 600000;
@@ -68,6 +68,15 @@ export class ScheduleExecutor {
   /** Map orderId → ExecutionInfo untuk fallback matching */
   private executionInfoMap = new Map<string, ExecutionInfo>();
 
+  /**
+   * Akumulasi P&L sesi ini (dalam satuan currency terkecil).
+   * Reset saat bot di-start ulang.
+   * WIN  → +profit (amount * profitRate)
+   * LOSE → -amount
+   * DRAW → 0
+   */
+  private sessionPnL = 0;
+
   constructor(
     private readonly userId: string,
     private readonly wsClient: StockityWebSocketClient,
@@ -86,6 +95,7 @@ export class ScheduleExecutor {
     if (this.botState === 'RUNNING') return;
     this.botState = 'RUNNING';
     this.alwaysSignalLossState = undefined;
+    this.sessionPnL = 0;
     this.logger.log(`[${this.userId}] 🚀 Executor started | orders: ${this.orders.filter(o => !o.isExecuted && !o.isSkipped).length}`);
     this.startMonitoringLoop();
     this.startCompletionCheck();
@@ -126,6 +136,7 @@ export class ScheduleExecutor {
     this.martingaleStartTime = undefined;
     this.alwaysSignalLossState = undefined;
     this.executionInfoMap.clear();
+    this.sessionPnL = 0;
     this.callbacks.onOrdersUpdate(this.orders);
     this.logger.log(`[${this.userId}] ⏹️ Stopped`);
   }
@@ -549,6 +560,25 @@ export class ScheduleExecutor {
   private completeOrder(orderIdx: number, result: 'WIN' | 'LOSE' | 'DRAW', dealId?: string) {
     const order = this.orders[orderIdx];
     const finalResult = result === 'WIN' ? 'WIN' : result === 'DRAW' ? 'DRAW' : 'LOSS';
+
+    // ── Hitung profit/loss trade ini ─────────────────────────────────────
+    // WIN  → amount * profitRate (default 85% jika profitRate tidak tersedia)
+    // LOSE → -amount
+    // DRAW → 0
+    const profitRate = (this.config.asset.profitRate ?? 85) / 100;
+    let tradePnL = 0;
+    if (result === 'WIN') {
+      tradePnL = Math.floor(order.martingaleState.isActive
+        ? this.calcAmount(order.martingaleState.currentStep) * profitRate
+        : this.calcAmount(0) * profitRate);
+    } else if (result === 'LOSE') {
+      tradePnL = -(order.martingaleState.isActive
+        ? this.calcAmount(order.martingaleState.currentStep)
+        : this.calcAmount(0));
+    }
+
+    this.sessionPnL += tradePnL;
+
     this.orders[orderIdx] = {
       ...order, result,
       activeDealId: dealId,
@@ -559,7 +589,43 @@ export class ScheduleExecutor {
       },
     };
     this.callbacks.onOrdersUpdate(this.orders);
-    this.logger.log(`[${this.userId}] ✅ ${order.time} ${order.trend} → ${result}`);
+    this.logger.log(
+      `[${this.userId}] ✅ ${order.time} ${order.trend} → ${result} ` +
+      `| tradePnL=${tradePnL > 0 ? '+' : ''}${tradePnL} sessionPnL=${this.sessionPnL > 0 ? '+' : ''}${this.sessionPnL}`,
+    );
+
+    // ── Cek stop conditions ───────────────────────────────────────────────
+    this.checkStopConditions();
+  }
+
+  /**
+   * Cek Stop Loss dan Stop Profit setelah setiap trade selesai.
+   * Dipanggil oleh completeOrder().
+   */
+  private checkStopConditions() {
+    const { stopLoss, stopProfit } = this.config;
+    const pnl = this.sessionPnL;
+
+    // Stop Loss: totalLoss >= stopLoss (pnl negatif)
+    if (stopLoss && stopLoss > 0 && pnl <= -stopLoss) {
+      this.logger.warn(
+        `[${this.userId}] 🛑 STOP LOSS triggered! ` +
+        `sessionPnL=${pnl} <= -${stopLoss} — bot berhenti`,
+      );
+      this.callbacks.onStatusChange(`Stop Loss triggered (PnL: ${pnl})`);
+      setTimeout(() => { this.stop(); this.callbacks.onAllCompleted(); }, 1000);
+      return;
+    }
+
+    // Stop Profit: totalProfit >= stopProfit (pnl positif)
+    if (stopProfit && stopProfit > 0 && pnl >= stopProfit) {
+      this.logger.log(
+        `[${this.userId}] 🎯 STOP PROFIT triggered! ` +
+        `sessionPnL=${pnl} >= ${stopProfit} — bot berhenti`,
+      );
+      this.callbacks.onStatusChange(`Stop Profit triggered (PnL: +${pnl})`);
+      setTimeout(() => { this.stop(); this.callbacks.onAllCompleted(); }, 1000);
+    }
   }
 
   // ── Stuck Martingale Cleanup ──────────────────
@@ -635,24 +701,40 @@ export class ScheduleExecutor {
   // ── Trade Builder ──────────────────────────────
 
   private buildTradeOrder(trend: TrendType, amount: number, isScheduledOrder: boolean, scheduledTimeMs?: number): TradeOrderData {
-    // FIX timing: untuk scheduled order, gunakan waktu terjadwal (order.timeInMillis)
-    // sebagai basis createdAt — bukan Date.now() (yang bisa =:58 karena EXECUTION_ADVANCE_MS).
-    // Dengan ini, createdAt selalu di detik :00 dari menit jadwal, bukan :58.
-    // Identik dengan Kotlin: customStartTimeMs = startTimeMillis untuk scheduled order.
-    const baseMs         = isScheduledOrder && scheduledTimeMs ? scheduledTimeMs : Date.now();
+    const baseMs          = isScheduledOrder && scheduledTimeMs ? scheduledTimeMs : Date.now();
     const nowFloorSeconds = Math.floor(baseMs / 1000);
     const createdAtSeconds = isScheduledOrder ? nowFloorSeconds : nowFloorSeconds + 1;
     const secondsInMinute  = createdAtSeconds % 60;
 
-    let expireAtSeconds: number;
-    if (secondsInMinute <= 10) {
-      expireAtSeconds = createdAtSeconds + (60 - secondsInMinute);
+    let finalExpireAt: number;
+
+    if (isScheduledOrder) {
+      // Scheduled: expire di boundary menit jadwal (secondsInMinute selalu 0)
+      let expireAtSeconds: number;
+      if (secondsInMinute <= 10) {
+        expireAtSeconds = createdAtSeconds + (60 - secondsInMinute);
+      } else {
+        expireAtSeconds = createdAtSeconds + (120 - secondsInMinute);
+      }
+      const duration = expireAtSeconds - createdAtSeconds;
+      finalExpireAt = (duration < 55 || duration > 120) ? createdAtSeconds + 60 : expireAtSeconds;
+
     } else {
-      expireAtSeconds = createdAtSeconds + (120 - secondsInMinute);
+      // Martingale/instant: NEAREST minute boundary dengan min 45s.
+      // Tujuan: expire SECEPAT MUNGKIN setelah result, bukan nunggu boundary 120s.
+      //
+      // remainingInMinute = detik tersisa sampai boundary menit ini
+      // >= 45s → pakai boundary menit ini (terpendek valid)
+      //  < 45s → pakai boundary menit berikutnya
+      //
+      // Contoh result di :00 → createdAt :01 → remaining=59s >= 45 → expire di :00 (59s)
+      // Contoh result di :20 → createdAt :21 → remaining=39s  < 45 → expire di :00+60 (99s)
+      const remainingInMinute = 60 - secondsInMinute;
+      finalExpireAt = remainingInMinute >= 45
+        ? createdAtSeconds + remainingInMinute        // boundary menit ini
+        : createdAtSeconds + remainingInMinute + 60;  // boundary menit berikutnya
     }
 
-    const duration = expireAtSeconds - createdAtSeconds;
-    const finalExpireAt = (duration < 55 || duration > 120) ? createdAtSeconds + 60 : expireAtSeconds;
     const finalDuration = finalExpireAt - createdAtSeconds;
 
     this.logger.debug(
@@ -707,6 +789,9 @@ export class ScheduleExecutor {
       nextOrderTime: next?.time ?? null,
       nextOrderInSeconds: next ? Math.max(0, Math.floor((next.timeInMillis - EXECUTION_ADVANCE_MS - now) / 1000)) : null,
       wsConnected: this.wsClient.isConnected(),
+      sessionPnL: this.sessionPnL,
+      stopLoss: this.config.stopLoss ?? 0,
+      stopProfit: this.config.stopProfit ?? 0,
     };
   }
 }

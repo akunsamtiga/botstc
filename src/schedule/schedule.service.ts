@@ -213,8 +213,13 @@ export class ScheduleService implements OnModuleInit, OnModuleDestroy {
       // duration tidak dipakai untuk kalkulasi trade, hanya metadata
     };
     this.configs.set(userId, cfg);
+
+    // ✅ FIX: Strip class prototype (dari @Type() class-transformer) sebelum simpan ke Firestore.
+    // Firestore menolak object dengan custom prototype (instance class seperti AssetConfigDto).
+    const plainCfg = JSON.parse(JSON.stringify(cfg));
+
     await this.firebaseService.db.collection('schedule_configs').doc(userId).set(
-      { ...cfg, updatedAt: this.firebaseService.FieldValue.serverTimestamp() },
+      { ...plainCfg, updatedAt: this.firebaseService.FieldValue.serverTimestamp() },
       { merge: true },
     );
     this.executors.get(userId)?.updateConfig(cfg);

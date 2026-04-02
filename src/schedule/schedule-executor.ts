@@ -247,7 +247,7 @@ export class ScheduleExecutor {
 
     let tradeData: TradeOrderData;
     try {
-      tradeData = this.buildTradeOrder(order.trend, amount, true);
+      tradeData = this.buildTradeOrder(order.trend, amount, true, order.timeInMillis);
     } catch (err: any) {
       this.logger.error(`[${this.userId}] ❌ Trade timing error: ${err.message}`);
       this.executionInfoMap.delete(order.id);
@@ -388,7 +388,14 @@ export class ScheduleExecutor {
         this.advanceAlwaysSignalLoss(order, step, this.calcAmount(step));
         this.completeOrder(orderIdx, 'LOSE', dealId);
       } else if (isRegular) {
-        this.startMartingale(order, orderIdx);
+        // FIX: jika order sudah di tengah martingale (step > 0 dan isActive),
+        // lanjutkan ke step berikutnya via processMartingaleResult.
+        // Sebelumnya selalu memanggil startMartingale → reset ke step 1 → amount tidak naik.
+        if (order.martingaleState.isActive && order.martingaleState.currentStep > 0) {
+          this.processMartingaleResult(orderIdx, false, false, dealId);
+        } else {
+          this.startMartingale(order, orderIdx);
+        }
       } else {
         this.completeOrder(orderIdx, 'LOSE', dealId);
       }
@@ -627,9 +634,13 @@ export class ScheduleExecutor {
 
   // ── Trade Builder ──────────────────────────────
 
-  private buildTradeOrder(trend: TrendType, amount: number, isScheduledOrder: boolean): TradeOrderData {
-    const nowMs           = Date.now();
-    const nowFloorSeconds = Math.floor(nowMs / 1000);
+  private buildTradeOrder(trend: TrendType, amount: number, isScheduledOrder: boolean, scheduledTimeMs?: number): TradeOrderData {
+    // FIX timing: untuk scheduled order, gunakan waktu terjadwal (order.timeInMillis)
+    // sebagai basis createdAt — bukan Date.now() (yang bisa =:58 karena EXECUTION_ADVANCE_MS).
+    // Dengan ini, createdAt selalu di detik :00 dari menit jadwal, bukan :58.
+    // Identik dengan Kotlin: customStartTimeMs = startTimeMillis untuk scheduled order.
+    const baseMs         = isScheduledOrder && scheduledTimeMs ? scheduledTimeMs : Date.now();
+    const nowFloorSeconds = Math.floor(baseMs / 1000);
     const createdAtSeconds = isScheduledOrder ? nowFloorSeconds : nowFloorSeconds + 1;
     const secondsInMinute  = createdAtSeconds % 60;
 

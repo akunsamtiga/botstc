@@ -283,7 +283,7 @@ export class StockityWebSocketClient {
           if (event === 'close_deal_batch') {
             const deals: any[] = payload.deals || payload.data || [];
             for (const deal of deals) {
-              const dealId = deal.id ?? deal.deal_id;
+              const dealId = deal.uuid ?? deal.id ?? deal.deal_id;
               if (dealId) {
                 this.logger.debug(`[${this.userId}] Trade event: close_deal_batch id=${dealId}`);
                 this.onDealResultCb?.(deal);
@@ -292,12 +292,14 @@ export class StockityWebSocketClient {
             return;
           }
 
-          // ✅ FIX: closed/deal_result bisa punya id di berbagai field
-          const dealId = payload.id ?? payload.deal_id ?? payload.dealId;
+          // Normalisasi dealId: Stockity pakai 'uuid' di event closed/deal_result,
+          // tapi 'id' (numeric) di event opened. Gunakan uuid sebagai primary key
+          // supaya opened -> activeDealId -> closed bisa matching.
+          const dealId = payload.uuid ?? payload.id ?? payload.deal_id ?? payload.dealId;
           this.logger.debug(`[${this.userId}] Trade event: ${event} id=${dealId}`);
 
-          // ✅ FIX: Jika bo:opened masuk dan masih ada pendingTrade yang belum resolve
-          // (phx_reply tidak datang atau tidak punya response.id), resolve dari sini.
+          // Jika bo:opened masuk dan masih ada pendingTrade yang belum resolve,
+          // resolve dari sini menggunakan UUID supaya match saat bo:closed datang.
           if (event === 'opened' && dealId && this.pendingTrades.size > 0) {
             const oldestRef = Math.min(...this.pendingTrades.keys());
             const pending = this.pendingTrades.get(oldestRef);
@@ -310,10 +312,10 @@ export class StockityWebSocketClient {
           }
 
           if (dealId) {
+            // Normalisasi payload.id ke dealId supaya handleDealResult di executor bisa match
             this.onDealResultCb?.({ ...payload, id: String(dealId) });
           } else {
-            // Log full payload untuk debug struktur yang tidak dikenal
-            this.logger.warn(`[${this.userId}] ${event} payload missing id: ${JSON.stringify(payload).slice(0, 200)}`);
+            this.logger.warn(`[${this.userId}] ${event} payload missing id: ${JSON.stringify(payload).slice(0, 300)}`);
           }
         }
       }

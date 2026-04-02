@@ -245,7 +245,9 @@ export class ScheduleExecutor {
   // ── Deal Result ──────────────────────────────
 
   private handleDealResult(payload: DealResultPayload) {
-    const dealId = payload.id;
+    const dealId = String(payload.id ?? payload.deal_id ?? payload.dealId ?? '');
+    if (!dealId) return;
+
     const s = (payload.status || payload.result || '').toLowerCase();
     const isWin = s === 'won' || s === 'win';
     const isDraw = s === 'stand' || s === 'draw' || s === 'tie';
@@ -447,13 +449,27 @@ export class ScheduleExecutor {
     const now = Date.now();
     if (now - this.lastCompletionCheck < 5000) return;
     this.lastCompletionCheck = now;
+
     const hasPending = this.orders.some(o => !o.isExecuted && !o.isSkipped);
     const hasIncompleteMart = this.orders.some(o => o.martingaleState.isActive && !o.martingaleState.isCompleted);
-    // ✅ FIX: Tunggu order yang sudah execute tapi belum dapat dealId atau result
-    // (trade masih dalam proses konfirmasi dari WebSocket / placeTrade masih await)
-    const hasAwaitingResult = this.orders.some(
-      o => o.isExecuted && !o.isSkipped && !o.activeDealId && !o.result,
-    );
+
+    // ✅ FIX: Tunggu order yang sudah execute tapi belum dapat result (WIN/LOSE/DRAW).
+    // completeOrder() di-set saat deal_result/closed event cocok dengan activeDealId.
+    // Safety timeout 180s: jika result tidak datang (mis. payload.id=undefined dari Stockity),
+    // bot tidak stuck selamanya — anggap timeout dan lanjut complete.
+    const MAX_RESULT_WAIT_MS = 180_000;
+    const hasAwaitingResult = this.orders.some(o => {
+      if (!o.isExecuted || o.isSkipped || o.martingaleState.isCompleted) return false;
+      const waitedMs = now - o.timeInMillis;
+      if (waitedMs > MAX_RESULT_WAIT_MS) {
+        this.logger.warn(
+          `[${this.userId}] ⚠️ Result timeout ${o.time} (waited ${Math.round(waitedMs / 1000)}s) — force complete`,
+        );
+        return false;
+      }
+      return true;
+    });
+
     if (!hasPending && !this.activeMartingaleOrderId && !hasIncompleteMart && !hasAwaitingResult && this.orders.length > 0) {
       this.logger.log(`[${this.userId}] ✅ All schedules completed`);
       setTimeout(() => { this.stop(); this.callbacks.onAllCompleted(); }, 3000);

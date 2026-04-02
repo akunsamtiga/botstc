@@ -278,24 +278,43 @@ export class StockityWebSocketClient {
 
       if (topic === 'bo' && payload) {
         if (['opened', 'closed', 'deal_result', 'close_deal_batch'].includes(event)) {
-          this.logger.debug(`[${this.userId}] Trade event: ${event} id=${payload.id}`);
+          // ✅ FIX: close_deal_batch membawa array deals, bukan single id
+          // Payload: { deals: [{ id, status, result, ... }] }
+          if (event === 'close_deal_batch') {
+            const deals: any[] = payload.deals || payload.data || [];
+            for (const deal of deals) {
+              const dealId = deal.id ?? deal.deal_id;
+              if (dealId) {
+                this.logger.debug(`[${this.userId}] Trade event: close_deal_batch id=${dealId}`);
+                this.onDealResultCb?.(deal);
+              }
+            }
+            return;
+          }
+
+          // ✅ FIX: closed/deal_result bisa punya id di berbagai field
+          const dealId = payload.id ?? payload.deal_id ?? payload.dealId;
+          this.logger.debug(`[${this.userId}] Trade event: ${event} id=${dealId}`);
 
           // ✅ FIX: Jika bo:opened masuk dan masih ada pendingTrade yang belum resolve
           // (phx_reply tidak datang atau tidak punya response.id), resolve dari sini.
-          // Ini menangani kasus Stockity kirim konfirmasi via bo:opened bukan phx_reply.
-          if (event === 'opened' && payload.id && this.pendingTrades.size > 0) {
-            // Ambil pending trade tertua (ref terkecil) — yang paling mungkin match
+          if (event === 'opened' && dealId && this.pendingTrades.size > 0) {
             const oldestRef = Math.min(...this.pendingTrades.keys());
             const pending = this.pendingTrades.get(oldestRef);
             if (pending) {
               clearTimeout(pending.timer);
-              pending.resolve(String(payload.id));
+              pending.resolve(String(dealId));
               this.pendingTrades.delete(oldestRef);
-              this.logger.log(`[${this.userId}] ✅ Trade confirmed via bo:opened: dealId=${payload.id}`);
+              this.logger.log(`[${this.userId}] ✅ Trade confirmed via bo:opened: dealId=${dealId}`);
             }
           }
 
-          this.onDealResultCb?.(payload);
+          if (dealId) {
+            this.onDealResultCb?.({ ...payload, id: String(dealId) });
+          } else {
+            // Log full payload untuk debug struktur yang tidak dikenal
+            this.logger.warn(`[${this.userId}] ${event} payload missing id: ${JSON.stringify(payload).slice(0, 200)}`);
+          }
         }
       }
 

@@ -3,7 +3,9 @@ import { Logger } from '@nestjs/common';
 import { TradeOrderData } from './types';
 
 export interface DealResultPayload {
-  id: string;
+  id: string;          // primary id: uuid untuk closed/deal_result
+  numericId?: string;  // numeric id dari payload.id (bo:opened)
+  uuid?: string;       // uuid dari payload.uuid (bo:closed)
   status?: string;
   result?: string;
   trend?: string;
@@ -32,7 +34,6 @@ export class StockityWebSocketClient {
   private readonly CHANNEL_JOIN_DELAY_MS = 800;
   private isDestroyed = false;
 
-  // pending trade: ref → { resolve, timer }
   private pendingTrades: Map<number, { resolve: (dealId: string | null) => void; timer: NodeJS.Timeout }> = new Map();
 
   private onDealResultCb?: (payload: DealResultPayload) => void;
@@ -49,44 +50,28 @@ export class StockityWebSocketClient {
     private readonly userAgent: string,
   ) {}
 
-  setOnDealResult(cb: (payload: DealResultPayload) => void) {
-    this.onDealResultCb = cb;
-  }
-
-  setOnStatusChange(cb: (connected: boolean, reason?: string) => void) {
-    this.onStatusChangeCb = cb;
-  }
-
-  private getRef(): number {
-    return this.refCounter++;
-  }
+  setOnDealResult(cb: (payload: DealResultPayload) => void) { this.onDealResultCb = cb; }
+  setOnStatusChange(cb: (connected: boolean, reason?: string) => void) { this.onStatusChangeCb = cb; }
+  private getRef(): number { return this.refCounter++; }
 
   connect(): Promise<void> {
     return new Promise((resolve, reject) => {
       if (this.isDestroyed) return reject(new Error('Client sudah di-destroy'));
 
-      // ✅ FIX: Gunakan settled flag agar resolve/reject hanya dipanggil sekali
       let settled = false;
-      const doResolve = () => {
-        if (!settled) { settled = true; resolve(); }
-      };
-      const doReject = (err: Error) => {
-        if (!settled) { settled = true; reject(err); }
-      };
+      const doResolve = () => { if (!settled) { settled = true; resolve(); } };
+      const doReject = (err: Error) => { if (!settled) { settled = true; reject(err); } };
 
       try {
-        // ✅ FIX: Kirim authorization-token sebagai header langsung (sama dengan REST API)
-        // Tambahkan juga Cookie sebagai fallback
         this.ws = new WebSocket('wss://ws.stockity.id/?v=2&vsn=2.0.0', {
           headers: {
-            'authorization-token': this.authToken,   // ✅ Header utama (sama dengan REST)
-            'device-id': this.deviceId,              // ✅ Header device-id
-            'device-type': this.deviceType,          // ✅ Header device-type
+            'authorization-token': this.authToken,
+            'device-id': this.deviceId,
+            'device-type': this.deviceType,
             'user-timezone': 'Asia/Jakarta',
             'User-Agent': this.userAgent,
             'Origin': 'https://stockity.id',
             'Referer': 'https://stockity.id/',
-            // Cookie sebagai fallback (browser-style auth)
             'Cookie': `authtoken=${this.authToken}; device_type=${this.deviceType}; device_id=${this.deviceId}`,
             'Cache-Control': 'no-cache',
           },
@@ -103,24 +88,18 @@ export class StockityWebSocketClient {
           this.reconnectAttempts = 0;
           this.logger.log(`[${this.userId}] ✅ WebSocket connected`);
           this.onStatusChangeCb?.(true, 'Connected to Stockity WebSocket');
-
           await this.sleep(1000);
           await this.joinChannelsWithRetry();
           this.startHeartbeat();
-
-          doResolve(); // ✅ FIX: Resolve hanya sekali
+          doResolve();
         });
 
-        this.ws.on('message', (raw: Buffer | string) => {
-          this.handleMessage(raw.toString());
-        });
+        this.ws.on('message', (raw: Buffer | string) => { this.handleMessage(raw.toString()); });
 
         this.ws.on('error', (err) => {
           this.logger.error(`[${this.userId}] WS error: ${err.message}`);
           this.onStatusChangeCb?.(false, err.message);
           clearTimeout(connectTimeout);
-          // ✅ FIX: Reject hanya jika belum settled (initial connect)
-          // Jika sudah connected sebelumnya, error ditangani oleh close handler
           doReject(err);
         });
 
@@ -128,16 +107,10 @@ export class StockityWebSocketClient {
           this.logger.warn(`[${this.userId}] WS closed: ${code} ${reason?.toString()}`);
           this.stopHeartbeat();
           this.onStatusChangeCb?.(false, `Closed: ${code}`);
-          // ✅ FIX: Hanya reconnect jika initial connect sudah berhasil (settled via resolve)
-          // dan tidak sedang di-destroy
-          if (!this.isDestroyed && settled) {
-            this.scheduleReconnect();
-          }
+          if (!this.isDestroyed && settled) this.scheduleReconnect();
         });
 
-      } catch (err) {
-        doReject(err as Error);
-      }
+      } catch (err) { doReject(err as Error); }
     });
   }
 
@@ -151,13 +124,7 @@ export class StockityWebSocketClient {
         if (this.isDestroyed || !this.ws) break;
         if (this.joinedChannels.has(channel)) continue;
 
-        const sent = this.sendMsg({
-          topic: channel,
-          event: 'phx_join',
-          payload: {},
-          ref: this.getRef(),
-        });
-
+        const sent = this.sendMsg({ topic: channel, event: 'phx_join', payload: {}, ref: this.getRef() });
         if (sent) {
           this.joinedChannels.add(channel);
           await this.sleep(this.CHANNEL_JOIN_DELAY_MS);
@@ -190,35 +157,20 @@ export class StockityWebSocketClient {
   private sendMsg(msg: WsMessage): boolean {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return false;
     try {
-      this.ws.send(JSON.stringify({
-        topic: msg.topic,
-        event: msg.event,
-        payload: msg.payload,
-        ref: msg.ref,
-      }));
+      this.ws.send(JSON.stringify({ topic: msg.topic, event: msg.event, payload: msg.payload, ref: msg.ref }));
       return true;
-    } catch {
-      return false;
-    }
+    } catch { return false; }
   }
 
   private startHeartbeat() {
     this.stopHeartbeat();
     this.heartbeatTimer = setInterval(() => {
-      this.sendMsg({
-        topic: 'phoenix',
-        event: 'heartbeat',
-        payload: {},
-        ref: this.getRef(),
-      });
+      this.sendMsg({ topic: 'phoenix', event: 'heartbeat', payload: {}, ref: this.getRef() });
     }, this.HEARTBEAT_INTERVAL_MS);
   }
 
   private stopHeartbeat() {
-    if (this.heartbeatTimer) {
-      clearInterval(this.heartbeatTimer);
-      this.heartbeatTimer = null;
-    }
+    if (this.heartbeatTimer) { clearInterval(this.heartbeatTimer); this.heartbeatTimer = null; }
   }
 
   private scheduleReconnect() {
@@ -237,7 +189,6 @@ export class StockityWebSocketClient {
         await this.connect();
       } catch (err: any) {
         this.logger.error(`[${this.userId}] Reconnect failed: ${err.message}`);
-        // ✅ FIX: Jika reconnect gagal, coba lagi (scheduleReconnect dipanggil dari close event)
       }
     }, delay);
   }
@@ -250,9 +201,9 @@ export class StockityWebSocketClient {
       const payload: any = msg.payload ?? {};
       const ref: number = msg.ref ?? -1;
 
+      // ── phx_reply ────────────────────────────────────────────────────────
       if (event === 'phx_reply') {
         if (topic === 'phoenix') return;
-
         const status = payload?.status;
         const response = payload?.response;
 
@@ -262,7 +213,7 @@ export class StockityWebSocketClient {
             clearTimeout(pending.timer);
             pending.resolve(response.id);
             this.pendingTrades.delete(ref);
-            this.logger.log(`[${this.userId}] ✅ Trade placed: dealId=${response.id}`);
+            this.logger.log(`[${this.userId}] ✅ Trade placed (phx_reply): dealId=${response.id}`);
           }
         } else if (status === 'error') {
           const pending = this.pendingTrades.get(ref);
@@ -276,48 +227,69 @@ export class StockityWebSocketClient {
         return;
       }
 
-      if (topic === 'bo' && payload) {
-        if (['opened', 'closed', 'deal_result', 'close_deal_batch'].includes(event)) {
-          // ✅ FIX: close_deal_batch membawa array deals, bukan single id
-          // Payload: { deals: [{ id, status, result, ... }] }
-          if (event === 'close_deal_batch') {
-            const deals: any[] = payload.deals || payload.data || [];
-            for (const deal of deals) {
-              const dealId = deal.uuid ?? deal.id ?? deal.deal_id;
-              if (dealId) {
-                this.logger.debug(`[${this.userId}] Trade event: close_deal_batch id=${dealId}`);
-                this.onDealResultCb?.(deal);
-              }
-            }
-            return;
-          }
+      if (topic !== 'bo' || !payload) return;
+      if (!['opened', 'closed', 'deal_result', 'close_deal_batch'].includes(event)) return;
 
-          // Normalisasi dealId: Stockity pakai 'uuid' di event closed/deal_result,
-          // tapi 'id' (numeric) di event opened. Gunakan uuid sebagai primary key
-          // supaya opened -> activeDealId -> closed bisa matching.
-          const dealId = payload.uuid ?? payload.id ?? payload.deal_id ?? payload.dealId;
-          this.logger.debug(`[${this.userId}] Trade event: ${event} id=${dealId}`);
-
-          // Jika bo:opened masuk dan masih ada pendingTrade yang belum resolve,
-          // resolve dari sini menggunakan UUID supaya match saat bo:closed datang.
-          if (event === 'opened' && dealId && this.pendingTrades.size > 0) {
-            const oldestRef = Math.min(...this.pendingTrades.keys());
-            const pending = this.pendingTrades.get(oldestRef);
-            if (pending) {
-              clearTimeout(pending.timer);
-              pending.resolve(String(dealId));
-              this.pendingTrades.delete(oldestRef);
-              this.logger.log(`[${this.userId}] ✅ Trade confirmed via bo:opened: dealId=${dealId}`);
-            }
-          }
-
+      // ── close_deal_batch ─────────────────────────────────────────────────
+      if (event === 'close_deal_batch') {
+        const deals: any[] = payload.deals || payload.data || [];
+        for (const deal of deals) {
+          const numericId: string | undefined = deal.id != null ? String(deal.id) : undefined;
+          const uuidStr: string | undefined = deal.uuid ?? deal.deal_id ?? deal.dealId;
+          const dealId = uuidStr ?? numericId;
           if (dealId) {
-            // Normalisasi payload.id ke dealId supaya handleDealResult di executor bisa match
-            this.onDealResultCb?.({ ...payload, id: String(dealId) });
-          } else {
-            this.logger.warn(`[${this.userId}] ${event} payload missing id: ${JSON.stringify(payload).slice(0, 300)}`);
+            this.logger.debug(`[${this.userId}] Trade event: close_deal_batch id=${dealId}`);
+            this.onDealResultCb?.({ ...deal, id: dealId, numericId, uuid: uuidStr });
           }
         }
+        return;
+      }
+
+      // ─────────────────────────────────────────────────────────────────────
+      // STOCKITY DUAL-ID SYSTEM:
+      //   bo:opened  → payload.id = numeric (4643345638), tidak ada uuid
+      //   bo:closed  → payload.uuid = UUID string, tidak ada numeric id
+      //
+      // FIX: bo:opened hanya digunakan untuk resolve pendingTrade (activeDealId).
+      //      TIDAK di-emit ke executor — mencegah false-match karena opened
+      //      tidak punya status "won"/"lost", sama seperti Kotlin yang hanya
+      //      handle "closed"/"deal_result"/"trade_update" di isWebSocketTradeMatch.
+      //
+      //      bo:closed → emit ke executor dengan uuid sebagai primary id.
+      //      Executor pakai fallback matching (amount + trend + 120s window).
+      // ─────────────────────────────────────────────────────────────────────
+
+      const numericId: string | undefined = payload.id != null ? String(payload.id) : undefined;
+      const uuidStr: string | undefined = payload.uuid ?? payload.deal_id ?? payload.dealId;
+
+      if (event === 'opened') {
+        // Hanya resolve pendingTrade — TIDAK emit ke onDealResultCb
+        const dealId = numericId ?? uuidStr;
+        this.logger.debug(`[${this.userId}] Trade event: opened numeric=${numericId} (pendingTrade resolve only)`);
+
+        if (dealId && this.pendingTrades.size > 0) {
+          const oldestRef = Math.min(...this.pendingTrades.keys());
+          const pending = this.pendingTrades.get(oldestRef);
+          if (pending) {
+            clearTimeout(pending.timer);
+            pending.resolve(String(dealId));
+            this.pendingTrades.delete(oldestRef);
+            this.logger.log(`[${this.userId}] ✅ Trade confirmed via bo:opened: dealId=${dealId}`);
+          }
+        }
+        return; // ← TIDAK lanjut ke onDealResultCb
+      }
+
+      // closed / deal_result → uuid sebagai primary id
+      const dealId = uuidStr ?? numericId;
+      this.logger.debug(`[${this.userId}] Trade event: ${event} uuid=${uuidStr} numeric=${numericId}`);
+
+      if (dealId) {
+        this.onDealResultCb?.({ ...payload, id: String(dealId), numericId, uuid: uuidStr });
+      } else {
+        this.logger.warn(
+          `[${this.userId}] ${event} payload missing id: ${JSON.stringify(payload).slice(0, 300)}`,
+        );
       }
 
     } catch {
@@ -362,21 +334,13 @@ export class StockityWebSocketClient {
     });
   }
 
-  isConnected(): boolean {
-    return this.ws?.readyState === WebSocket.OPEN;
-  }
-
-  isRequiredChannelsReady(): boolean {
-    return [...this.REQUIRED_CHANNELS].every(c => this.joinedChannels.has(c));
-  }
+  isConnected(): boolean { return this.ws?.readyState === WebSocket.OPEN; }
+  isRequiredChannelsReady(): boolean { return [...this.REQUIRED_CHANNELS].every(c => this.joinedChannels.has(c)); }
 
   disconnect() {
     this.isDestroyed = true;
     this.stopHeartbeat();
-    if (this.reconnectTimer) {
-      clearTimeout(this.reconnectTimer);
-      this.reconnectTimer = null;
-    }
+    if (this.reconnectTimer) { clearTimeout(this.reconnectTimer); this.reconnectTimer = null; }
     for (const [, pending] of this.pendingTrades.entries()) {
       clearTimeout(pending.timer);
       pending.resolve(null);

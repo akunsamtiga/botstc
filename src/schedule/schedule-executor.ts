@@ -271,7 +271,23 @@ export class ScheduleExecutor {
       return;
     }
 
-    const dealId = await this.wsClient.placeTrade(tradeData);
+    const result = await this.wsClient.placeTrade(tradeData);
+    const dealId = result.dealId;
+
+    // amount_min → stop bot, tidak ada gunanya retry
+    if (result.error === 'amount_min') {
+      this.logger.error(`[${this.userId}] ❌ Amount di bawah minimum Stockity — bot dihentikan`);
+      this.callbacks.onStatusChange('Trade gagal: amount di bawah minimum Stockity. Cek konfigurasi.');
+      this.executionInfoMap.delete(order.id);
+      this.callbacks.onLog({
+        id: uuidv4(), orderId: order.id, time: order.time,
+        trend: order.trend, amount, martingaleStep: step,
+        result: 'FAILED', executedAt: Date.now(),
+        note: 'Amount di bawah minimum Stockity',
+      });
+      setTimeout(() => { this.stop(); this.callbacks.onAllCompleted(); }, 300);
+      return;
+    }
 
     if (dealId) {
       const idx = this.orders.findIndex(o => o.id === order.id);
@@ -279,18 +295,21 @@ export class ScheduleExecutor {
         this.orders[idx] = { ...this.orders[idx], activeDealId: dealId };
         this.callbacks.onOrdersUpdate(this.orders);
       }
-    } else {
+    } else if (result.error !== 'duplicate') {
       this.logger.error(`[${this.userId}] ❌ Trade failed for ${order.id}`);
       this.executionInfoMap.delete(order.id);
       if (isAlways) this.advanceAlwaysSignalLoss(order, step, amount);
+    } else {
+      this.logger.warn(`[${this.userId}] ⚠️ Duplicate deal ${order.id} — menunggu hasil via WS`);
     }
 
     this.callbacks.onLog({
       id: uuidv4(), orderId: order.id, time: order.time,
       trend: order.trend, amount, martingaleStep: step,
       dealId: dealId ?? undefined,
-      result: dealId ? undefined : 'FAILED',
+      result: (result.error && result.error !== 'duplicate') ? 'FAILED' : undefined,
       executedAt: Date.now(),
+      note: result.error === 'duplicate' ? 'Duplicate deal — menunggu hasil via WS' : undefined,
     });
   }
 
@@ -502,21 +521,45 @@ export class ScheduleExecutor {
       return;
     }
 
-    const dealId = await this.wsClient.placeTrade(tradeData);
+    const result = await this.wsClient.placeTrade(tradeData);
+    const dealId = result.dealId;
+
+    if (result.error === 'amount_min') {
+      this.logger.error(`[${this.userId}] ❌ Martingale amount di bawah minimum — bot dihentikan`);
+      this.callbacks.onStatusChange('Martingale gagal: amount di bawah minimum Stockity. Cek konfigurasi.');
+      this.executionInfoMap.delete(order.id);
+      this.activeMartingaleOrderId = undefined;
+      this.martingaleStartTime = undefined;
+      this.callbacks.onLog({
+        id: uuidv4(), orderId: order.id, time: order.time, trend: order.trend,
+        amount, martingaleStep: step,
+        result: 'FAILED', executedAt: Date.now(),
+        note: `Martingale step ${step}: amount di bawah minimum Stockity`,
+      });
+      setTimeout(() => { this.stop(); this.callbacks.onAllCompleted(); }, 300);
+      return;
+    }
+
     if (dealId) {
       const idx = this.orders.findIndex(o => o.id === order.id);
       if (idx !== -1) {
         this.orders[idx] = { ...this.orders[idx], activeDealId: dealId };
         this.callbacks.onOrdersUpdate(this.orders);
       }
-    } else {
+    } else if (result.error !== 'duplicate') {
       this.executionInfoMap.delete(order.id);
+    } else {
+      this.logger.warn(`[${this.userId}] ⚠️ Duplicate martingale deal step ${step} — menunggu hasil via WS`);
     }
+
     this.callbacks.onLog({
       id: uuidv4(), orderId: order.id, time: order.time, trend: order.trend,
       amount, martingaleStep: step, dealId: dealId ?? undefined,
-      result: dealId ? undefined : 'FAILED', executedAt: Date.now(),
-      note: `Martingale step ${step}`,
+      result: (result.error && result.error !== 'duplicate') ? 'FAILED' : undefined,
+      executedAt: Date.now(),
+      note: result.error === 'duplicate'
+        ? `Martingale step ${step}: duplicate deal — menunggu hasil via WS`
+        : `Martingale step ${step}`,
     });
   }
 

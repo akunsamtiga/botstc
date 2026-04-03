@@ -11,7 +11,7 @@ async function bootstrap() {
       'https://v2.stcautotrade.id',
       'http://localhost:3000',
       'http://localhost:3001',
-      // Tambahkan domain lain jika perlu
+      'https://bot.stcautotrade.id',   
     ],
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization'],

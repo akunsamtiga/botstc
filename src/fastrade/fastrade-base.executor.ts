@@ -216,7 +216,34 @@ export abstract class FastradeBaseExecutor {
       return null;
     }
 
-    const dealId = await this.wsClient.placeTrade(tradeData as any);
+    const result = await this.wsClient.placeTrade(tradeData as any);
+
+    // ── Handle permanent errors — stop bot immediately ───────────────
+    if (result.error === 'amount_min') {
+      this.logger.error(
+        `[${this.userId}] ❌ Amount ${amount} di bawah minimum Stockity — bot dihentikan`,
+      );
+      this.callbacks.onLog({
+        id: uuidv4(), orderId, trend, amount, martingaleStep,
+        result: 'FAILED', executedAt: now, cycleNumber: cycleNum,
+        note: 'Trade gagal: amount di bawah minimum Stockity. Cek konfigurasi.',
+      });
+      this.callbacks.onStatusChange(
+        `❌ Amount ${amount} di bawah minimum Stockity — bot dihentikan. Cek konfigurasi.`,
+      );
+      setTimeout(() => this.stop(), 300);
+      return null;
+    }
+
+    // ── Handle duplicate — trade sudah masuk, lanjut tanpa dealId ────
+    if (result.error === 'duplicate') {
+      this.logger.warn(
+        `[${this.userId}] ⚠️ Duplicate deal — trade probably went through, tracking without dealId`,
+      );
+      // Lanjut dengan dealId null, fallback match akan handle result dari WS
+    }
+
+    const dealId = result.dealId ?? null;
 
     const order: FastradeOrder = {
       id: orderId,
@@ -232,13 +259,16 @@ export abstract class FastradeBaseExecutor {
     this.callbacks.onLog({
       id: uuidv4(), orderId, trend, amount, martingaleStep,
       dealId: dealId ?? undefined,
-      result: dealId ? undefined : 'FAILED',
+      result: (result.error && result.error !== 'duplicate') ? 'FAILED' : undefined,
       executedAt: now,
       cycleNumber: cycleNum,
-      note: dealId ? undefined : 'Trade gagal: WS tidak merespons',
+      note: result.error === 'duplicate'
+        ? 'Duplicate deal — menunggu hasil via WS'
+        : (!dealId ? 'Trade gagal: WS tidak merespons' : undefined),
     });
 
-    if (!dealId) return null;
+    // Jika error non-duplicate dan tidak ada dealId, return null (gagal)
+    if (!dealId && result.error !== 'duplicate') return null;
 
     this.executionTime = now;
     return order;

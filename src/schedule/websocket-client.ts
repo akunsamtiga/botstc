@@ -2,6 +2,11 @@ import WebSocket = require('ws');
 import { Logger } from '@nestjs/common';
 import { TradeOrderData } from './types';
 
+export interface PlaceTradeResult {
+  dealId: string | null;
+  error?: 'amount_min' | 'duplicate' | 'unknown';
+}
+
 export interface DealResultPayload {
   id: string;          // primary id: uuid untuk closed/deal_result
   numericId?: string;  // numeric id dari payload.id (bo:opened)
@@ -34,7 +39,7 @@ export class StockityWebSocketClient {
   private readonly CHANNEL_JOIN_DELAY_MS = 800;
   private isDestroyed = false;
 
-  private pendingTrades: Map<number, { resolve: (dealId: string | null) => void; timer: NodeJS.Timeout }> = new Map();
+  private pendingTrades: Map<number, { resolve: (result: PlaceTradeResult) => void; timer: NodeJS.Timeout }> = new Map();
 
   private onDealResultCb?: (payload: DealResultPayload) => void;
   private onStatusChangeCb?: (connected: boolean, reason?: string) => void;
@@ -211,7 +216,7 @@ export class StockityWebSocketClient {
           const pending = this.pendingTrades.get(ref);
           if (pending) {
             clearTimeout(pending.timer);
-            pending.resolve(response.id);
+            pending.resolve({ dealId: response.id });
             this.pendingTrades.delete(ref);
             this.logger.log(`[${this.userId}] ✅ Trade placed (phx_reply): dealId=${response.id}`);
           }
@@ -219,7 +224,11 @@ export class StockityWebSocketClient {
           const pending = this.pendingTrades.get(ref);
           if (pending) {
             clearTimeout(pending.timer);
-            pending.resolve(null);
+            const reasons: string[] = (response?.reasons ?? []).map((r: any) => r.validation as string);
+            const error: PlaceTradeResult['error'] =
+              reasons.includes('deal_amount_min') ? 'amount_min' :
+              reasons.includes('duplicate_deal')  ? 'duplicate'  : 'unknown';
+            pending.resolve({ dealId: null, error });
             this.pendingTrades.delete(ref);
             this.logger.warn(`[${this.userId}] Trade error: ${JSON.stringify(response)}`);
           }
@@ -272,7 +281,7 @@ export class StockityWebSocketClient {
           const pending = this.pendingTrades.get(oldestRef);
           if (pending) {
             clearTimeout(pending.timer);
-            pending.resolve(String(dealId));
+            pending.resolve({ dealId: String(dealId) });
             this.pendingTrades.delete(oldestRef);
             this.logger.log(`[${this.userId}] ✅ Trade confirmed via bo:opened: dealId=${dealId}`);
           }
@@ -297,14 +306,14 @@ export class StockityWebSocketClient {
     }
   }
 
-  async placeTrade(order: TradeOrderData): Promise<string | null> {
+  async placeTrade(order: TradeOrderData): Promise<PlaceTradeResult> {
     const ref = this.getRef();
 
     return new Promise((resolve) => {
       const timer = setTimeout(() => {
         this.pendingTrades.delete(ref);
         this.logger.warn(`[${this.userId}] Trade timeout ref=${ref}`);
-        resolve(null);
+        resolve({ dealId: null, error: 'unknown' });
       }, 8000);
 
       this.pendingTrades.set(ref, { resolve, timer });
@@ -329,7 +338,7 @@ export class StockityWebSocketClient {
         clearTimeout(timer);
         this.pendingTrades.delete(ref);
         this.logger.error(`[${this.userId}] WS tidak open, tidak bisa place trade`);
-        resolve(null);
+        resolve({ dealId: null, error: 'unknown' });
       }
     });
   }

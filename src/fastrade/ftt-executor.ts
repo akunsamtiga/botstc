@@ -178,23 +178,42 @@ export class FttExecutor extends FastradeBaseExecutor {
 
   // ── Trade execution helpers ────────────────────────
 
-  private async executeWithTrend(trend: TrendType, step: number): Promise<void> {
+  private async executeWithTrend(trend: TrendType, step: number, retryCount = 0): Promise<void> {
     if (!this.isRunning) return;
+
+    const MAX_RETRIES = 3;
+    if (retryCount >= MAX_RETRIES) {
+      this.logger.error(
+        `[${this.userId}] FTT: Trade gagal ${MAX_RETRIES}x berturut-turut — bot dihentikan`,
+      );
+      this.callbacks.onStatusChange(
+        `FTT: Trade gagal ${MAX_RETRIES}x — cek konfigurasi amount/koneksi`,
+      );
+      this.stop();
+      return;
+    }
 
     this.phase = 'EXECUTING';
     const amount = this.calcAmount(step);
 
     this.logger.log(
       `[${this.userId}] FTT: Execute trend=${trend.toUpperCase()} amount=${amount} step=${step} ` +
-      `cycle=${this.cycleNumber}`,
+      `cycle=${this.cycleNumber}` +
+      (retryCount > 0 ? ` (retry ${retryCount}/${MAX_RETRIES})` : ''),
     );
 
     const order = await this.executeTrade(trend, amount, step, this.cycleNumber);
 
     if (!order) {
-      // Trade placement failed
-      this.logger.error(`[${this.userId}] FTT: Trade placement failed — waiting before new cycle`);
-      if (this.isRunning) this.scheduleNewCycle(CYCLE_RESTART_DELAY_MS);
+      // executeTrade sudah handle amount_min (stop bot) — cek isRunning sebelum retry
+      if (!this.isRunning) return;
+
+      this.logger.error(
+        `[${this.userId}] FTT: Trade placement failed — retry ${retryCount + 1}/${MAX_RETRIES} in 2s`,
+      );
+      setTimeout(() => {
+        if (this.isRunning) this.executeWithTrend(trend, step, retryCount + 1);
+      }, 2000);
       return;
     }
 

@@ -224,25 +224,42 @@ export class CtcExecutor extends FastradeBaseExecutor {
 
   // ── Trade execution helper ─────────────────────────
 
-  private async executeWithTrend(trend: TrendType, step: number): Promise<void> {
+  private async executeWithTrend(trend: TrendType, step: number, retryCount = 0): Promise<void> {
     if (!this.isRunning) return;
+
+    const MAX_RETRIES = 3;
+    if (retryCount >= MAX_RETRIES) {
+      this.logger.error(
+        `[${this.userId}] CTC: Trade gagal ${MAX_RETRIES}x berturut-turut — bot dihentikan`,
+      );
+      this.callbacks.onStatusChange(
+        `CTC: Trade gagal ${MAX_RETRIES}x — cek konfigurasi amount/koneksi`,
+      );
+      this.stop();
+      return;
+    }
 
     this.phase = 'EXECUTING';
     const amount = this.calcAmount(step);
 
     this.logger.log(
       `[${this.userId}] CTC: Execute trend=${trend.toUpperCase()} amount=${amount} step=${step} ` +
-      `activeTrend=${this.activeTrend} cycle=${this.cycleNumber}`,
+      `activeTrend=${this.activeTrend} cycle=${this.cycleNumber}` +
+      (retryCount > 0 ? ` (retry ${retryCount}/${MAX_RETRIES})` : ''),
     );
 
     const order = await this.executeTrade(trend, amount, step, this.cycleNumber);
 
     if (!order) {
-      // Trade failed — CTC retries immediately (no long delay, unlike FTT)
-      this.logger.error(`[${this.userId}] CTC: Trade placement failed — retrying in 500ms`);
+      // executeTrade sudah handle amount_min (stop bot) — cek isRunning sebelum retry
+      if (!this.isRunning) return;
+
+      this.logger.error(
+        `[${this.userId}] CTC: Trade placement failed — retry ${retryCount + 1}/${MAX_RETRIES} in 2s`,
+      );
       setTimeout(() => {
-        if (this.isRunning) this.executeWithTrend(trend, step);
-      }, 500);
+        if (this.isRunning) this.executeWithTrend(trend, step, retryCount + 1);
+      }, 2000);
       return;
     }
 

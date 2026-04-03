@@ -1,4 +1,4 @@
-import * as WebSocket from 'ws';
+import WebSocket = require('ws');
 import { Logger } from '@nestjs/common';
 import { TradeOrderData } from './types';
 

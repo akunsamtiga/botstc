@@ -54,6 +54,10 @@ export class CtcExecutor extends FastradeBaseExecutor {
    */
   private activeTrend?: TrendType;
 
+  /** Consecutive trade-placement failure counter (reset on any success) */
+  private tradeRetryCount = 0;
+  private readonly MAX_TRADE_RETRIES = 3;
+
   constructor(
     userId: string,
     wsClient: StockityWebSocketClient,
@@ -81,6 +85,7 @@ export class CtcExecutor extends FastradeBaseExecutor {
     this.currentTrend = undefined;
     this.activeTrend = undefined;
     this.phase = 'IDLE';
+    this.tradeRetryCount = 0;
     this.resetMartingale();
 
     this.logger.log(`[${this.userId}] 🔄 CTC CYCLE ${this.cycleNumber}: Starting`);
@@ -238,14 +243,35 @@ export class CtcExecutor extends FastradeBaseExecutor {
     const order = await this.executeTrade(trend, amount, step, this.cycleNumber);
 
     if (!order) {
-      // Trade failed — CTC retries immediately (no long delay, unlike FTT)
-      this.logger.error(`[${this.userId}] CTC: Trade placement failed — retrying in 500ms`);
+      // executeTrade already handles FATAL errors (deal_amount_min) by stopping the bot.
+      // If we're still running here, the error is retryable.
+      if (!this.isRunning) return;
+
+      this.tradeRetryCount++;
+
+      if (this.tradeRetryCount > this.MAX_TRADE_RETRIES) {
+        this.logger.error(
+          `[${this.userId}] CTC: Trade failed ${this.tradeRetryCount} times — ` +
+          `aborting current cycle and starting new one`,
+        );
+        this.tradeRetryCount = 0;
+        setTimeout(() => {
+          if (this.isRunning) this.startNewCycle();
+        }, CYCLE_RESTART_DELAY_MS);
+        return;
+      }
+
+      this.logger.error(
+        `[${this.userId}] CTC: Trade placement failed (retry ${this.tradeRetryCount}/${this.MAX_TRADE_RETRIES}) — retrying in 500ms`,
+      );
       setTimeout(() => {
         if (this.isRunning) this.executeWithTrend(trend, step);
       }, 500);
       return;
     }
 
+    // Trade placed successfully — reset retry counter
+    this.tradeRetryCount = 0;
     this.activeOrder = order;
     this.phase = 'WAITING_RESULT';
     this.callbacks.onStatusChange(
@@ -268,6 +294,7 @@ export class CtcExecutor extends FastradeBaseExecutor {
     );
     this.callbacks.onStatusChange(`CTC WIN ✅ — Lanjut ${trend.toUpperCase()} segera`);
     this.resetMartingale();
+    this.tradeRetryCount = 0;
 
     setTimeout(() => {
       if (this.isRunning) this.executeWithTrend(trend, 0);

@@ -216,14 +216,80 @@ export abstract class FastradeBaseExecutor {
       return null;
     }
 
-    const dealId = await this.wsClient.placeTrade(tradeData as any);
+    const result = await this.wsClient.placeTrade(tradeData as any);
 
+    // ── WS timeout / not open ───────────────────────────────────────
+    if (result === null) {
+      this.logger.error(`[${this.userId}] Trade placement failed: WS timeout or not open`);
+      this.callbacks.onLog({
+        id: uuidv4(), orderId, trend, amount, martingaleStep,
+        dealId: undefined,
+        result: 'FAILED', executedAt: now, cycleNumber: cycleNum,
+        note: 'Trade gagal: WS timeout',
+      });
+      return null;
+    }
+
+    const dealId = result.id;
+
+    // ── Server rejected trade — inspect reason ──────────────────────
+    if (!dealId) {
+      const reasons = result.reasons ?? [];
+      const validations = reasons.map(r => r.validation);
+
+      // FATAL: amount di bawah minimum — jangan retry, stop bot
+      if (validations.includes('deal_amount_min')) {
+        const iso = this.config.currencyIso?.toUpperCase() ?? '';
+        const msg =
+          `Amount ${amount} di bawah minimum Stockity (${iso}). ` +
+          `Perbaiki konfigurasi dan mulai ulang bot.`;
+        this.logger.error(`[${this.userId}] ❌ FATAL: deal_amount_min — stopping bot. ${msg}`);
+        this.callbacks.onStatusChange(`❌ Bot dihentikan: ${msg}`);
+        this.callbacks.onLog({
+          id: uuidv4(), orderId, trend, amount, martingaleStep,
+          result: 'FAILED', executedAt: now, cycleNumber: cycleNum,
+          note: `FATAL: deal_amount_min — ${msg}`,
+        });
+        // Stop bot async so caller can still see the null return
+        setTimeout(() => this.stop(), 100);
+        return null;
+      }
+
+      // RETRYABLE (duplicate_deal, etc.) — log and let caller decide retry
+      const reasonStr = validations.join(', ') || 'unknown';
+      this.logger.warn(`[${this.userId}] Trade rejected (${reasonStr}) — caller may retry`);
+      this.callbacks.onLog({
+        id: uuidv4(), orderId, trend, amount, martingaleStep,
+        dealId: undefined,
+        result: 'FAILED', executedAt: now, cycleNumber: cycleNum,
+        note: `Trade rejected: ${reasonStr}`,
+      });
+
+      // Special case: duplicate_deal means a trade already went through —
+      // wait for the result via fallback matching, do NOT retry
+      if (validations.includes('duplicate_deal')) {
+        this.logger.warn(
+          `[${this.userId}] duplicate_deal: trade already placed, waiting for result via fallback match`,
+        );
+        // Synthesise an order without dealId — fallback matching in handleDealResult will pick it up
+        const syntheticOrder: FastradeOrder = {
+          id: orderId, trend, amount, executedAt: now,
+          dealId: undefined, martingaleStep, isMartingale: martingaleStep > 0, cycleNumber: cycleNum,
+        };
+        this.executionTime = now;
+        return syntheticOrder;
+      }
+
+      return null;
+    }
+
+    // ── Success ─────────────────────────────────────────────────────
     const order: FastradeOrder = {
       id: orderId,
       trend,
       amount,
       executedAt: now,
-      dealId: dealId ?? undefined,
+      dealId,
       martingaleStep,
       isMartingale: martingaleStep > 0,
       cycleNumber: cycleNum,
@@ -231,14 +297,11 @@ export abstract class FastradeBaseExecutor {
 
     this.callbacks.onLog({
       id: uuidv4(), orderId, trend, amount, martingaleStep,
-      dealId: dealId ?? undefined,
-      result: dealId ? undefined : 'FAILED',
+      dealId,
+      result: undefined,
       executedAt: now,
       cycleNumber: cycleNum,
-      note: dealId ? undefined : 'Trade gagal: WS tidak merespons',
     });
-
-    if (!dealId) return null;
 
     this.executionTime = now;
     return order;

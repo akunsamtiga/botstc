@@ -1,4 +1,4 @@
-import * as WebSocket from 'ws';
+import WebSocket from 'ws';
 import { Logger } from '@nestjs/common';
 import { TradeOrderData } from './types';
 
@@ -34,7 +34,16 @@ export class StockityWebSocketClient {
   private readonly CHANNEL_JOIN_DELAY_MS = 800;
   private isDestroyed = false;
 
-  private pendingTrades: Map<number, { resolve: (dealId: string | null) => void; timer: NodeJS.Timeout }> = new Map();
+  /**
+   * Resolved with:
+   *   { id: string }        — trade placed successfully
+   *   { id: null, reasons } — rejected by server (e.g. deal_amount_min)
+   *   null                  — timeout or WS not open
+   */
+  private pendingTrades: Map<number, {
+    resolve: (result: { id: string | null; reasons?: Array<{ field: string; validation: string }> }) => void;
+    timer: NodeJS.Timeout;
+  }> = new Map();
 
   private onDealResultCb?: (payload: DealResultPayload) => void;
   private onStatusChangeCb?: (connected: boolean, reason?: string) => void;
@@ -211,7 +220,7 @@ export class StockityWebSocketClient {
           const pending = this.pendingTrades.get(ref);
           if (pending) {
             clearTimeout(pending.timer);
-            pending.resolve(response.id);
+            pending.resolve({ id: String(response.id) });
             this.pendingTrades.delete(ref);
             this.logger.log(`[${this.userId}] ✅ Trade placed (phx_reply): dealId=${response.id}`);
           }
@@ -219,7 +228,9 @@ export class StockityWebSocketClient {
           const pending = this.pendingTrades.get(ref);
           if (pending) {
             clearTimeout(pending.timer);
-            pending.resolve(null);
+            const reasons: Array<{ field: string; validation: string }> =
+              response?.reasons ?? [];
+            pending.resolve({ id: null, reasons });
             this.pendingTrades.delete(ref);
             this.logger.warn(`[${this.userId}] Trade error: ${JSON.stringify(response)}`);
           }
@@ -272,7 +283,7 @@ export class StockityWebSocketClient {
           const pending = this.pendingTrades.get(oldestRef);
           if (pending) {
             clearTimeout(pending.timer);
-            pending.resolve(String(dealId));
+            pending.resolve({ id: String(dealId) });
             this.pendingTrades.delete(oldestRef);
             this.logger.log(`[${this.userId}] ✅ Trade confirmed via bo:opened: dealId=${dealId}`);
           }
@@ -297,7 +308,7 @@ export class StockityWebSocketClient {
     }
   }
 
-  async placeTrade(order: TradeOrderData): Promise<string | null> {
+  async placeTrade(order: TradeOrderData): Promise<{ id: string | null; reasons?: Array<{ field: string; validation: string }> } | null> {
     const ref = this.getRef();
 
     return new Promise((resolve) => {

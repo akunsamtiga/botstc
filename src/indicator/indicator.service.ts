@@ -766,29 +766,41 @@ export class IndicatorService implements OnModuleDestroy {
   }
 
   private async fetchTradeResult(session: any, config: IndicatorConfig): Promise<any | null> {
-    try {
-      const response = await axios.get(
-        `${BASE_URL}/profile/trading-history?type=${config.isDemoAccount ? 'demo' : 'real'}`,
-        {
-          headers: this.buildStockityHeaders(session),
-          timeout: 5000,
+  try {
+    const response = await axios.get(
+      // ✅ BENAR - sesuai Kotlin
+      `${BASE_URL}/bo-deals-history/v3/deals/trade?type=${config.isDemoAccount ? 'demo' : 'real'}&locale=id`,
+      {
+        headers: {
+          'authorization-token': session.stockityToken,
+          'device-id': session.deviceId,
+          'device-type': session.deviceType || 'web',
+          'user-timezone': session.userTimezone || 'Asia/Jakarta',
+          'User-Agent': session.userAgent,
+          'Accept': 'application/json, text/plain, */*',
+          'Origin': 'https://stockity.id',
+          'Referer': 'https://stockity.id/',
         },
-      );
+        timeout: 5000,
+      },
+    );
 
-      if (response.data?.data) {
-        const trades = response.data.data;
-        const recentTrade = trades.find((t: any) => {
-          const tradeTime = new Date(t.created_at).getTime();
-          return tradeTime > Date.now() - 120000;
-        });
-        return recentTrade || null;
-      }
-      return null;
-    } catch (err) {
-      this.logger.error(`Error fetching trade result: ${err}`);
-      return null;
+    if (response.data?.data) {
+      // Response structure dari Kotlin:
+      // response.data.data.standard_trade_deals atau response.data.data.deals
+      const deals = response.data.data.standard_trade_deals || response.data.data.deals || [];
+      const recentTrade = deals.find((t: any) => {
+        const tradeTime = new Date(t.created_at).getTime();
+        return tradeTime > Date.now() - 120000;
+      });
+      return recentTrade || null;
     }
+    return null;
+  } catch (err) {
+    this.logger.error(`Error fetching trade result: ${err}`);
+    return null;
   }
+}
 
   private async handleTradeResult(
     userId: string,

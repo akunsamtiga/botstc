@@ -19,7 +19,7 @@ const MAX_RESULT_WAIT_MS = 120_000; // Reduced from 180s for faster result timeo
 /**
  * Window fallback matching: identik dengan Kotlin isWebSocketTradeMatch
  *   timeMatch = System.currentTimeMillis() - executionInfo.executionTime < 120000L
- * Reduced to 60s for faster martingale response while still safe for matching
+ * INCREASED to 120s to ensure trades that take 60-120s to close can still be matched
  */
 const FALLBACK_MATCH_WINDOW_MS = 120_000;
 
@@ -70,6 +70,13 @@ export class ScheduleExecutor {
   private executionInfoMap = new Map<string, ExecutionInfo>();
 
   /**
+   * Guard flag untuk mencegah duplikasi onAllCompleted callback
+   * - Set ke true saat onAllCompleted pertama kali dipanggil
+   - Reset saat start() atau cleanup()
+   */
+  private hasCompleted = false;
+
+  /**
    * Akumulasi P&L sesi ini (dalam satuan currency terkecil).
    * Reset saat bot di-start ulang.
    * WIN  → +profit (amount * profitRate)
@@ -95,6 +102,7 @@ export class ScheduleExecutor {
   start() {
     if (this.botState === 'RUNNING') return;
     this.botState = 'RUNNING';
+    this.hasCompleted = false;  // Reset completion flag
     this.alwaysSignalLossState = undefined;
     this.sessionPnL = 0;
     this.logger.log(`[${this.userId}] 🚀 Executor started | orders: ${this.orders.filter(o => !o.isExecuted && !o.isSkipped).length}`);
@@ -379,7 +387,7 @@ export class ScheduleExecutor {
       if (orderIdx !== -1) {
         const order = this.orders[orderIdx];
         this.logger.warn(
-          `[${this.userId}] ⚠️ Fallback match ${order.time} ${order.trend} ` +
+          `[${this.userId}] Fallback match ${order.time} ${order.trend} ` +
           `by amount=${payload.amount} trend=${payload.trend} ` +
           `(dealId=${dealId}, activeDealId=${order.activeDealId})`,
         );
@@ -393,12 +401,12 @@ export class ScheduleExecutor {
       if (this.activeMartingaleOrderId) {
         const mIdx = this.orders.findIndex(o => o.id === this.activeMartingaleOrderId);
         if (mIdx !== -1) {
-          this.logger.warn(`[${this.userId}] ⚠️ No order match, applying to active martingale: ${this.orders[mIdx].time}`);
+          this.logger.warn(`[${this.userId}] No order match, applying to active martingale: ${this.orders[mIdx].time}`);
           this.processMartingaleResult(mIdx, isWin, isDraw, dealId);
         }
       } else {
         this.logger.warn(
-          `[${this.userId}] ⚠️ handleDealResult: no order found ` +
+          `[${this.userId}] handleDealResult: no order found ` +
           `dealId=${dealId} uuid=${payload.uuid} amount=${payload.amount} status=${s}`,
         );
       }
@@ -460,7 +468,7 @@ export class ScheduleExecutor {
       const info = this.executionInfoMap.get(o.id);
       if (!info) return false;
 
-      // timeMatch
+      // timeMatch - INCREASED to 120s
       if (now - info.executedAt > FALLBACK_MATCH_WINDOW_MS) return false;
 
       // amountMatch
@@ -680,7 +688,11 @@ export class ScheduleExecutor {
       setTimeout(async () => { 
         this.stop(); 
         try {
-          await this.callbacks.onAllCompleted();
+          // Guard: hanya panggil onAllCompleted sekali
+          if (!this.hasCompleted) {
+            this.hasCompleted = true;
+            await this.callbacks.onAllCompleted();
+          }
         } catch (err: any) {
           this.logger.error(`[${this.userId}] ❌ onAllCompleted error: ${err.message}`);
         }
@@ -698,7 +710,11 @@ export class ScheduleExecutor {
       setTimeout(async () => { 
         this.stop(); 
         try {
-          await this.callbacks.onAllCompleted();
+          // Guard: hanya panggil onAllCompleted sekali
+          if (!this.hasCompleted) {
+            this.hasCompleted = true;
+            await this.callbacks.onAllCompleted();
+          }
         } catch (err: any) {
           this.logger.error(`[${this.userId}] ❌ onAllCompleted error: ${err.message}`);
         }
@@ -775,7 +791,11 @@ export class ScheduleExecutor {
       setTimeout(async () => { 
         this.stop(); 
         try {
-          await this.callbacks.onAllCompleted();
+          // Guard: hanya panggil onAllCompleted sekali
+          if (!this.hasCompleted) {
+            this.hasCompleted = true;
+            await this.callbacks.onAllCompleted();
+          }
         } catch (err: any) {
           this.logger.error(`[${this.userId}] ❌ onAllCompleted error: ${err.message}`);
         }

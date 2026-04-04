@@ -8,19 +8,20 @@ import {
 } from './types';
 
 const JAKARTA_OFFSET_MS = 7 * 60 * 60 * 1000;
-const EXECUTION_ADVANCE_MS = 0;
-const PRECISION_CHECK_MS = 100;
+const EXECUTION_ADVANCE_MS = 200;  // Start execution 200ms earlier to compensate network latency
+const PRECISION_CHECK_MS = 50;     // Check every 50ms for more responsive detection
 const EXECUTION_WINDOW_MS = 4900;
 const MARTINGALE_MAX_DURATION_MS = 600000;
 const STEP_STUCK_THRESHOLD_MS = 150000;
-const MIN_PREP_TIME_MS = 10000;
-const MAX_RESULT_WAIT_MS = 180_000;
+const MIN_PREP_TIME_MS = 5000;      // Reduced from 10s for faster martingale execution
+const MAX_RESULT_WAIT_MS = 120_000; // Reduced from 180s for faster result timeout
 
 /**
  * Window fallback matching: identik dengan Kotlin isWebSocketTradeMatch
  *   timeMatch = System.currentTimeMillis() - executionInfo.executionTime < 120000L
+ * Reduced to 60s for faster martingale response while still safe for matching
  */
-const FALLBACK_MATCH_WINDOW_MS = 120_000;
+const FALLBACK_MATCH_WINDOW_MS = 60_000;
 
 /**
  * Status terminal dari Stockity WebSocket.
@@ -740,7 +741,7 @@ export class ScheduleExecutor {
 
   private startCompletionCheck() {
     this.stopCompletionCheck();
-    this.completionTimer = setInterval(() => this.checkCompletion(), 5000);
+    this.completionTimer = setInterval(() => this.checkCompletion(), 2000);  // Check every 2s for faster response
   }
 
   private stopCompletionCheck() {
@@ -750,7 +751,7 @@ export class ScheduleExecutor {
   private checkCompletion() {
     if (this.botState !== 'RUNNING') return;
     const now = Date.now();
-    if (now - this.lastCompletionCheck < 5000) return;
+    if (now - this.lastCompletionCheck < 2000) return;  // Match interval
     this.lastCompletionCheck = now;
 
     const hasPending         = this.orders.some(o => !o.isExecuted && !o.isSkipped);

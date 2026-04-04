@@ -36,7 +36,7 @@ export class StockityWebSocketClient {
   private reconnectAttempts = 0;
   private readonly MAX_RECONNECT = 10;
   private readonly HEARTBEAT_INTERVAL_MS = 25000;
-  private readonly CHANNEL_JOIN_DELAY_MS = 800;
+  private readonly CHANNEL_JOIN_DELAY_MS = 400;  // Reduced from 800ms for faster channel joining
   private isDestroyed = false;
 
   private pendingTrades: Map<number, { resolve: (result: PlaceTradeResult) => void; timer: NodeJS.Timeout }> = new Map();
@@ -93,7 +93,7 @@ export class StockityWebSocketClient {
           this.reconnectAttempts = 0;
           this.logger.log(`[${this.userId}] ✅ WebSocket connected`);
           this.onStatusChangeCb?.(true, 'Connected to Stockity WebSocket');
-          await this.sleep(1000);
+          await this.sleep(300);  // Reduced from 1000ms for faster readiness
           await this.joinChannelsWithRetry();
           this.startHeartbeat();
           doResolve();
@@ -314,7 +314,7 @@ export class StockityWebSocketClient {
         this.pendingTrades.delete(ref);
         this.logger.warn(`[${this.userId}] Trade timeout ref=${ref}`);
         resolve({ dealId: null, error: 'unknown' });
-      }, 8000);
+      }, 5000);  // Reduced from 8s for faster timeout response
 
       this.pendingTrades.set(ref, { resolve, timer });
 

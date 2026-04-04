@@ -54,8 +54,9 @@ export class ProfileService {
       const real = data.find((d) => d.account_type === 'real');
       const demo = data.find((d) => d.account_type === 'demo');
       return {
-        realBalance: real?.balance ?? 0,
-        demoBalance: demo?.balance ?? 0,
+        real_balance: real?.balance ?? 0,
+        demo_balance: demo?.balance ?? 0,
+        balance: real?.balance ?? 0,
         currency: real?.currency ?? session.currency ?? 'IDR',
       };
     } catch (err: any) {

@@ -285,7 +285,14 @@ export class ScheduleExecutor {
         result: 'FAILED', executedAt: Date.now(),
         note: 'Amount di bawah minimum Stockity',
       });
-      setTimeout(() => { this.stop(); this.callbacks.onAllCompleted(); }, 300);
+      setTimeout(async () => { 
+        this.stop(); 
+        try {
+          await this.callbacks.onAllCompleted();
+        } catch (err: any) {
+          this.logger.error(`[${this.userId}] ❌ onAllCompleted error: ${err.message}`);
+        }
+      }, 300);
       return;
     }
 
@@ -536,7 +543,14 @@ export class ScheduleExecutor {
         result: 'FAILED', executedAt: Date.now(),
         note: `Martingale step ${step}: amount di bawah minimum Stockity`,
       });
-      setTimeout(() => { this.stop(); this.callbacks.onAllCompleted(); }, 300);
+      setTimeout(async () => { 
+        this.stop(); 
+        try {
+          await this.callbacks.onAllCompleted();
+        } catch (err: any) {
+          this.logger.error(`[${this.userId}] ❌ onAllCompleted error: ${err.message}`);
+        }
+      }, 300);
       return;
     }
 
@@ -604,6 +618,12 @@ export class ScheduleExecutor {
     const order = this.orders[orderIdx];
     const finalResult = result === 'WIN' ? 'WIN' : result === 'DRAW' ? 'DRAW' : 'LOSS';
 
+    // Clear activeMartingaleOrderId if this completed order was the active one
+    if (this.activeMartingaleOrderId === order.id) {
+      this.activeMartingaleOrderId = undefined;
+      this.martingaleStartTime = undefined;
+    }
+
     // ── Hitung profit/loss trade ini ─────────────────────────────────────
     // WIN  → amount * profitRate (default 85% jika profitRate tidak tersedia)
     // LOSE → -amount
@@ -656,7 +676,14 @@ export class ScheduleExecutor {
         `sessionPnL=${pnl} <= -${stopLoss} — bot berhenti`,
       );
       this.callbacks.onStatusChange(`Stop Loss triggered (PnL: ${pnl})`);
-      setTimeout(() => { this.stop(); this.callbacks.onAllCompleted(); }, 1000);
+      setTimeout(async () => { 
+        this.stop(); 
+        try {
+          await this.callbacks.onAllCompleted();
+        } catch (err: any) {
+          this.logger.error(`[${this.userId}] ❌ onAllCompleted error: ${err.message}`);
+        }
+      }, 1000);
       return;
     }
 
@@ -667,7 +694,14 @@ export class ScheduleExecutor {
         `sessionPnL=${pnl} >= ${stopProfit} — bot berhenti`,
       );
       this.callbacks.onStatusChange(`Stop Profit triggered (PnL: +${pnl})`);
-      setTimeout(() => { this.stop(); this.callbacks.onAllCompleted(); }, 1000);
+      setTimeout(async () => { 
+        this.stop(); 
+        try {
+          await this.callbacks.onAllCompleted();
+        } catch (err: any) {
+          this.logger.error(`[${this.userId}] ❌ onAllCompleted error: ${err.message}`);
+        }
+      }, 1000);
     }
   }
 
@@ -737,7 +771,14 @@ export class ScheduleExecutor {
 
     if (!hasPending && !this.activeMartingaleOrderId && !hasIncompleteMart && !hasAwaitingResult && this.orders.length > 0) {
       this.logger.log(`[${this.userId}] ✅ All schedules completed`);
-      setTimeout(() => { this.stop(); this.callbacks.onAllCompleted(); }, 3000);
+      setTimeout(async () => { 
+        this.stop(); 
+        try {
+          await this.callbacks.onAllCompleted();
+        } catch (err: any) {
+          this.logger.error(`[${this.userId}] ❌ onAllCompleted error: ${err.message}`);
+        }
+      }, 3000);
     }
   }
 

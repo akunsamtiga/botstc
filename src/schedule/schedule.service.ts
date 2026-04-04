@@ -127,7 +127,11 @@ export class ScheduleService implements OnModuleInit, OnModuleDestroy {
         const name: string = asset.name;
         const assetType: number = asset.type;
         const typeName = TYPE_NAME_MAPPING[assetType] ?? `Type-${assetType}`;
-        const iconUrl: string | null = asset.icon?.url ?? null;
+        let iconUrl: string | null = asset.icon?.url ?? null;
+        // Ensure icon URL is absolute
+        if (iconUrl && !iconUrl.startsWith('http')) {
+          iconUrl = `https://stockity.id${iconUrl.startsWith('/') ? '' : '/'}${iconUrl}`;
+        }
 
         // Cari profit rate — identik dengan Kotlin processAssets()
         let profitRate: number | null = null;
@@ -349,8 +353,16 @@ export class ScheduleService implements OnModuleInit, OnModuleDestroy {
       },
       onAllCompleted: async () => {
         this.logger.log(`[${userId}] All completed`);
-        await this.updateStatus(userId, 'STOPPED');
-        this.cleanup(userId);
+        const exec = this.executors.get(userId);
+        const status = exec?.getStatus() as any;
+        const sessionPnL = status?.sessionPnL ?? 0;
+        try {
+          await this.updateStatus(userId, 'STOPPED', sessionPnL);
+        } catch (err: any) {
+          this.logger.error(`[${userId}] Failed to update status: ${err.message}`);
+        } finally {
+          this.cleanup(userId);
+        }
       },
       onStatusChange: (s) => this.logger.debug(`[${userId}] ${s}`),
     };
@@ -400,14 +412,16 @@ export class ScheduleService implements OnModuleInit, OnModuleDestroy {
     }
     const statusDoc = await this.firebaseService.db.collection('schedule_status').doc(userId).get();
     const orders = await this.getOrders(userId);
+    const statusData = statusDoc.exists ? statusDoc.data() : null;
     return {
-      botState: statusDoc.exists ? statusDoc.data()?.botState ?? 'STOPPED' : 'STOPPED',
+      botState: statusData?.botState ?? 'STOPPED',
       totalOrders: orders.length,
       pendingOrders: orders.filter(o => !o.isExecuted && !o.isSkipped).length,
       executedOrders: orders.filter(o => o.isExecuted).length,
       skippedOrders: orders.filter(o => o.isSkipped).length,
       activeMartingaleOrderId: null,
       wsConnected: false,
+      sessionPnL: statusData?.sessionPnL ?? 0,
       orders,
     };
   }
@@ -464,10 +478,13 @@ export class ScheduleService implements OnModuleInit, OnModuleDestroy {
 
   // ── Firebase helpers ──────────────────────────
 
-  private async updateStatus(userId: string, botState: string) {
+  private async updateStatus(userId: string, botState: string, sessionPnL?: number) {
     const extra: any = {};
     if (botState === 'RUNNING') extra.startedAt = this.firebaseService.FieldValue.serverTimestamp();
-    if (botState === 'STOPPED') extra.stoppedAt = this.firebaseService.FieldValue.serverTimestamp();
+    if (botState === 'STOPPED') {
+      extra.stoppedAt = this.firebaseService.FieldValue.serverTimestamp();
+      if (sessionPnL !== undefined) extra.sessionPnL = sessionPnL;
+    }
     await this.firebaseService.db.collection('schedule_status').doc(userId).set(
       { botState, updatedAt: this.firebaseService.FieldValue.serverTimestamp(), ...extra },
       { merge: true },

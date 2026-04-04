@@ -1,0 +1,974 @@
+import { Injectable, Logger, OnModuleDestroy } from '@nestjs/common';
+import { FirebaseService } from '../firebase/firebase.service';
+import { AuthService } from '../auth/auth.service';
+import { StockityWebSocketClient } from '../schedule/websocket-client';
+import axios from 'axios';
+import { v4 as uuidv4 } from 'uuid';
+import {
+  MomentumType,
+  MomentumSignal,
+  MomentumOrder,
+  MomentumMartingaleOrder,
+  Candle,
+  CandleApiResponse,
+  BollingerBands,
+  SignalState,
+  MomentumStates,
+  SIGNAL_COOLDOWN_MS,
+  PRICE_MOVE_THRESHOLD,
+  MAX_SIGNALS_PER_HOUR,
+  SIGNAL_HISTORY_CLEANUP_MS,
+  MAX_CANDLES_STORAGE,
+  MIN_CANDLES_FOR_BB_SAR,
+  CANDLES_5SEC_PER_MINUTE,
+  FETCH_5SEC_OFFSET,
+} from './types';
+
+const BASE_URL = 'https://api.stockity.id';
+
+interface MomentumConfig {
+  asset: { ric: string; name: string } | null;
+  enabledMomentums: {
+    candleSabit: boolean;
+    dojiTerjepit: boolean;
+    dojiPembatalan: boolean;
+    bbSarBreak: boolean;
+  };
+  martingale: {
+    isEnabled: boolean;
+    maxSteps: number;
+    baseAmount: number;
+    multiplierValue: number;
+    multiplierType: 'FIXED' | 'PERCENTAGE';
+  };
+  isDemoAccount: boolean;
+  currency: string;
+}
+
+@Injectable()
+export class MomentumService implements OnModuleDestroy {
+  private readonly logger = new Logger(MomentumService.name);
+  private configs = new Map<string, MomentumConfig>();
+  private activeModes = new Map<string, {
+    isActive: boolean;
+    wsClient: StockityWebSocketClient;
+    candleStorage: Candle[];
+    momentumOrders: MomentumOrder[];
+    activeMartingaleOrders: Map<string, MomentumMartingaleOrder>;
+    activeMomentumOrders: Map<string, { momentumType: MomentumType; orderId: string; trend: string; executedTime: number; isSettled: boolean }>;
+    momentumStates: MomentumStates;
+    totalExecutions: number;
+    totalWins: number;
+    totalLosses: number;
+    candleFetchInterval?: NodeJS.Timeout;
+    processedOrderIds: Set<string>;
+  }>();
+
+  constructor(
+    private readonly firebaseService: FirebaseService,
+    private readonly authService: AuthService,
+  ) {}
+
+  onModuleDestroy() {
+    for (const [userId, mode] of this.activeModes) {
+      this.stopMomentumMode(userId);
+    }
+  }
+
+  // ==================== CONFIG ====================
+
+  async getConfig(userId: string): Promise<MomentumConfig> {
+    if (this.configs.has(userId)) return this.configs.get(userId)!;
+
+    const doc = await this.firebaseService.db.collection('momentum_configs').doc(userId).get();
+    if (doc.exists) {
+      const d = doc.data() as any;
+      const cfg: MomentumConfig = {
+        asset: d.asset || null,
+        enabledMomentums: d.enabledMomentums || {
+          candleSabit: true,
+          dojiTerjepit: true,
+          dojiPembatalan: true,
+          bbSarBreak: true,
+        },
+        martingale: d.martingale || {
+          isEnabled: true,
+          maxSteps: 2,
+          baseAmount: 1400000,
+          multiplierValue: 2.5,
+          multiplierType: 'FIXED',
+        },
+        isDemoAccount: d.isDemoAccount ?? true,
+        currency: d.currency || 'IDR',
+      };
+      this.configs.set(userId, cfg);
+      return cfg;
+    }
+
+    const def: MomentumConfig = {
+      asset: null,
+      enabledMomentums: {
+        candleSabit: true,
+        dojiTerjepit: true,
+        dojiPembatalan: true,
+        bbSarBreak: true,
+      },
+      martingale: {
+        isEnabled: true,
+        maxSteps: 2,
+        baseAmount: 1400000,
+        multiplierValue: 2.5,
+        multiplierType: 'FIXED',
+      },
+      isDemoAccount: true,
+      currency: 'IDR',
+    };
+    this.configs.set(userId, def);
+    return def;
+  }
+
+  async updateConfig(userId: string, dto: Partial<MomentumConfig>): Promise<MomentumConfig> {
+    const current = await this.getConfig(userId);
+    const updated = { ...current, ...dto };
+    this.configs.set(userId, updated);
+
+    const plainCfg = JSON.parse(JSON.stringify(updated));
+    await this.firebaseService.db.collection('momentum_configs').doc(userId).set(
+      { ...plainCfg, updatedAt: this.firebaseService.FieldValue.serverTimestamp() },
+      { merge: true },
+    );
+
+    return updated;
+  }
+
+  // ==================== MOMENTUM MODE CONTROL ====================
+
+  async startMomentumMode(userId: string): Promise<{ message: string; status: string }> {
+    const existing = this.activeModes.get(userId);
+    if (existing?.isActive) {
+      return { message: 'Momentum mode sudah berjalan', status: 'RUNNING' };
+    }
+
+    const session = await this.authService.getSession(userId);
+    if (!session) throw new Error('Session tidak ditemukan');
+
+    const config = await this.getConfig(userId);
+    if (!config.asset?.ric) {
+      throw new Error('Asset belum dikonfigurasi');
+    }
+
+    const ws = new StockityWebSocketClient(
+      userId,
+      session.stockityToken,
+      session.deviceId,
+      session.deviceType || 'web',
+      session.userAgent,
+    );
+
+    try {
+      await ws.connect();
+    } catch (err: any) {
+      ws.disconnect();
+      throw new Error(`Gagal koneksi WebSocket: ${err.message}`);
+    }
+
+    const initialStates: MomentumStates = {
+      candleSabit: this.createSignalState(),
+      dojiTerjepit: this.createSignalState(),
+      dojiPembatalan: this.createSignalState(),
+      bbSarBreak: this.createSignalState(),
+    };
+
+    this.activeModes.set(userId, {
+      isActive: true,
+      wsClient: ws,
+      candleStorage: [],
+      momentumOrders: [],
+      activeMartingaleOrders: new Map(),
+      activeMomentumOrders: new Map(),
+      momentumStates: initialStates,
+      totalExecutions: 0,
+      totalWins: 0,
+      totalLosses: 0,
+      processedOrderIds: new Set(),
+    });
+
+    await this.updateStatus(userId, 'RUNNING');
+    this.logger.log(`[${userId}] Momentum mode started`);
+
+    // Start candle storage loop
+    this.startCandleStorageLoop(userId, config, session);
+
+    return { message: 'Momentum mode dimulai', status: 'RUNNING' };
+  }
+
+  async stopMomentumMode(userId: string): Promise<{ message: string }> {
+    const mode = this.activeModes.get(userId);
+    if (!mode?.isActive) {
+      return { message: 'Momentum mode tidak berjalan' };
+    }
+
+    mode.isActive = false;
+    if (mode.candleFetchInterval) {
+      clearInterval(mode.candleFetchInterval);
+    }
+    mode.wsClient.disconnect();
+    this.activeModes.delete(userId);
+
+    await this.updateStatus(userId, 'STOPPED');
+    this.logger.log(`[${userId}] Momentum mode stopped`);
+
+    return { message: 'Momentum mode dihentikan' };
+  }
+
+  async getStatus(userId: string): Promise<object> {
+    const mode = this.activeModes.get(userId);
+    const config = await this.getConfig(userId);
+
+    if (mode) {
+      return {
+        isActive: mode.isActive,
+        botState: 'RUNNING',
+        totalExecutions: mode.totalExecutions,
+        totalWins: mode.totalWins,
+        totalLosses: mode.totalLosses,
+        wsConnected: mode.wsClient.isConnected(),
+        candleStorage: mode.candleStorage.length,
+        momentumOrders: mode.momentumOrders,
+        activeMartingaleOrders: Array.from(mode.activeMartingaleOrders.entries()),
+        config,
+      };
+    }
+
+    const statusDoc = await this.firebaseService.db.collection('momentum_status').doc(userId).get();
+    return {
+      isActive: false,
+      botState: statusDoc.exists ? (statusDoc.data()?.botState ?? 'STOPPED') : 'STOPPED',
+      config,
+    };
+  }
+
+  // ==================== CANDLE STORAGE & ANALYSIS ====================
+
+  private startCandleStorageLoop(userId: string, config: MomentumConfig, session: any) {
+    const mode = this.activeModes.get(userId);
+    if (!mode) return;
+
+    const runCycle = async () => {
+      if (!mode.isActive) return;
+
+      try {
+        const serverNow = Date.now();
+        const nextMinuteStart = this.calculateNextMinuteStart(serverNow);
+        const waitTime = nextMinuteStart - serverNow;
+
+        if (waitTime > 0) {
+          await this.sleep(waitTime);
+        }
+
+        if (!mode.isActive) return;
+
+        await this.sleep(FETCH_5SEC_OFFSET);
+
+        const newCandle = await this.fetchAndAggregateOneMinuteCandle(config.asset!.ric, session);
+
+        if (newCandle) {
+          this.addCandleToStorage(userId, newCandle);
+
+          if (mode.candleStorage.length >= 2) {
+            await this.analyzeAllMomentums(userId, config, session);
+          }
+        }
+      } catch (err) {
+        this.logger.error(`[${userId}] Error in candle storage loop: ${err}`);
+      }
+
+      // Schedule next cycle
+      if (mode.isActive) {
+        setTimeout(() => runCycle(), 1000);
+      }
+    };
+
+    runCycle();
+  }
+
+  private calculateNextMinuteStart(serverTime: number): number {
+    const seconds = Math.floor((serverTime / 1000) % 60);
+    const millis = serverTime % 1000;
+    return serverTime + ((60 - seconds) * 1000) - millis;
+  }
+
+  private async fetchAndAggregateOneMinuteCandle(symbol: string, session: any): Promise<Candle | null> {
+    try {
+      const encodedSymbol = symbol.replace('/', '%2F');
+      const now = new Date();
+      const dateForApi = now.toISOString().slice(0, 13) + ':00:00';
+
+      const response = await axios.get<CandleApiResponse>(
+        `${BASE_URL}/candles/v1/${encodedSymbol}/${dateForApi}/5`,
+        {
+          headers: this.buildStockityHeaders(session),
+          timeout: 5000,
+        },
+      );
+
+      if (response.data?.data) {
+        const candles5Sec = response.data.data
+          .map((d) => this.parseCandleData(d))
+          .filter((c): c is Candle => c !== null);
+
+        const last12Candles = candles5Sec.slice(-CANDLES_5SEC_PER_MINUTE);
+        return this.aggregateCandlesToOneMinute(last12Candles);
+      }
+      return null;
+    } catch (err) {
+      this.logger.error(`Error fetching candles: ${err}`);
+      return null;
+    }
+  }
+
+  private parseCandleData(data: any): Candle | null {
+    try {
+      const candle: Candle = {
+        open: parseFloat(data.open),
+        close: parseFloat(data.close),
+        high: parseFloat(data.high),
+        low: parseFloat(data.low),
+        createdAt: data.created_at,
+      };
+
+      if (candle.open > 0 && candle.close > 0) {
+        return candle;
+      }
+      return null;
+    } catch {
+      return null;
+    }
+  }
+
+  private aggregateCandlesToOneMinute(candles5Sec: Candle[]): Candle | null {
+    if (candles5Sec.length === 0) return null;
+
+    return {
+      open: candles5Sec[0].open,
+      close: candles5Sec[candles5Sec.length - 1].close,
+      high: Math.max(...candles5Sec.map((c) => c.high)),
+      low: Math.min(...candles5Sec.map((c) => c.low)),
+      createdAt: candles5Sec[candles5Sec.length - 1].createdAt,
+    };
+  }
+
+  private addCandleToStorage(userId: string, candle: Candle) {
+    const mode = this.activeModes.get(userId);
+    if (!mode) return;
+
+    mode.candleStorage.push(candle);
+    if (mode.candleStorage.length > MAX_CANDLES_STORAGE) {
+      mode.candleStorage.shift();
+    }
+
+    this.logger.debug(`[${userId}] Candle added. Storage: ${mode.candleStorage.length}/${MAX_CANDLES_STORAGE}`);
+  }
+
+  // ==================== MOMENTUM ANALYSIS ====================
+
+  private async analyzeAllMomentums(userId: string, config: MomentumConfig, session: any) {
+    const mode = this.activeModes.get(userId);
+    if (!mode) return;
+
+    const signals: MomentumSignal[] = [];
+
+    if (config.enabledMomentums.candleSabit) {
+      const signal = this.analyzeCandleSabit(mode.candleStorage, mode.momentumStates.candleSabit);
+      if (signal) {
+        signals.push(signal);
+        this.logger.log(`[${userId}] Signal detected: CANDLE_SABIT (${signal.trend})`);
+      }
+    }
+
+    if (config.enabledMomentums.dojiTerjepit) {
+      const signal = this.analyzeDojiTerjepit(mode.candleStorage, mode.momentumStates.dojiTerjepit);
+      if (signal) {
+        signals.push(signal);
+        this.logger.log(`[${userId}] Signal detected: DOJI_TERJEPIT (${signal.trend})`);
+      }
+    }
+
+    if (config.enabledMomentums.dojiPembatalan) {
+      const signal = this.analyzeDojiPembatalan(mode.candleStorage, mode.momentumStates.dojiPembatalan);
+      if (signal) {
+        signals.push(signal);
+        this.logger.log(`[${userId}] Signal detected: DOJI_PEMBATALAN (${signal.trend})`);
+      }
+    }
+
+    if (config.enabledMomentums.bbSarBreak && mode.candleStorage.length >= MIN_CANDLES_FOR_BB_SAR) {
+      const signal = this.analyzeBBSARBreak(mode.candleStorage, mode.momentumStates.bbSarBreak);
+      if (signal) {
+        signals.push(signal);
+        this.logger.log(`[${userId}] Signal detected: BB_SAR_BREAK (${signal.trend})`);
+      }
+    }
+
+    for (const signal of signals) {
+      await this.executeMomentumOrder(userId, config, session, signal);
+    }
+  }
+
+  private analyzeCandleSabit(candles: Candle[], state: SignalState): MomentumSignal | null {
+    if (candles.length < 4) return null;
+
+    const last4 = candles.slice(-4);
+    const candle4 = last4[3];
+
+    const trend2 = this.getCandleTrend(last4[1]);
+    const trend3 = this.getCandleTrend(last4[2]);
+    const trend4 = this.getCandleTrend(candle4);
+
+    if (trend2 !== trend3 || trend3 !== trend4) return null;
+
+    const body2 = Math.abs(last4[1].close - last4[1].open);
+    const body3 = Math.abs(last4[2].close - last4[2].open);
+    const body4 = Math.abs(candle4.close - candle4.open);
+
+    if (body2 < body3 && body3 < body4) {
+      const signalTrend = trend2 === 'buy' ? 'call' : 'put';
+      const currentPrice = candle4.close;
+      const currentTime = Date.now();
+
+      if (!this.shouldAllowSignal(state, signalTrend, currentPrice, currentTime)) {
+        return null;
+      }
+
+      this.recordSignal(state, signalTrend, currentPrice, currentTime);
+
+      return {
+        momentumType: MomentumType.CANDLE_SABIT,
+        trend: signalTrend,
+        confidence: this.calculateConfidence(body2, body3, body4),
+        details: 'Candle Sabit: 4 candles increasing body size',
+      };
+    }
+
+    return null;
+  }
+
+  private analyzeDojiTerjepit(candles: Candle[], state: SignalState): MomentumSignal | null {
+    if (candles.length < 4) return null;
+
+    const last4 = candles.slice(-4);
+    const candle4 = last4[3];
+
+    const trend1 = this.getCandleTrend(last4[0]);
+    const trend2 = this.getCandleTrend(last4[1]);
+    const trend3 = this.getCandleTrend(last4[2]);
+
+    if (trend1 !== trend2 || trend2 !== trend3) return null;
+
+    const body1Pct = this.calculateBodyPercentage(last4[0]);
+    const body2Pct = this.calculateBodyPercentage(last4[1]);
+    const body3Pct = this.calculateBodyPercentage(last4[2]);
+    const body4Pct = this.calculateBodyPercentage(candle4);
+
+    if (body1Pct > 60 && body2Pct > 60 && body3Pct > 60 && body4Pct < 10) {
+      const trend4 = this.getCandleTrend(candle4);
+
+      // Reversal logic
+      let signalTrend: string;
+      if (trend1 === 'buy' && trend4 === 'sell') {
+        signalTrend = 'put';
+      } else if (trend1 === 'sell' && trend4 === 'buy') {
+        signalTrend = 'call';
+      } else {
+        return null;
+      }
+
+      const currentPrice = candle4.close;
+      const currentTime = Date.now();
+
+      if (!this.shouldAllowSignal(state, signalTrend, currentPrice, currentTime)) {
+        return null;
+      }
+
+      this.recordSignal(state, signalTrend, currentPrice, currentTime);
+
+      return {
+        momentumType: MomentumType.DOJI_TERJEPIT,
+        trend: signalTrend,
+        confidence: 0.8,
+        details: 'Doji Terjepit: 3 long candles + 1 doji reversal hint',
+      };
+    }
+
+    return null;
+  }
+
+  private analyzeDojiPembatalan(candles: Candle[], state: SignalState): MomentumSignal | null {
+    if (candles.length < 2) return null;
+
+    const last2 = candles.slice(-2);
+    const previous = last2[0];
+    const current = last2[1];
+
+    const currentBodyPct = this.calculateBodyPercentage(current);
+
+    if (currentBodyPct < 10) {
+      const prevTrend = this.getCandleTrend(previous);
+      const dojiTrend = this.getCandleTrend(current);
+
+      let signalTrend: string;
+      if (prevTrend === 'sell' && dojiTrend === 'buy') {
+        signalTrend = 'call';
+      } else if (prevTrend === 'buy' && dojiTrend === 'sell') {
+        signalTrend = 'put';
+      } else {
+        return null;
+      }
+
+      const currentPrice = current.close;
+      const currentTime = Date.now();
+
+      if (!this.shouldAllowSignal(state, signalTrend, currentPrice, currentTime)) {
+        return null;
+      }
+
+      this.recordSignal(state, signalTrend, currentPrice, currentTime);
+
+      return {
+        momentumType: MomentumType.DOJI_PEMBATALAN,
+        trend: signalTrend,
+        confidence: 0.75,
+        details: 'Doji Pembatalan: Reversal detected',
+      };
+    }
+
+    return null;
+  }
+
+  private analyzeBBSARBreak(candles: Candle[], state: SignalState): MomentumSignal | null {
+    if (candles.length < MIN_CANDLES_FOR_BB_SAR) return null;
+
+    const lastCandle = candles[candles.length - 1];
+    const closePrice = lastCandle.close;
+
+    const bb = this.calculateBollingerBands(candles, 20, 2);
+    const sar = this.calculateParabolicSAR(candles);
+
+    if (!bb) return null;
+
+    let currentSignal: string;
+    if (closePrice > bb.upper && closePrice > sar) {
+      currentSignal = 'call';
+    } else if (closePrice < bb.lower && closePrice < sar) {
+      currentSignal = 'put';
+    } else {
+      return null;
+    }
+
+    const currentTime = Date.now();
+
+    if (!this.shouldAllowSignal(state, currentSignal, closePrice, currentTime)) {
+      return null;
+    }
+
+    this.recordSignal(state, currentSignal, closePrice, currentTime);
+
+    return {
+      momentumType: MomentumType.BB_SAR_BREAK,
+      trend: currentSignal,
+      confidence: 0.85,
+      details: 'BB/SAR Break: Strong trend with filters passed',
+    };
+  }
+
+  // ==================== SIGNAL STATE MANAGEMENT ====================
+
+  private createSignalState(): SignalState {
+    return {
+      lastSignal: null,
+      lastSignalTime: 0,
+      lastPrice: null,
+      consecutiveSignals: 0,
+      signalHistory: [],
+      isOrderActive: false,
+    };
+  }
+
+  private shouldAllowSignal(state: SignalState, currentSignal: string, currentPrice: number, currentTime: number): boolean {
+    if (currentSignal === state.lastSignal) {
+      if (currentTime - state.lastSignalTime < SIGNAL_COOLDOWN_MS) {
+        return false;
+      }
+
+      if (state.lastPrice !== null) {
+        const priceChange = Math.abs((currentPrice - state.lastPrice) / state.lastPrice);
+        if (priceChange < PRICE_MOVE_THRESHOLD) {
+          return false;
+        }
+      }
+    }
+
+    this.cleanupOldSignals(state, currentTime);
+    if (state.signalHistory.length >= MAX_SIGNALS_PER_HOUR) {
+      return false;
+    }
+
+    return true;
+  }
+
+  private recordSignal(state: SignalState, signal: string, price: number, time: number) {
+    state.lastSignal = signal;
+    state.lastSignalTime = time;
+    state.lastPrice = price;
+    state.consecutiveSignals++;
+    state.signalHistory.push(time);
+  }
+
+  private cleanupOldSignals(state: SignalState, currentTime: number) {
+    state.signalHistory = state.signalHistory.filter((t) => currentTime - t <= SIGNAL_HISTORY_CLEANUP_MS);
+  }
+
+  // ==================== TECHNICAL CALCULATIONS ====================
+
+  private getCandleTrend(candle: Candle): string {
+    return candle.close > candle.open ? 'buy' : 'sell';
+  }
+
+  private calculateBodyPercentage(candle: Candle): number {
+    const range = Math.abs(candle.high - candle.low);
+    if (range === 0) return 0;
+    const body = Math.abs(candle.close - candle.open);
+    return (body / range) * 100;
+  }
+
+  private calculateConfidence(body2: number, body3: number, body4: number): number {
+    if (body2 === 0 || body3 === 0) return 0.5;
+    const ratio1 = body3 / body2;
+    const ratio2 = body4 / body3;
+    return Math.min(0.9, 0.5 + (ratio1 + ratio2) * 0.1);
+  }
+
+  private calculateBollingerBands(candles: Candle[], period: number, stdDevMultiplier: number): BollingerBands | null {
+    if (candles.length < period) return null;
+
+    const recentCandles = candles.slice(-period);
+    const closes = recentCandles.map((c) => c.close);
+
+    const sma = closes.reduce((a, b) => a + b, 0) / period;
+    const variance = closes.reduce((acc, val) => acc + Math.pow(val - sma, 2), 0) / period;
+    const stdDev = Math.sqrt(variance);
+
+    return {
+      upper: sma + stdDev * stdDevMultiplier,
+      middle: sma,
+      lower: sma - stdDev * stdDevMultiplier,
+    };
+  }
+
+  private calculateParabolicSAR(candles: Candle[]): number {
+    if (candles.length < 2) return candles[candles.length - 1].close;
+
+    const last = candles[candles.length - 1];
+    const previous = candles[candles.length - 2];
+
+    const isUptrend = last.close > previous.close;
+
+    return isUptrend
+      ? Math.min(last.low, previous.low)
+      : Math.max(last.high, previous.high);
+  }
+
+  // ==================== ORDER EXECUTION ====================
+
+  private async executeMomentumOrder(
+    userId: string,
+    config: MomentumConfig,
+    session: any,
+    signal: MomentumSignal,
+  ) {
+    const mode = this.activeModes.get(userId);
+    if (!mode) return;
+
+    // Check for duplicate active order
+    const existingActiveOrder = mode.activeMomentumOrders.get(signal.momentumType);
+    if (existingActiveOrder && !existingActiveOrder.isSettled) {
+      this.logger.warn(`[${userId}] Duplicate prevented: ${signal.momentumType} already has active order`);
+      return;
+    }
+
+    const orderId = uuidv4();
+    const currentTime = Date.now();
+
+    const order: MomentumOrder = {
+      id: orderId,
+      assetRic: config.asset!.ric,
+      assetName: config.asset!.name,
+      trend: signal.trend,
+      amount: config.martingale.baseAmount,
+      executionTime: currentTime,
+      momentumType: signal.momentumType,
+      confidence: signal.confidence,
+      sourceCandle: mode.candleStorage[mode.candleStorage.length - 1],
+      isExecuted: true,
+      isSkipped: false,
+      martingaleState: {
+        isActive: false,
+        currentStep: 0,
+        isCompleted: false,
+        totalLoss: 0,
+        totalRecovered: 0,
+      },
+    };
+
+    mode.momentumOrders.push(order);
+    mode.activeMomentumOrders.set(signal.momentumType, {
+      momentumType: signal.momentumType,
+      orderId,
+      trend: signal.trend,
+      executedTime: currentTime,
+      isSettled: false,
+    });
+    mode.totalExecutions++;
+
+    this.logger.log(`[${userId}] Executing ${signal.momentumType} order: ${signal.trend}`);
+
+    // Execute via WebSocket
+    mode.wsClient.sendTrade({
+      amount: config.martingale.baseAmount,
+      trend: signal.trend,
+      ric: config.asset!.ric,
+      isDemo: config.isDemoAccount,
+      duration: 60,
+    });
+
+    // Monitor trade result
+    this.monitorTradeResult(userId, config, session, orderId, signal.momentumType);
+  }
+
+  private async monitorTradeResult(
+    userId: string,
+    config: MomentumConfig,
+    session: any,
+    orderId: string,
+    momentumType: MomentumType,
+  ) {
+    const mode = this.activeModes.get(userId);
+    if (!mode) return;
+
+    const maxWaitTime = 90000;
+    const startTime = Date.now();
+
+    const checkInterval = setInterval(async () => {
+      if (!mode.isActive || Date.now() - startTime > maxWaitTime) {
+        clearInterval(checkInterval);
+        return;
+      }
+
+      try {
+        const result = await this.fetchTradeResult(session, config);
+        if (result) {
+          clearInterval(checkInterval);
+          await this.handleTradeResult(userId, config, session, orderId, momentumType, result);
+        }
+      } catch (err) {
+        this.logger.error(`[${userId}] Error checking trade result: ${err}`);
+      }
+    }, 2000);
+  }
+
+  private async fetchTradeResult(session: any, config: MomentumConfig): Promise<any | null> {
+    try {
+      const response = await axios.get(
+        `${BASE_URL}/profile/trading-history?type=${config.isDemoAccount ? 'demo' : 'real'}`,
+        {
+          headers: this.buildStockityHeaders(session),
+          timeout: 5000,
+        },
+      );
+
+      if (response.data?.data) {
+        const trades = response.data.data;
+        const recentTrade = trades.find((t: any) => {
+          const tradeTime = new Date(t.created_at).getTime();
+          return tradeTime > Date.now() - 120000;
+        });
+        return recentTrade || null;
+      }
+      return null;
+    } catch (err) {
+      this.logger.error(`Error fetching trade result: ${err}`);
+      return null;
+    }
+  }
+
+  private async handleTradeResult(
+    userId: string,
+    config: MomentumConfig,
+    session: any,
+    orderId: string,
+    momentumType: MomentumType,
+    result: any,
+  ) {
+    const mode = this.activeModes.get(userId);
+    if (!mode) return;
+
+    // Deduplication check
+    if (mode.processedOrderIds.has(orderId)) {
+      return;
+    }
+    mode.processedOrderIds.add(orderId);
+
+    const isWin = result.status?.toLowerCase() === 'won';
+    const order = mode.momentumOrders.find((o) => o.id === orderId);
+
+    if (order) {
+      order.martingaleState.isCompleted = true;
+      order.martingaleState.finalResult = isWin ? 'WIN' : 'LOSE';
+
+      if (isWin) {
+        order.martingaleState.totalRecovered = result.win || result.payment || 0;
+        mode.totalWins++;
+      } else {
+        order.martingaleState.totalLoss = config.martingale.baseAmount;
+        mode.totalLosses++;
+      }
+    }
+
+    // Update active momentum order
+    const activeOrder = mode.activeMomentumOrders.get(momentumType);
+    if (activeOrder) {
+      activeOrder.isSettled = true;
+    }
+
+    this.logger.log(`[${userId}] ${momentumType} result: ${isWin ? 'WIN' : 'LOSE'}`);
+
+    if (!isWin && config.martingale.isEnabled) {
+      await this.startMartingale(userId, config, session, orderId, momentumType);
+    } else if (isWin) {
+      mode.activeMomentumOrders.delete(momentumType);
+    }
+  }
+
+  private async startMartingale(
+    userId: string,
+    config: MomentumConfig,
+    session: any,
+    parentOrderId: string,
+    momentumType: MomentumType,
+    step: number = 1,
+  ) {
+    const mode = this.activeModes.get(userId);
+    if (!mode) return;
+
+    if (step > config.martingale.maxSteps) {
+      this.logger.log(`[${userId}] Max martingale steps reached for ${momentumType}`);
+      mode.activeMomentumOrders.delete(momentumType);
+      return;
+    }
+
+    const martingaleAmount = this.calculateMartingaleAmount(config, step);
+    const parentOrder = mode.momentumOrders.find((o) => o.id === parentOrderId);
+
+    if (!parentOrder) return;
+
+    mode.activeMartingaleOrders.set(parentOrderId, {
+      originalOrderId: parentOrderId,
+      momentumType,
+      currentStep: step,
+      maxSteps: config.martingale.maxSteps,
+      totalLoss: parentOrder.amount,
+      nextAmount: martingaleAmount,
+      trend: parentOrder.trend,
+      isActive: true,
+    });
+
+    this.logger.log(`[${userId}] ${momentumType} martingale step ${step}: ${martingaleAmount}`);
+
+    // Execute martingale trade
+    mode.wsClient.sendTrade({
+      amount: martingaleAmount,
+      trend: parentOrder.trend,
+      ric: config.asset!.ric,
+      isDemo: config.isDemoAccount,
+      duration: 60,
+    });
+
+    // Monitor martingale result
+    this.monitorMartingaleResult(userId, config, session, parentOrderId, momentumType, step);
+  }
+
+  private calculateMartingaleAmount(config: MomentumConfig, step: number): number {
+    const multiplier = config.martingale.multiplierType === 'FIXED'
+      ? config.martingale.multiplierValue
+      : 1 + config.martingale.multiplierValue / 100;
+
+    return Math.floor(config.martingale.baseAmount * Math.pow(multiplier, step - 1));
+  }
+
+  private async monitorMartingaleResult(
+    userId: string,
+    config: MomentumConfig,
+    session: any,
+    parentOrderId: string,
+    momentumType: MomentumType,
+    step: number,
+  ) {
+    const mode = this.activeModes.get(userId);
+    if (!mode) return;
+
+    const maxWaitTime = 90000;
+    const startTime = Date.now();
+
+    const checkInterval = setInterval(async () => {
+      if (!mode.isActive || Date.now() - startTime > maxWaitTime) {
+        clearInterval(checkInterval);
+        return;
+      }
+
+      try {
+        const result = await this.fetchTradeResult(session, config);
+        if (result) {
+          clearInterval(checkInterval);
+
+          const isWin = result.status?.toLowerCase() === 'won';
+
+          if (isWin) {
+            mode.activeMartingaleOrders.delete(parentOrderId);
+            mode.activeMomentumOrders.delete(momentumType);
+            this.logger.log(`[${userId}] ${momentumType} martingale WIN at step ${step}`);
+          } else {
+            await this.startMartingale(userId, config, session, parentOrderId, momentumType, step + 1);
+          }
+        }
+      } catch (err) {
+        this.logger.error(`[${userId}] Error checking martingale result: ${err}`);
+      }
+    }, 2000);
+  }
+
+  // ==================== HELPERS ====================
+
+  private buildStockityHeaders(session: any): Record<string, string> {
+    return {
+      'authorization-token': session.stockityToken,
+      'device-id': session.deviceId,
+      'device-type': session.deviceType || 'web',
+      'user-timezone': session.userTimezone || 'Asia/Jakarta',
+      'User-Agent': session.userAgent,
+      'Accept': 'application/json, text/plain, '*/*'',
+      'Origin': 'https://stockity.id',
+      'Referer': 'https://stockity.id/',
+    };
+  }
+
+  private async updateStatus(userId: string, botState: string) {
+    await this.firebaseService.db.collection('momentum_status').doc(userId).set(
+      { botState, updatedAt: this.firebaseService.FieldValue.serverTimestamp() },
+      { merge: true },
+    );
+  }
+
+  private sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+}

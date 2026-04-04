@@ -320,7 +320,10 @@ export class ScheduleExecutor {
     }
 
     this.callbacks.onLog({
-      id: uuidv4(), orderId: order.id, time: order.time,
+      // ID deterministik: orderId + step → Firestore akan overwrite entry ini
+      // saat completeOrder() dipanggil dengan ID yang sama, sehingga tidak ada duplikat.
+      id: `${order.id}_s${step}`,
+      orderId: order.id, time: order.time,
       trend: order.trend, amount, martingaleStep: step,
       dealId: dealId ?? undefined,
       result: (result.error && result.error !== 'duplicate') ? 'FAILED' : undefined,
@@ -576,7 +579,9 @@ export class ScheduleExecutor {
     }
 
     this.callbacks.onLog({
-      id: uuidv4(), orderId: order.id, time: order.time, trend: order.trend,
+      // ID deterministik per step martingale
+      id: `${order.id}_s${step}`,
+      orderId: order.id, time: order.time, trend: order.trend,
       amount, martingaleStep: step, dealId: dealId ?? undefined,
       result: (result.error && result.error !== 'duplicate') ? 'FAILED' : undefined,
       executedAt: Date.now(),
@@ -667,24 +672,22 @@ export class ScheduleExecutor {
     );
 
     // ── Emit result log ke Firebase history ──────────────────────────────
-    // FIX: completeOrder sebelumnya tidak memanggil onLog → history tidak
-    // pernah menampilkan WIN/LOSE, selalu stuck tanpa result.
-    const resultAmount = order.martingaleState.isActive
-      ? this.calcAmount(order.martingaleState.currentStep)
-      : this.calcAmount(0);
+    // Pakai ID deterministik (orderId_sStep) yang sama dengan execution log
+    // → Firestore overwrite entry lama → tidak ada 2 baris untuk 1 trade.
     const resultStep = order.martingaleState.isActive
       ? order.martingaleState.currentStep
       : 0;
+    const resultAmount = this.calcAmount(resultStep);
 
     this.callbacks.onLog({
-      id: uuidv4(),
+      id: `${order.id}_s${resultStep}`,
       orderId: order.id,
       time: order.time,
       trend: order.trend,
       amount: resultAmount,
       martingaleStep: resultStep,
       dealId: dealId,
-      result: finalResult,       // 'WIN' | 'LOSS' | 'DRAW'
+      result: finalResult,
       profit: tradePnL,
       sessionPnL: this.sessionPnL,
       executedAt: Date.now(),

@@ -207,7 +207,15 @@ export class FastradeService implements OnModuleDestroy {
       .limit(limit)
       .get();
 
-    return snap.docs.map((d) => d.data() as FastradeLog);
+    // FIX: Firestore mengembalikan executedAt sebagai Timestamp object, bukan number.
+    // Konversi ke millis agar frontend tidak menghasilkan "Invalid Date".
+    return snap.docs.map((d) => {
+      const data = d.data() as any;
+      return {
+        ...data,
+        executedAt: data.executedAt?.toMillis?.() ?? data.executedAt ?? 0,
+      } as FastradeLog;
+    });
   }
 
   // ── Private helpers ────────────────────────────────

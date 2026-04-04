@@ -49,6 +49,12 @@ export abstract class FastradeBaseExecutor {
   // ── Timers ─────────────────────────────────────────
   protected resultTimeoutTimer?: NodeJS.Timeout;
 
+  // ── Interruptible sleep ─────────────────────────────
+  // Allows stop() to immediately cancel any active sleep(), so the executor
+  // doesn't hang for up to 60s waiting for a minute boundary after stop is called.
+  private _sleepTimer?: NodeJS.Timeout;
+  private _sleepResolve?: () => void;
+
   constructor(
     protected readonly userId: string,
     protected readonly wsClient: StockityWebSocketClient,
@@ -82,6 +88,7 @@ export abstract class FastradeBaseExecutor {
     if (!this.isRunning && !this.activeOrder) return;
     this.isRunning = false;
     this.clearResultTimeout();
+    this.wakeUp();           // FIX: interrupt any active sleep() immediately
     this.activeOrder = undefined;
     this.executionTime = undefined;
     this.resetMartingale();
@@ -257,7 +264,10 @@ export abstract class FastradeBaseExecutor {
     };
 
     this.callbacks.onLog({
-      id: uuidv4(), orderId, trend, amount, martingaleStep,
+      // ID deterministik: orderId + step → Firestore akan overwrite entry ini
+      // saat handleDealResult() emit result log dengan ID yang sama.
+      id: `${orderId}_s${martingaleStep}`,
+      orderId, trend, amount, martingaleStep,
       dealId: dealId ?? undefined,
       result: (result.error && result.error !== 'duplicate') ? 'FAILED' : undefined,
       executedAt: now,
@@ -395,7 +405,9 @@ export abstract class FastradeBaseExecutor {
     );
 
     this.callbacks.onLog({
-      id: uuidv4(),
+      // Pakai ID yang sama dengan execution log → Firestore overwrite entry lama
+      // sehingga tidak ada 2 baris untuk 1 trade.
+      id: `${active.id}_s${active.martingaleStep}`,
       orderId: active.id,
       trend: active.trend,
       amount: active.amount,
@@ -504,6 +516,25 @@ export abstract class FastradeBaseExecutor {
   // ── Utility ────────────────────────────────────────
 
   protected sleep(ms: number): Promise<void> {
-    return new Promise((resolve) => setTimeout(resolve, ms));
+    // Interruptible sleep: calling wakeUp() resolves this promise early.
+    // This ensures stop() exits runCycle() within milliseconds instead of
+    // waiting up to 60s for a minute boundary sleep to finish.
+    return new Promise((resolve) => {
+      this._sleepResolve = resolve;
+      this._sleepTimer = setTimeout(() => {
+        this._sleepTimer = undefined;
+        this._sleepResolve = undefined;
+        resolve();
+      }, ms);
+    });
   }
-}
+
+  protected wakeUp() {
+    if (this._sleepTimer) {
+      clearTimeout(this._sleepTimer);
+      this._sleepTimer = undefined;
+    }
+    const res = this._sleepResolve;
+    this._sleepResolve = undefined;
+    res?.();
+  }}

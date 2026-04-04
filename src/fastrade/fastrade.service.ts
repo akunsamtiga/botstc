@@ -100,7 +100,15 @@ export class FastradeService implements OnModuleDestroy {
         const modeLabel = this.modes.get(userId) ?? 'FTT';
         const enriched = { ...log, mode: modeLabel };
         const arr = this.logs.get(userId) || [];
-        arr.push(enriched);
+        // FIX: upsert by id — jika entry dengan ID yang sama sudah ada (execution log),
+        // timpa dengan entry baru (result log). Mencegah duplikasi di in-memory saat
+        // getLogs() dipanggil ketika bot sedang running.
+        const existingIdx = arr.findIndex(l => l.id === enriched.id);
+        if (existingIdx !== -1) {
+          arr[existingIdx] = enriched;
+        } else {
+          arr.push(enriched);
+        }
         if (arr.length > 500) arr.splice(0, arr.length - 500);
         this.logs.set(userId, arr);
         this.appendLogToFirebase(userId, enriched).catch(() => {});

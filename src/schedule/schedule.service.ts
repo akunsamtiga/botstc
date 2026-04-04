@@ -346,7 +346,15 @@ export class ScheduleService implements OnModuleInit, OnModuleDestroy {
       onOrdersUpdate: async (o) => { await this.saveOrders(userId, o).catch(() => {}); },
       onLog: async (log) => {
         const arr = this.logs.get(userId) || [];
-        arr.push(log);
+        // FIX: upsert by id — jika entry dengan ID yang sama sudah ada (execution log),
+        // timpa dengan entry baru (result log). Mencegah duplikasi di in-memory saat
+        // getLogs() dipanggil ketika bot sedang running.
+        const existingIdx = arr.findIndex(l => l.id === log.id);
+        if (existingIdx !== -1) {
+          arr[existingIdx] = log;
+        } else {
+          arr.push(log);
+        }
         if (arr.length > 500) arr.splice(0, arr.length - 500);
         this.logs.set(userId, arr);
         await this.appendLog(userId, log).catch(() => {});

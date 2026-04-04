@@ -26,7 +26,8 @@ import {
 
 const BASE_URL = 'https://api.stockity.id';
 
-interface MomentumConfig {
+// Exported so the controller can reference it without TS4053
+export interface MomentumConfig {
   asset: { ric: string; name: string } | null;
   enabledMomentums: {
     candleSabit: boolean;
@@ -70,7 +71,7 @@ export class MomentumService implements OnModuleDestroy {
   ) {}
 
   onModuleDestroy() {
-    for (const [userId, mode] of this.activeModes) {
+    for (const [userId] of this.activeModes) {
       this.stopMomentumMode(userId);
     }
   }
@@ -196,7 +197,6 @@ export class MomentumService implements OnModuleDestroy {
     await this.updateStatus(userId, 'RUNNING');
     this.logger.log(`[${userId}] Momentum mode started`);
 
-    // Start candle storage loop
     this.startCandleStorageLoop(userId, config, session);
 
     return { message: 'Momentum mode dimulai', status: 'RUNNING' };
@@ -283,7 +283,6 @@ export class MomentumService implements OnModuleDestroy {
         this.logger.error(`[${userId}] Error in candle storage loop: ${err}`);
       }
 
-      // Schedule next cycle
       if (mode.isActive) {
         setTimeout(() => runCycle(), 1000);
       }
@@ -473,7 +472,6 @@ export class MomentumService implements OnModuleDestroy {
     if (body1Pct > 60 && body2Pct > 60 && body3Pct > 60 && body4Pct < 10) {
       const trend4 = this.getCandleTrend(candle4);
 
-      // Reversal logic
       let signalTrend: string;
       if (trend1 === 'buy' && trend4 === 'sell') {
         signalTrend = 'put';
@@ -689,7 +687,6 @@ export class MomentumService implements OnModuleDestroy {
     const mode = this.activeModes.get(userId);
     if (!mode) return;
 
-    // Check for duplicate active order
     const existingActiveOrder = mode.activeMomentumOrders.get(signal.momentumType);
     if (existingActiveOrder && !existingActiveOrder.isSettled) {
       this.logger.warn(`[${userId}] Duplicate prevented: ${signal.momentumType} already has active order`);
@@ -733,15 +730,10 @@ export class MomentumService implements OnModuleDestroy {
     this.logger.log(`[${userId}] Executing ${signal.momentumType} order: ${signal.trend}`);
 
     // Execute via WebSocket
-    mode.wsClient.sendTrade({
-      amount: config.martingale.baseAmount,
-      trend: signal.trend,
-      ric: config.asset!.ric,
-      isDemo: config.isDemoAccount,
-      duration: 60,
-    });
+    void mode.wsClient.placeTrade(
+      this.buildTradePayload(session, config, config.martingale.baseAmount, signal.trend),
+    );
 
-    // Monitor trade result
     this.monitorTradeResult(userId, config, session, orderId, signal.momentumType);
   }
 
@@ -812,10 +804,7 @@ export class MomentumService implements OnModuleDestroy {
     const mode = this.activeModes.get(userId);
     if (!mode) return;
 
-    // Deduplication check
-    if (mode.processedOrderIds.has(orderId)) {
-      return;
-    }
+    if (mode.processedOrderIds.has(orderId)) return;
     mode.processedOrderIds.add(orderId);
 
     const isWin = result.status?.toLowerCase() === 'won';
@@ -834,7 +823,6 @@ export class MomentumService implements OnModuleDestroy {
       }
     }
 
-    // Update active momentum order
     const activeOrder = mode.activeMomentumOrders.get(momentumType);
     if (activeOrder) {
       activeOrder.isSettled = true;
@@ -884,16 +872,11 @@ export class MomentumService implements OnModuleDestroy {
 
     this.logger.log(`[${userId}] ${momentumType} martingale step ${step}: ${martingaleAmount}`);
 
-    // Execute martingale trade
-    mode.wsClient.sendTrade({
-      amount: martingaleAmount,
-      trend: parentOrder.trend,
-      ric: config.asset!.ric,
-      isDemo: config.isDemoAccount,
-      duration: 60,
-    });
+    // Execute via WebSocket
+    void mode.wsClient.placeTrade(
+      this.buildTradePayload(session, config, martingaleAmount, parentOrder.trend),
+    );
 
-    // Monitor martingale result
     this.monitorMartingaleResult(userId, config, session, parentOrderId, momentumType, step);
   }
 
@@ -948,6 +931,30 @@ export class MomentumService implements OnModuleDestroy {
 
   // ==================== HELPERS ====================
 
+  /**
+   * Builds a trade payload compatible with StockityWebSocketClient.placeTrade().
+   */
+  private buildTradePayload(session: any, config: MomentumConfig, amount: number, trend: string): any {
+    const nowMs = Date.now();
+    const createdAtSec = Math.floor(nowMs / 1000) + 1;
+    const secondsInMinute = createdAtSec % 60;
+    const remaining = 60 - secondsInMinute;
+    const expireAt = remaining >= 45
+      ? createdAtSec + remaining
+      : createdAtSec + remaining + 60;
+
+    return {
+      amount,
+      createdAt: createdAtSec * 1000,
+      dealType: config.isDemoAccount ? 'demo' : 'real',
+      expireAt,
+      iso: session.currencyIso || config.currency || 'IDR',
+      optionType: 'turbo',
+      ric: config.asset!.ric,
+      trend,
+    };
+  }
+
   private buildStockityHeaders(session: any): Record<string, string> {
     return {
       'authorization-token': session.stockityToken,
@@ -955,7 +962,7 @@ export class MomentumService implements OnModuleDestroy {
       'device-type': session.deviceType || 'web',
       'user-timezone': session.userTimezone || 'Asia/Jakarta',
       'User-Agent': session.userAgent,
-      'Accept': 'application/json, text/plain, '*/*'',
+      'Accept': 'application/json, text/plain, */*',
       'Origin': 'https://stockity.id',
       'Referer': 'https://stockity.id/',
     };

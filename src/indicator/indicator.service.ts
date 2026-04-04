@@ -10,7 +10,6 @@ import {
   PricePrediction,
   IndicatorOrder,
   IndicatorMartingaleOrder,
-  IndicatorMartingaleResult,
   Candle,
   CandleApiResponse,
   IndicatorType,
@@ -23,7 +22,8 @@ const PRICE_MONITOR_INTERVAL = 3000;
 const MINUTE_BOUNDARY_OFFSET_MS = 100;
 const CANDLE_INTERVAL_MS = 60000;
 
-interface IndicatorConfig {
+// Exported so the controller can reference it without TS4053
+export interface IndicatorConfig {
   asset: { ric: string; name: string } | null;
   settings: IndicatorSettings;
   martingale: {
@@ -70,7 +70,7 @@ export class IndicatorService implements OnModuleDestroy {
   ) {}
 
   onModuleDestroy() {
-    for (const [userId, mode] of this.activeModes) {
+    for (const [userId] of this.activeModes) {
       this.stopIndicatorMode(userId);
     }
   }
@@ -188,7 +188,6 @@ export class IndicatorService implements OnModuleDestroy {
     await this.updateStatus(userId, 'RUNNING');
     this.logger.log(`[${userId}] Indicator mode started`);
 
-    // Start the indicator cycle
     this.executeIndicatorCycle(userId, config, session);
 
     return { message: 'Indicator mode dimulai', status: 'RUNNING' };
@@ -450,7 +449,6 @@ export class IndicatorService implements OnModuleDestroy {
     let gains = 0;
     let losses = 0;
 
-    // Initial average gain/loss
     for (let i = 1; i <= period; i++) {
       const change = candles[i].close - candles[i - 1].close;
       if (change > 0) gains += change;
@@ -460,7 +458,6 @@ export class IndicatorService implements OnModuleDestroy {
     let avgGain = gains / period;
     let avgLoss = losses / period;
 
-    // Calculate RSI for remaining candles
     for (let i = period + 1; i < candles.length; i++) {
       const change = candles[i].close - candles[i - 1].close;
       const gain = change > 0 ? change : 0;
@@ -516,17 +513,14 @@ export class IndicatorService implements OnModuleDestroy {
     const currentPrice = candles[candles.length - 1].close;
     const predictions: PricePrediction[] = [];
 
-    // Calculate average price movement
     const movements = candles.slice(-20).map((c) => Math.abs(c.high - c.low));
     const avgMovement = movements.reduce((a, b) => a + b, 0) / movements.length;
     const baseMovement = avgMovement * settings.sensitivity;
 
-    // Base confidence based on strength
     let baseConfidence = 0.6;
     if (analysis.strength === 'STRONG') baseConfidence = 0.8;
     else if (analysis.strength === 'MODERATE') baseConfidence = 0.7;
 
-    // Sensitivity bonus
     let sensitivityBonus = 0;
     if (settings.sensitivity <= 0.1) sensitivityBonus = -0.05;
     else if (settings.sensitivity >= 5) sensitivityBonus = 0.05;
@@ -608,7 +602,6 @@ export class IndicatorService implements OnModuleDestroy {
         });
       }
     } else {
-      // SMA/EMA predictions
       predictions.push({
         id: uuidv4(),
         targetPrice: currentPrice + baseMovement,
@@ -664,7 +657,7 @@ export class IndicatorService implements OnModuleDestroy {
             this.logger.log(`[${userId}] Prediction triggered: ${prediction.predictionType} at ${currentPrice}`);
 
             await this.executeTrade(userId, config, session, prediction);
-            break; // Only execute one trade per cycle
+            break;
           }
         }
       } catch (err) {
@@ -739,15 +732,10 @@ export class IndicatorService implements OnModuleDestroy {
     this.logger.log(`[${userId}] Executing trade: ${prediction.recommendedTrend} at ${prediction.targetPrice}`);
 
     // Execute via WebSocket
-    mode.wsClient.sendTrade({
-      amount: config.settings.amount,
-      trend: prediction.recommendedTrend,
-      ric: config.asset!.ric,
-      isDemo: config.isDemoAccount,
-      duration: 60,
-    });
+    void mode.wsClient.placeTrade(
+      this.buildTradePayload(session, config, config.settings.amount, prediction.recommendedTrend),
+    );
 
-    // Start monitoring for result
     this.monitorTradeResult(userId, config, session, orderId);
   }
 
@@ -755,7 +743,7 @@ export class IndicatorService implements OnModuleDestroy {
     const mode = this.activeModes.get(userId);
     if (!mode) return;
 
-    const maxWaitTime = 90000; // 90 seconds
+    const maxWaitTime = 90000;
     const startTime = Date.now();
 
     const checkInterval = setInterval(async () => {
@@ -791,7 +779,7 @@ export class IndicatorService implements OnModuleDestroy {
         const trades = response.data.data;
         const recentTrade = trades.find((t: any) => {
           const tradeTime = new Date(t.created_at).getTime();
-          return tradeTime > Date.now() - 120000; // Within last 2 minutes
+          return tradeTime > Date.now() - 120000;
         });
         return recentTrade || null;
       }
@@ -872,18 +860,12 @@ export class IndicatorService implements OnModuleDestroy {
 
     this.logger.log(`[${userId}] Martingale step ${step}: ${martingaleAmount}`);
 
-    // Execute martingale trade
     const parentOrder = mode.indicatorOrders.find((o) => o.id === parentOrderId);
     if (parentOrder) {
-      mode.wsClient.sendTrade({
-        amount: martingaleAmount,
-        trend: parentOrder.trend,
-        ric: config.asset!.ric,
-        isDemo: config.isDemoAccount,
-        duration: 60,
-      });
+      void mode.wsClient.placeTrade(
+        this.buildTradePayload(session, config, martingaleAmount, parentOrder.trend),
+      );
 
-      // Monitor martingale result
       this.monitorMartingaleResult(userId, config, session, parentOrderId, step);
     }
   }
@@ -953,7 +935,6 @@ export class IndicatorService implements OnModuleDestroy {
       mode.consecutiveRestarts++;
       this.logger.log(`[${userId}] Auto-restarting cycle #${mode.consecutiveRestarts}`);
 
-      // Reset state
       mode.isTradeExecuted = false;
       mode.activeTradeOrderId = null;
       mode.currentMartingaleOrder = null;
@@ -975,6 +956,30 @@ export class IndicatorService implements OnModuleDestroy {
 
   // ==================== HELPERS ====================
 
+  /**
+   * Builds a trade payload compatible with StockityWebSocketClient.placeTrade().
+   */
+  private buildTradePayload(session: any, config: IndicatorConfig, amount: number, trend: string): any {
+    const nowMs = Date.now();
+    const createdAtSec = Math.floor(nowMs / 1000) + 1;
+    const secondsInMinute = createdAtSec % 60;
+    const remaining = 60 - secondsInMinute;
+    const expireAt = remaining >= 45
+      ? createdAtSec + remaining
+      : createdAtSec + remaining + 60;
+
+    return {
+      amount,
+      createdAt: createdAtSec * 1000,
+      dealType: config.isDemoAccount ? 'demo' : 'real',
+      expireAt,
+      iso: session.currencyIso || config.currency || 'IDR',
+      optionType: 'turbo',
+      ric: config.asset!.ric,
+      trend,
+    };
+  }
+
   private buildStockityHeaders(session: any): Record<string, string> {
     return {
       'authorization-token': session.stockityToken,
@@ -982,7 +987,7 @@ export class IndicatorService implements OnModuleDestroy {
       'device-type': session.deviceType || 'web',
       'user-timezone': session.userTimezone || 'Asia/Jakarta',
       'User-Agent': session.userAgent,
-      'Accept': 'application/json, text/plain, '*/*'',
+      'Accept': 'application/json, text/plain, */*',
       'Origin': 'https://stockity.id',
       'Referer': 'https://stockity.id/',
     };

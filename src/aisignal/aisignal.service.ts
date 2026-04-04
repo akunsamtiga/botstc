@@ -38,7 +38,7 @@ export class AISignalService implements OnModuleDestroy {
   ) {}
 
   onModuleDestroy() {
-    for (const [userId, mode] of this.activeModes) {
+    for (const [userId] of this.activeModes) {
       this.stopAISignalMode(userId);
     }
   }
@@ -357,10 +357,8 @@ export class AISignalService implements OnModuleDestroy {
     const mode = this.activeModes.get(userId);
     if (!mode) return;
 
-    // Check if already executed
     if (order.isExecuted) return;
 
-    // Mark as executed
     const orderIndex = mode.pendingOrders.findIndex((o) => o.id === order.id);
     if (orderIndex !== -1) {
       mode.pendingOrders[orderIndex] = {
@@ -374,13 +372,9 @@ export class AISignalService implements OnModuleDestroy {
     this.logger.log(`[${userId}] Executing AI Signal order: ${order.trend} - ${order.amount}`);
 
     // Execute via WebSocket
-    mode.wsClient.sendTrade({
-      amount: order.amount,
-      trend: order.trend,
-      ric: config.asset!.ric,
-      isDemo: config.isDemoAccount,
-      duration: 60,
-    });
+    void mode.wsClient.placeTrade(
+      this.buildTradePayload(session, config, order.amount, order.trend),
+    );
 
     // Update status to monitoring
     setTimeout(() => {
@@ -394,7 +388,6 @@ export class AISignalService implements OnModuleDestroy {
       }
     }, 2000);
 
-    // Start monitoring for result
     this.monitorTradeResult(userId, config, session, order.id, order.martingaleStep > 0);
   }
 
@@ -465,10 +458,7 @@ export class AISignalService implements OnModuleDestroy {
     const mode = this.activeModes.get(userId);
     if (!mode) return;
 
-    // Deduplication check
-    if (mode.processedOrderIds.has(orderId)) {
-      return;
-    }
+    if (mode.processedOrderIds.has(orderId)) return;
     mode.processedOrderIds.add(orderId);
 
     const isWin = result.status?.toLowerCase() === 'won';
@@ -491,7 +481,6 @@ export class AISignalService implements OnModuleDestroy {
       await this.handleInitialTradeResult(userId, config, session, orderId, isWin);
     }
 
-    // Set status to waiting after 3 seconds
     setTimeout(() => {
       const idx = mode.pendingOrders.findIndex((o) => o.id === orderId);
       if (idx !== -1) {
@@ -522,7 +511,6 @@ export class AISignalService implements OnModuleDestroy {
     } else {
       if (config.martingale.isEnabled) {
         if (config.martingale.isAlwaysSignal) {
-          // Always Signal mode - track loss for next signal
           mode.alwaysSignalLossTracking = {
             hasOutstandingLoss: true,
             currentMartingaleStep: 0,
@@ -532,7 +520,6 @@ export class AISignalService implements OnModuleDestroy {
           };
           this.logger.log(`[${userId}] Always Signal: Will continue on next signal`);
         } else {
-          // Standard martingale
           await this.startMartingale(userId, config, session, orderId, order?.trend || 'call');
         }
       }
@@ -560,17 +547,15 @@ export class AISignalService implements OnModuleDestroy {
         mode.activeMartingaleOrders.delete(parentOrderId);
         this.logger.log(`[${userId}] Martingale failed - Max steps reached`);
       } else {
-        // Continue to next step
-        const nextAmount = this.calculateMartingaleAmount(config, nextStep);
         mode.activeMartingaleOrders.set(parentOrderId, {
           ...martingaleInfo,
           currentStep: nextStep,
-          totalLoss: martingaleInfo.totalLoss + martingaleInfo.totalLoss, // Simplified
+          totalLoss: martingaleInfo.totalLoss * 2,
         });
 
         this.logger.log(`[${userId}] Martingale continuing to step ${nextStep}`);
 
-        // Execute next step
+        const nextAmount = this.calculateMartingaleAmount(config, nextStep);
         setTimeout(() => {
           this.executeMartingaleTrade(userId, config, session, parentOrderId, martingaleInfo.originalTrend, nextAmount, nextStep);
         }, 300);
@@ -640,15 +625,10 @@ export class AISignalService implements OnModuleDestroy {
     this.logger.log(`[${userId}] Executing martingale step ${step}: ${amount}`);
 
     // Execute via WebSocket
-    mode.wsClient.sendTrade({
-      amount,
-      trend,
-      ric: config.asset!.ric,
-      isDemo: config.isDemoAccount,
-      duration: 60,
-    });
+    void mode.wsClient.placeTrade(
+      this.buildTradePayload(session, config, amount, trend),
+    );
 
-    // Monitor result
     this.monitorTradeResult(userId, config, session, martingaleOrderId, true);
   }
 
@@ -662,6 +642,30 @@ export class AISignalService implements OnModuleDestroy {
 
   // ==================== HELPERS ====================
 
+  /**
+   * Builds a trade payload compatible with StockityWebSocketClient.placeTrade().
+   */
+  private buildTradePayload(session: any, config: AISignalConfig, amount: number, trend: string): any {
+    const nowMs = Date.now();
+    const createdAtSec = Math.floor(nowMs / 1000) + 1;
+    const secondsInMinute = createdAtSec % 60;
+    const remaining = 60 - secondsInMinute;
+    const expireAt = remaining >= 45
+      ? createdAtSec + remaining
+      : createdAtSec + remaining + 60;
+
+    return {
+      amount,
+      createdAt: createdAtSec * 1000,
+      dealType: config.isDemoAccount ? 'demo' : 'real',
+      expireAt,
+      iso: session.currencyIso || config.currency || 'IDR',
+      optionType: 'turbo',
+      ric: config.asset!.ric,
+      trend,
+    };
+  }
+
   private buildStockityHeaders(session: any): Record<string, string> {
     return {
       'authorization-token': session.stockityToken,
@@ -669,7 +673,7 @@ export class AISignalService implements OnModuleDestroy {
       'device-type': session.deviceType || 'web',
       'user-timezone': session.userTimezone || 'Asia/Jakarta',
       'User-Agent': session.userAgent,
-      'Accept': 'application/json, text/plain, '*/*'',
+      'Accept': 'application/json, text/plain, */*',
       'Origin': 'https://stockity.id',
       'Referer': 'https://stockity.id/',
     };

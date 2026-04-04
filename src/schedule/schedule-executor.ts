@@ -666,6 +666,31 @@ export class ScheduleExecutor {
       `| tradePnL=${tradePnL > 0 ? '+' : ''}${tradePnL} sessionPnL=${this.sessionPnL > 0 ? '+' : ''}${this.sessionPnL}`,
     );
 
+    // ── Emit result log ke Firebase history ──────────────────────────────
+    // FIX: completeOrder sebelumnya tidak memanggil onLog → history tidak
+    // pernah menampilkan WIN/LOSE, selalu stuck tanpa result.
+    const resultAmount = order.martingaleState.isActive
+      ? this.calcAmount(order.martingaleState.currentStep)
+      : this.calcAmount(0);
+    const resultStep = order.martingaleState.isActive
+      ? order.martingaleState.currentStep
+      : 0;
+
+    this.callbacks.onLog({
+      id: uuidv4(),
+      orderId: order.id,
+      time: order.time,
+      trend: order.trend,
+      amount: resultAmount,
+      martingaleStep: resultStep,
+      dealId: dealId,
+      result: finalResult,       // 'WIN' | 'LOSS' | 'DRAW'
+      profit: tradePnL,
+      sessionPnL: this.sessionPnL,
+      executedAt: Date.now(),
+      note: `Result: ${finalResult} | PnL: ${tradePnL > 0 ? '+' : ''}${tradePnL}`,
+    });
+
     // ── Cek stop conditions ───────────────────────────────────────────────
     this.checkStopConditions();
   }

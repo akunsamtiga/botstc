@@ -439,7 +439,15 @@ export class ScheduleService implements OnModuleInit, OnModuleDestroy {
       .collection('schedule_logs').doc(userId)
       .collection('entries')
       .orderBy('executedAt', 'desc').limit(limit).get();
-    return snap.docs.map(d => d.data() as ExecutionLog);
+    // FIX: Firestore mengembalikan executedAt sebagai Timestamp object, bukan number.
+    // Konversi ke millis agar frontend tidak menghasilkan "Invalid Date".
+    return snap.docs.map(d => {
+      const data = d.data() as any;
+      return {
+        ...data,
+        executedAt: data.executedAt?.toMillis?.() ?? data.executedAt ?? 0,
+      } as ExecutionLog;
+    });
   }
 
   // ── Input Parser ──────────────────────────────

@@ -357,12 +357,16 @@ export class ScheduleService implements OnModuleInit, OnModuleDestroy {
         const status = exec?.getStatus() as any;
         const sessionPnL = status?.sessionPnL ?? 0;
         try {
+          // Update status to STOPPED first before cleanup
           await this.updateStatus(userId, 'STOPPED', sessionPnL);
+          this.logger.log(`[${userId}] Status updated to STOPPED`);
+          // Small delay to ensure Firestore propagation before cleanup
+          await new Promise(r => setTimeout(r, 500));
         } catch (err: any) {
           this.logger.error(`[${userId}] Failed to update status: ${err.message}`);
-        } finally {
-          this.cleanup(userId);
         }
+        // Cleanup after status update is confirmed
+        this.cleanup(userId);
       },
       onStatusChange: (s) => this.logger.debug(`[${userId}] ${s}`),
     };
@@ -381,6 +385,8 @@ export class ScheduleService implements OnModuleInit, OnModuleDestroy {
     exec.stop();
     await this.saveOrders(userId, exec.getOrders());
     await this.updateStatus(userId, 'STOPPED');
+    // Small delay to ensure Firestore propagation before cleanup
+    await new Promise(r => setTimeout(r, 300));
     this.cleanup(userId);
     return { message: 'Schedule dihentikan' };
   }

@@ -21,7 +21,7 @@ const MAX_RESULT_WAIT_MS = 120_000; // Reduced from 180s for faster result timeo
  *   timeMatch = System.currentTimeMillis() - executionInfo.executionTime < 120000L
  * Reduced to 60s for faster martingale response while still safe for matching
  */
-const FALLBACK_MATCH_WINDOW_MS = 60_000;
+const FALLBACK_MATCH_WINDOW_MS = 120_000;
 
 /**
  * Status terminal dari Stockity WebSocket.

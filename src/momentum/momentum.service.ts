@@ -46,24 +46,44 @@ export interface MomentumConfig {
   currency: string;
 }
 
+// FIX: Log structure matching frontend MomentumLog expectations
+export interface MomentumLog {
+  id: string;
+  orderId: string;
+  momentumType: MomentumType;
+  trend: string;
+  amount: number;
+  martingaleStep: number;
+  dealId?: string;
+  result?: string;
+  profit?: number;
+  sessionPnL?: number;
+  executedAt: number;
+  note?: string;
+}
+
+interface ActiveModeState {
+  isRunning: boolean; // FIX: was isActive — matches frontend MomentumStatus.isRunning
+  wsClient: StockityWebSocketClient;
+  candleStorage: Candle[];
+  momentumOrders: MomentumOrder[];
+  activeMartingaleOrders: Map<string, MomentumMartingaleOrder>;
+  activeMomentumOrders: Map<string, { momentumType: MomentumType; orderId: string; trend: string; executedTime: number; isSettled: boolean }>;
+  momentumStates: MomentumStates;
+  totalExecutions: number;
+  totalWins: number;
+  totalLosses: number;
+  sessionPnL: number; // FIX: track running P&L
+  candleFetchInterval?: NodeJS.Timeout;
+  processedOrderIds: Set<string>;
+  logs: MomentumLog[]; // FIX: in-memory log storage (like fastrade)
+}
+
 @Injectable()
 export class MomentumService implements OnModuleDestroy {
   private readonly logger = new Logger(MomentumService.name);
   private configs = new Map<string, MomentumConfig>();
-  private activeModes = new Map<string, {
-    isActive: boolean;
-    wsClient: StockityWebSocketClient;
-    candleStorage: Candle[];
-    momentumOrders: MomentumOrder[];
-    activeMartingaleOrders: Map<string, MomentumMartingaleOrder>;
-    activeMomentumOrders: Map<string, { momentumType: MomentumType; orderId: string; trend: string; executedTime: number; isSettled: boolean }>;
-    momentumStates: MomentumStates;
-    totalExecutions: number;
-    totalWins: number;
-    totalLosses: number;
-    candleFetchInterval?: NodeJS.Timeout;
-    processedOrderIds: Set<string>;
-  }>();
+  private activeModes = new Map<string, ActiveModeState>();
 
   constructor(
     private readonly firebaseService: FirebaseService,
@@ -146,7 +166,8 @@ export class MomentumService implements OnModuleDestroy {
 
   async startMomentumMode(userId: string): Promise<{ message: string; status: string }> {
     const existing = this.activeModes.get(userId);
-    if (existing?.isActive) {
+    // FIX: check isRunning (was isActive)
+    if (existing?.isRunning) {
       return { message: 'Momentum mode sudah berjalan', status: 'RUNNING' };
     }
 
@@ -166,6 +187,13 @@ export class MomentumService implements OnModuleDestroy {
       session.userAgent,
     );
 
+    // FIX: register WS deal result callback for reliable result tracking
+    ws.setOnDealResult((payload) => {
+      this.handleWsDealResult(userId, payload).catch((err) =>
+        this.logger.error(`[${userId}] WS deal result error: ${err.message}`),
+      );
+    });
+
     try {
       await ws.connect();
     } catch (err: any) {
@@ -181,7 +209,7 @@ export class MomentumService implements OnModuleDestroy {
     };
 
     this.activeModes.set(userId, {
-      isActive: true,
+      isRunning: true, // FIX: was isActive
       wsClient: ws,
       candleStorage: [],
       momentumOrders: [],
@@ -191,7 +219,9 @@ export class MomentumService implements OnModuleDestroy {
       totalExecutions: 0,
       totalWins: 0,
       totalLosses: 0,
+      sessionPnL: 0, // FIX: init P&L
       processedOrderIds: new Set(),
+      logs: [], // FIX: init in-memory logs
     });
 
     await this.updateStatus(userId, 'RUNNING');
@@ -204,11 +234,12 @@ export class MomentumService implements OnModuleDestroy {
 
   async stopMomentumMode(userId: string): Promise<{ message: string }> {
     const mode = this.activeModes.get(userId);
-    if (!mode?.isActive) {
+    // FIX: check isRunning
+    if (!mode?.isRunning) {
       return { message: 'Momentum mode tidak berjalan' };
     }
 
-    mode.isActive = false;
+    mode.isRunning = false; // FIX: was isActive
     if (mode.candleFetchInterval) {
       clearInterval(mode.candleFetchInterval);
     }
@@ -221,31 +252,66 @@ export class MomentumService implements OnModuleDestroy {
     return { message: 'Momentum mode dihentikan' };
   }
 
+  // FIX: return isRunning (was isActive) — matches MomentumStatus frontend interface
   async getStatus(userId: string): Promise<object> {
     const mode = this.activeModes.get(userId);
     const config = await this.getConfig(userId);
 
     if (mode) {
       return {
-        isActive: mode.isActive,
-        botState: 'RUNNING',
+        isRunning: mode.isRunning,      // FIX: was isActive
+        botState: mode.isRunning ? 'RUNNING' : 'STOPPED',
         totalExecutions: mode.totalExecutions,
         totalWins: mode.totalWins,
         totalLosses: mode.totalLosses,
+        totalTrades: mode.totalExecutions,
+        sessionPnL: mode.sessionPnL,    // FIX: expose P&L
         wsConnected: mode.wsClient.isConnected(),
-        candleStorage: mode.candleStorage.length,
-        momentumOrders: mode.momentumOrders,
-        activeMartingaleOrders: Array.from(mode.activeMartingaleOrders.entries()),
+        candleStorageCount: mode.candleStorage.length,
+        activeMartingaleCount: mode.activeMartingaleOrders.size,
+        lastStatus: `Candles: ${mode.candleStorage.length} | Executions: ${mode.totalExecutions}`,
         config,
       };
     }
 
     const statusDoc = await this.firebaseService.db.collection('momentum_status').doc(userId).get();
     return {
-      isActive: false,
+      isRunning: false,   // FIX: was isActive
       botState: statusDoc.exists ? (statusDoc.data()?.botState ?? 'STOPPED') : 'STOPPED',
+      totalExecutions: 0,
+      totalWins: 0,
+      totalLosses: 0,
+      totalTrades: 0,
+      sessionPnL: 0,
       config,
     };
+  }
+
+  // FIX: getLogs method — mirrors FastradeService.getLogs() pattern
+  async getLogs(userId: string, limit = 100): Promise<MomentumLog[]> {
+    // Try in-memory first (bot is running)
+    const mode = this.activeModes.get(userId);
+    if (mode && mode.logs.length > 0) {
+      return mode.logs.slice(-limit);
+    }
+
+    // Fallback: Firebase (bot stopped, like fastrade pattern)
+    const snap = await this.firebaseService.db
+      .collection('momentum_logs')
+      .doc(userId)
+      .collection('entries')
+      .orderBy('executedAt', 'desc')
+      .limit(limit)
+      .get();
+
+    return snap.docs.map((d) => {
+      const data = d.data() as any;
+      return {
+        ...data,
+        // FIX: convert Firestore Timestamp → millis (same fix as fastrade getLogs)
+        executedAt: data.executedAt?.toMillis?.() ?? data.executedAt ?? 0,
+      } as MomentumLog;
+    });
   }
 
   // ==================== CANDLE STORAGE & ANALYSIS ====================
@@ -255,7 +321,8 @@ export class MomentumService implements OnModuleDestroy {
     if (!mode) return;
 
     const runCycle = async () => {
-      if (!mode.isActive) return;
+      // FIX: check isRunning
+      if (!mode.isRunning) return;
 
       try {
         const serverNow = Date.now();
@@ -266,7 +333,7 @@ export class MomentumService implements OnModuleDestroy {
           await this.sleep(waitTime);
         }
 
-        if (!mode.isActive) return;
+        if (!mode.isRunning) return;
 
         await this.sleep(FETCH_5SEC_OFFSET);
 
@@ -283,7 +350,8 @@ export class MomentumService implements OnModuleDestroy {
         this.logger.error(`[${userId}] Error in candle storage loop: ${err}`);
       }
 
-      if (mode.isActive) {
+      // FIX: check isRunning
+      if (mode.isRunning) {
         setTimeout(() => runCycle(), 1000);
       }
     };
@@ -695,13 +763,14 @@ export class MomentumService implements OnModuleDestroy {
 
     const orderId = uuidv4();
     const currentTime = Date.now();
+    const amount = config.martingale.baseAmount;
 
     const order: MomentumOrder = {
       id: orderId,
       assetRic: config.asset!.ric,
       assetName: config.asset!.name,
       trend: signal.trend,
-      amount: config.martingale.baseAmount,
+      amount,
       executionTime: currentTime,
       momentumType: signal.momentumType,
       confidence: signal.confidence,
@@ -727,14 +796,65 @@ export class MomentumService implements OnModuleDestroy {
     });
     mode.totalExecutions++;
 
-    this.logger.log(`[${userId}] Executing ${signal.momentumType} order: ${signal.trend}`);
+    this.logger.log(`[${userId}] Executing ${signal.momentumType} order: ${signal.trend} amount=${amount}`);
+
+    // FIX: save execution log entry immediately (pending result)
+    const execLog: MomentumLog = {
+      id: orderId,
+      orderId,
+      momentumType: signal.momentumType,
+      trend: signal.trend,
+      amount,
+      martingaleStep: 0,
+      executedAt: currentTime,
+      note: `${signal.momentumType} signal | ${signal.details}`,
+    };
+    this.appendLog(userId, execLog);
 
     // Execute via WebSocket
-    void mode.wsClient.placeTrade(
-      this.buildTradePayload(session, config, config.martingale.baseAmount, signal.trend),
+    const tradeResult = await mode.wsClient.placeTrade(
+      this.buildTradePayload(session, config, amount, signal.trend),
     );
 
+    if (tradeResult?.dealId) {
+      // FIX: update log with dealId
+      this.updateLog(userId, orderId, { dealId: tradeResult.dealId });
+    }
+
     this.monitorTradeResult(userId, config, session, orderId, signal.momentumType);
+  }
+
+  // FIX: handle WS deal result (called by wsClient.setOnDealResult)
+  private async handleWsDealResult(userId: string, payload: any) {
+    const mode = this.activeModes.get(userId);
+    if (!mode) return;
+
+    const dealId: string | undefined = payload.uuid ?? payload.id;
+    const result: string | undefined = payload.result ?? payload.status;
+    if (!dealId || !result) return;
+
+    // Find matching active order by dealId in logs
+    const matchedLog = mode.logs.find((l) => l.dealId === dealId && !l.result);
+    if (!matchedLog) return;
+
+    const isWin = result.toLowerCase() === 'won' || result.toLowerCase() === 'win';
+    const profit = isWin ? (payload.win ?? payload.payment ?? 0) : -matchedLog.amount;
+
+    mode.sessionPnL += profit;
+
+    this.updateLog(userId, matchedLog.orderId, {
+      result: isWin ? 'WIN' : 'LOSE',
+      profit,
+      sessionPnL: mode.sessionPnL,
+    });
+
+    if (isWin) {
+      mode.totalWins++;
+    } else {
+      mode.totalLosses++;
+    }
+
+    this.logger.log(`[${userId}] WS deal result: dealId=${dealId} result=${isWin ? 'WIN' : 'LOSE'} profit=${profit}`);
   }
 
   private async monitorTradeResult(
@@ -751,7 +871,8 @@ export class MomentumService implements OnModuleDestroy {
     const startTime = Date.now();
 
     const checkInterval = setInterval(async () => {
-      if (!mode.isActive || Date.now() - startTime > maxWaitTime) {
+      // FIX: check isRunning
+      if (!mode.isRunning || Date.now() - startTime > maxWaitTime) {
         clearInterval(checkInterval);
         return;
       }
@@ -808,6 +929,7 @@ export class MomentumService implements OnModuleDestroy {
     mode.processedOrderIds.add(orderId);
 
     const isWin = result.status?.toLowerCase() === 'won';
+    const profit = isWin ? (result.win || result.payment || 0) : -config.martingale.baseAmount;
     const order = mode.momentumOrders.find((o) => o.id === orderId);
 
     if (order) {
@@ -823,12 +945,23 @@ export class MomentumService implements OnModuleDestroy {
       }
     }
 
+    // FIX: only update P&L & log if WS callback hasn't already done it
+    const existingLog = mode.logs.find((l) => l.orderId === orderId && l.result);
+    if (!existingLog) {
+      mode.sessionPnL += profit;
+      this.updateLog(userId, orderId, {
+        result: isWin ? 'WIN' : 'LOSE',
+        profit,
+        sessionPnL: mode.sessionPnL,
+      });
+    }
+
     const activeOrder = mode.activeMomentumOrders.get(momentumType);
     if (activeOrder) {
       activeOrder.isSettled = true;
     }
 
-    this.logger.log(`[${userId}] ${momentumType} result: ${isWin ? 'WIN' : 'LOSE'}`);
+    this.logger.log(`[${userId}] ${momentumType} result: ${isWin ? 'WIN' : 'LOSE'} profit=${profit}`);
 
     if (!isWin && config.martingale.isEnabled) {
       await this.startMartingale(userId, config, session, orderId, momentumType);
@@ -870,12 +1003,29 @@ export class MomentumService implements OnModuleDestroy {
       isActive: true,
     });
 
-    this.logger.log(`[${userId}] ${momentumType} martingale step ${step}: ${martingaleAmount}`);
+    this.logger.log(`[${userId}] ${momentumType} martingale step ${step}: amount=${martingaleAmount}`);
 
-    // Execute via WebSocket
-    void mode.wsClient.placeTrade(
+    // FIX: save martingale log entry
+    const martingaleLogId = uuidv4();
+    const martingaleLog: MomentumLog = {
+      id: martingaleLogId,
+      orderId: parentOrderId,
+      momentumType,
+      trend: parentOrder.trend,
+      amount: martingaleAmount,
+      martingaleStep: step,
+      executedAt: Date.now(),
+      note: `Martingale step ${step}/${config.martingale.maxSteps}`,
+    };
+    this.appendLog(userId, martingaleLog);
+
+    const tradeResult = await mode.wsClient.placeTrade(
       this.buildTradePayload(session, config, martingaleAmount, parentOrder.trend),
     );
+
+    if (tradeResult?.dealId) {
+      this.updateLog(userId, parentOrderId, { dealId: tradeResult.dealId }, step);
+    }
 
     this.monitorMartingaleResult(userId, config, session, parentOrderId, momentumType, step);
   }
@@ -903,7 +1053,8 @@ export class MomentumService implements OnModuleDestroy {
     const startTime = Date.now();
 
     const checkInterval = setInterval(async () => {
-      if (!mode.isActive || Date.now() - startTime > maxWaitTime) {
+      // FIX: check isRunning
+      if (!mode.isRunning || Date.now() - startTime > maxWaitTime) {
         clearInterval(checkInterval);
         return;
       }
@@ -914,12 +1065,25 @@ export class MomentumService implements OnModuleDestroy {
           clearInterval(checkInterval);
 
           const isWin = result.status?.toLowerCase() === 'won';
+          const martingaleAmount = this.calculateMartingaleAmount(config, step);
+          const profit = isWin ? (result.win || result.payment || 0) : -martingaleAmount;
+
+          mode.sessionPnL += profit;
+
+          // FIX: update log for this martingale step
+          this.updateLog(userId, parentOrderId, {
+            result: isWin ? 'WIN' : 'LOSE',
+            profit,
+            sessionPnL: mode.sessionPnL,
+          }, step);
 
           if (isWin) {
+            mode.totalWins++;
             mode.activeMartingaleOrders.delete(parentOrderId);
             mode.activeMomentumOrders.delete(momentumType);
             this.logger.log(`[${userId}] ${momentumType} martingale WIN at step ${step}`);
           } else {
+            mode.totalLosses++;
             await this.startMartingale(userId, config, session, parentOrderId, momentumType, step + 1);
           }
         }
@@ -929,11 +1093,63 @@ export class MomentumService implements OnModuleDestroy {
     }, 2000);
   }
 
-  // ==================== HELPERS ====================
+  // ==================== LOG HELPERS (FIX: new section) ====================
 
   /**
-   * Builds a trade payload compatible with StockityWebSocketClient.placeTrade().
+   * Append a new log entry to in-memory + Firebase.
+   * Mirrors FastradeService.callbacks.onLog pattern.
    */
+  private appendLog(userId: string, log: MomentumLog) {
+    const mode = this.activeModes.get(userId);
+    if (mode) {
+      // Upsert by id to prevent duplicates (same fix as fastrade)
+      const existingIdx = mode.logs.findIndex((l) => l.id === log.id);
+      if (existingIdx !== -1) {
+        mode.logs[existingIdx] = log;
+      } else {
+        mode.logs.push(log);
+      }
+      if (mode.logs.length > 500) mode.logs.splice(0, mode.logs.length - 500);
+    }
+
+    // Persist to Firebase
+    this.persistLogToFirebase(userId, log).catch((err) =>
+      this.logger.error(`[${userId}] Failed to persist log: ${err.message}`),
+    );
+  }
+
+  /**
+   * Update an existing log entry in-memory + Firebase.
+   * Used to add result/profit after trade settles.
+   */
+  private updateLog(userId: string, orderId: string, updates: Partial<MomentumLog>, step = 0) {
+    const mode = this.activeModes.get(userId);
+    if (!mode) return;
+
+    // For martingale steps, find by orderId + martingaleStep
+    const idx = mode.logs.findIndex(
+      (l) => l.orderId === orderId && l.martingaleStep === step,
+    );
+    if (idx !== -1) {
+      mode.logs[idx] = { ...mode.logs[idx], ...updates };
+      this.persistLogToFirebase(userId, mode.logs[idx]).catch(() => {});
+    }
+  }
+
+  private async persistLogToFirebase(userId: string, log: MomentumLog) {
+    await this.firebaseService.db
+      .collection('momentum_logs')
+      .doc(userId)
+      .collection('entries')
+      .doc(log.id)
+      .set({
+        ...log,
+        executedAt: this.firebaseService.Timestamp.fromMillis(log.executedAt),
+      });
+  }
+
+  // ==================== HELPERS ====================
+
   private buildTradePayload(session: any, config: MomentumConfig, amount: number, trend: string): any {
     const nowMs = Date.now();
     const createdAtSec = Math.floor(nowMs / 1000) + 1;

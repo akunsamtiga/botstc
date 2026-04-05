@@ -5,6 +5,7 @@ import {
   Put,
   Body,
   Request,
+  Query,
   UseGuards,
   HttpCode,
 } from '@nestjs/common';
@@ -27,13 +28,15 @@ export class MomentumController {
   @Put('config')
   async updateConfig(@Request() req, @Body() dto: UpdateMomentumConfigDto) {
     const config = await this.svc.getConfig(req.user.userId);
-    
+
     const updates: any = {};
-    
-    if (dto.candleSabitEnabled !== undefined ||
-        dto.dojiTerjepitEnabled !== undefined ||
-        dto.dojiPembatalanEnabled !== undefined ||
-        dto.bbSarBreakEnabled !== undefined) {
+
+    if (
+      dto.candleSabitEnabled !== undefined ||
+      dto.dojiTerjepitEnabled !== undefined ||
+      dto.dojiPembatalanEnabled !== undefined ||
+      dto.bbSarBreakEnabled !== undefined
+    ) {
       updates.enabledMomentums = {
         candleSabit: dto.candleSabitEnabled ?? config.enabledMomentums.candleSabit,
         dojiTerjepit: dto.dojiTerjepitEnabled ?? config.enabledMomentums.dojiTerjepit,
@@ -42,9 +45,11 @@ export class MomentumController {
       };
     }
 
-    if (dto.maxSteps !== undefined ||
-        dto.multiplierValue !== undefined ||
-        dto.baseAmount !== undefined) {
+    if (
+      dto.maxSteps !== undefined ||
+      dto.multiplierValue !== undefined ||
+      dto.baseAmount !== undefined
+    ) {
       updates.martingale = {
         ...config.martingale,
         ...(dto.maxSteps && { maxSteps: dto.maxSteps }),
@@ -85,6 +90,12 @@ export class MomentumController {
     return this.svc.getStatus(req.user.userId);
   }
 
+  // FIX: add /momentum/logs endpoint — mirrors /fastrade/logs and /schedule/logs
+  @Get('logs')
+  async getLogs(@Request() req, @Query('limit') limit?: string) {
+    return this.svc.getLogs(req.user.userId, limit ? parseInt(limit, 10) : 100);
+  }
+
   // ==================== INFO ====================
   @Get('info')
   getMomentumInfo() {
@@ -97,8 +108,8 @@ export class MomentumController {
         [MomentumType.BB_SAR_BREAK]: 'Breakout Bollinger Bands dengan konfirmasi Parabolic SAR',
       },
       antiOverTrading: {
-        signalCooldownMs: 180000, // 3 minutes
-        priceMoveThreshold: 0.0003, // 0.03%
+        signalCooldownMs: 180000,
+        priceMoveThreshold: 0.0003,
         maxSignalsPerHour: 10,
       },
     };

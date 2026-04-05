@@ -5,6 +5,7 @@ import {
   Put,
   Body,
   Request,
+  Query,
   UseGuards,
   HttpCode,
 } from '@nestjs/common';
@@ -84,6 +85,12 @@ export class IndicatorController {
   @Get('status')
   async getStatus(@Request() req) {
     return this.svc.getStatus(req.user.userId);
+  }
+
+  // ==================== LOGS ====================
+  @Get('logs')
+  async getLogs(@Request() req, @Query('limit') limit?: string) {
+    return this.svc.getLogs(req.user.userId, limit ? parseInt(limit, 10) : 100);
   }
 
   // ==================== PRESETS ====================

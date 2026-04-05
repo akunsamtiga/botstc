@@ -1,7 +1,7 @@
 import { Injectable, Logger, OnModuleDestroy } from '@nestjs/common';
 import { FirebaseService } from '../firebase/firebase.service';
 import { AuthService } from '../auth/auth.service';
-import { StockityWebSocketClient } from '../schedule/websocket-client';
+import { StockityWebSocketClient, DealResultPayload } from '../schedule/websocket-client';
 import axios from 'axios';
 import { v4 as uuidv4 } from 'uuid';
 import {
@@ -22,6 +22,30 @@ const PRICE_MONITOR_INTERVAL = 3000;
 const MINUTE_BOUNDARY_OFFSET_MS = 100;
 const CANDLE_INTERVAL_MS = 60000;
 
+// ── Log structure (mirip FastradeLog & ExecutionLog) ──────────────────────────
+export interface IndicatorLog {
+  id: string;           // unique log entry id (pakai orderId_s{step} agar upsert di Firestore)
+  orderId: string;      // internal order UUID
+  trend: string;
+  amount: number;
+  martingaleStep: number;
+  dealId?: string;
+  result?: string;      // 'WIN' | 'LOSE' | 'DRAW' | undefined (saat execution log)
+  profit?: number;
+  sessionPnL?: number;
+  executedAt: number;   // millis
+  note?: string;
+  indicatorType?: string;
+  cycleNumber?: number;
+}
+
+// Statuses yang menandakan trade sudah selesai (terminal)
+const TERMINAL_STATUSES = new Set(['won', 'win', 'lost', 'lose', 'loss', 'stand', 'draw', 'tie']);
+
+// Fallback: cek HTTP API setelah trade seharusnya sudah expire
+const RESULT_TIMEOUT_MS = 90_000;
+const FALLBACK_MATCH_WINDOW_MS = 120_000;
+
 // Exported so the controller can reference it without TS4053
 export interface IndicatorConfig {
   asset: { ric: string; name: string } | null;
@@ -38,31 +62,56 @@ export interface IndicatorConfig {
   currency: string;
 }
 
+interface ActiveMode {
+  isActive: boolean;
+  wsClient: StockityWebSocketClient;
+  historicalCandles: Candle[];
+  analysisResult: IndicatorAnalysisResult | null;
+  pricePredictions: PricePrediction[];
+  indicatorOrders: IndicatorOrder[];
+  currentMartingaleOrder: IndicatorMartingaleOrder | null;
+  isTradeExecuted: boolean;
+
+  // ── FIX: Proper deal tracking ──────────────────────
+  // activeDealId  = numeric ID dari bo:opened (untuk fallback match)
+  // activeOrderId = internal UUID trade yang sedang ditunggu hasilnya
+  activeDealId: string | null;
+  activeOrderId: string | null;
+  activeOrderTrend: string | null;
+  activeOrderAmount: number;
+  activeOrderExecutedAt: number;
+  currentMartingaleStep: number;
+
+  // ── FIX: Guard ─────────────────────────────────────
+  // isHandlingResult mencegah dua callback (WS + timeout fallback)
+  // mengeksekusi handler secara bersamaan.
+  isHandlingResult: boolean;
+  resultTimeoutTimer: NodeJS.Timeout | null;
+
+  // ── Monitoring interval (price) ────────────────────
+  monitoringInterval?: NodeJS.Timeout;
+
+  // ── Stats ──────────────────────────────────────────
+  consecutiveWins: number;
+  consecutiveLosses: number;
+  totalExecutions: number;
+  totalWins: number;
+  totalLosses: number;
+  autoRestartEnabled: boolean;
+  consecutiveRestarts: number;
+  maxConsecutiveRestarts: number;
+  sessionPnL: number;
+  cycleNumber: number;
+
+  // In-memory logs (sama seperti FastradeService)
+  logs: IndicatorLog[];
+}
+
 @Injectable()
 export class IndicatorService implements OnModuleDestroy {
   private readonly logger = new Logger(IndicatorService.name);
   private configs = new Map<string, IndicatorConfig>();
-  private activeModes = new Map<string, {
-    isActive: boolean;
-    wsClient: StockityWebSocketClient;
-    historicalCandles: Candle[];
-    analysisResult: IndicatorAnalysisResult | null;
-    pricePredictions: PricePrediction[];
-    indicatorOrders: IndicatorOrder[];
-    pendingTradeResults: Map<string, any>;
-    currentMartingaleOrder: IndicatorMartingaleOrder | null;
-    isTradeExecuted: boolean;
-    activeTradeOrderId: string | null;
-    consecutiveWins: number;
-    consecutiveLosses: number;
-    totalExecutions: number;
-    totalWins: number;
-    totalLosses: number;
-    autoRestartEnabled: boolean;
-    consecutiveRestarts: number;
-    maxConsecutiveRestarts: number;
-    monitoringInterval?: NodeJS.Timeout;
-  }>();
+  private activeModes = new Map<string, ActiveMode>();
 
   constructor(
     private readonly firebaseService: FirebaseService,
@@ -164,17 +213,23 @@ export class IndicatorService implements OnModuleDestroy {
       throw new Error(`Gagal koneksi WebSocket: ${err.message}`);
     }
 
-    this.activeModes.set(userId, {
+    const mode: ActiveMode = {
       isActive: true,
       wsClient: ws,
       historicalCandles: [],
       analysisResult: null,
       pricePredictions: [],
       indicatorOrders: [],
-      pendingTradeResults: new Map(),
       currentMartingaleOrder: null,
       isTradeExecuted: false,
-      activeTradeOrderId: null,
+      activeDealId: null,
+      activeOrderId: null,
+      activeOrderTrend: null,
+      activeOrderAmount: 0,
+      activeOrderExecutedAt: 0,
+      currentMartingaleStep: 0,
+      isHandlingResult: false,
+      resultTimeoutTimer: null,
       consecutiveWins: 0,
       consecutiveLosses: 0,
       totalExecutions: 0,
@@ -183,7 +238,17 @@ export class IndicatorService implements OnModuleDestroy {
       autoRestartEnabled: true,
       consecutiveRestarts: 0,
       maxConsecutiveRestarts: 50,
-    });
+      sessionPnL: 0,
+      cycleNumber: 0,
+      logs: [],
+    };
+
+    this.activeModes.set(userId, mode);
+
+    // ── FIX: Register WS deal result handler ──────────────────────────────────
+    // Pakai onDealResult (sama seperti FastradeBaseExecutor) — BUKAN polling HTTP.
+    // Ini yang mencegah false-match dengan deal lama atau deal yang masih OPEN.
+    ws.setOnDealResult((payload) => this.handleWsDealResult(userId, payload));
 
     await this.updateStatus(userId, 'RUNNING');
     this.logger.log(`[${userId}] Indicator mode started`);
@@ -200,8 +265,10 @@ export class IndicatorService implements OnModuleDestroy {
     }
 
     mode.isActive = false;
+    this.clearResultTimeout(mode);
     if (mode.monitoringInterval) {
       clearInterval(mode.monitoringInterval);
+      mode.monitoringInterval = undefined;
     }
     mode.wsClient.disconnect();
     this.activeModes.delete(userId);
@@ -219,9 +286,9 @@ export class IndicatorService implements OnModuleDestroy {
     if (mode) {
       return {
         isActive: mode.isActive,
-        isRunning: mode.isActive,            // ← fix: field yg dibaca frontend
+        isRunning: mode.isActive,
         botState: 'RUNNING',
-        totalTrades: mode.totalExecutions,   // ← fix: frontend pakai totalTrades
+        totalTrades: mode.totalExecutions,
         totalExecutions: mode.totalExecutions,
         totalWins: mode.totalWins,
         totalLosses: mode.totalLosses,
@@ -237,6 +304,8 @@ export class IndicatorService implements OnModuleDestroy {
         indicatorOrders: mode.indicatorOrders,
         pricePredictions: mode.pricePredictions,
         analysisResult: mode.analysisResult,
+        sessionPnL: mode.sessionPnL,
+        cycleNumber: mode.cycleNumber,
         config,
       };
     }
@@ -244,14 +313,21 @@ export class IndicatorService implements OnModuleDestroy {
     const statusDoc = await this.firebaseService.db.collection('indicator_status').doc(userId).get();
     return {
       isActive: false,
-      isRunning: false,                      // ← fix: field yg dibaca frontend
+      isRunning: false,
       botState: statusDoc.exists ? (statusDoc.data()?.botState ?? 'STOPPED') : 'STOPPED',
       totalTrades: 0,
       totalWins: 0,
       totalLosses: 0,
+      consecutiveWins: 0,
+      consecutiveLosses: 0,
       currentIndicatorValue: null,
       lastTrend: null,
       lastSignalTime: null,
+      indicatorType: null,
+      wsConnected: false,
+      indicatorOrders: [],
+      pricePredictions: [],
+      analysisResult: null,
       config,
     };
   }
@@ -263,6 +339,7 @@ export class IndicatorService implements OnModuleDestroy {
     if (!mode || !mode.isActive) return;
 
     try {
+      mode.cycleNumber++;
       this.logger.log(`[${userId}] === PHASE 1: Waiting for minute boundary ===`);
       await this.waitForMinuteBoundary();
 
@@ -357,7 +434,12 @@ export class IndicatorService implements OnModuleDestroy {
         createdAt: data.created_at,
       };
 
-      if (candle.open > 0 && candle.close > 0 && candle.high >= Math.max(candle.open, candle.close) && candle.low <= Math.min(candle.open, candle.close)) {
+      if (
+        candle.open > 0 &&
+        candle.close > 0 &&
+        candle.high >= Math.max(candle.open, candle.close) &&
+        candle.low <= Math.min(candle.open, candle.close)
+      ) {
         return candle;
       }
       return null;
@@ -459,7 +541,12 @@ export class IndicatorService implements OnModuleDestroy {
     };
   }
 
-  private calculateRSI(candles: Candle[], period: number, overbought: number, oversold: number): IndicatorAnalysisResult {
+  private calculateRSI(
+    candles: Candle[],
+    period: number,
+    overbought: number,
+    oversold: number,
+  ): IndicatorAnalysisResult {
     const values: number[] = [];
     let gains = 0;
     let losses = 0;
@@ -648,11 +735,20 @@ export class IndicatorService implements OnModuleDestroy {
     const mode = this.activeModes.get(userId);
     if (!mode) return;
 
+    // Bersihkan interval lama jika ada (defensive)
+    if (mode.monitoringInterval) {
+      clearInterval(mode.monitoringInterval);
+    }
+
     mode.monitoringInterval = setInterval(async () => {
       if (!mode.isActive) {
         clearInterval(mode.monitoringInterval!);
         return;
       }
+
+      // ── FIX: Jika trade sedang aktif, JANGAN trigger prediction baru ────────
+      // Ini mencegah prediction kedua ter-trigger saat trade pertama masih berjalan.
+      if (mode.isTradeExecuted) return;
 
       try {
         const currentPrice = await this.getCurrentPrice(config.asset!.ric, session);
@@ -672,7 +768,7 @@ export class IndicatorService implements OnModuleDestroy {
             this.logger.log(`[${userId}] Prediction triggered: ${prediction.predictionType} at ${currentPrice}`);
 
             await this.executeTrade(userId, config, session, prediction);
-            break;
+            break; // Hanya eksekusi satu trade per iterasi
           }
         }
       } catch (err) {
@@ -706,6 +802,8 @@ export class IndicatorService implements OnModuleDestroy {
     }
   }
 
+  // ==================== TRADE EXECUTION ====================
+
   private async executeTrade(
     userId: string,
     config: IndicatorConfig,
@@ -713,17 +811,23 @@ export class IndicatorService implements OnModuleDestroy {
     prediction: PricePrediction,
   ) {
     const mode = this.activeModes.get(userId);
+    // ── FIX: Double-check guard (monitoringInterval sudah guard di atas,
+    //         tapi ini defensive untuk race condition)
     if (!mode || mode.isTradeExecuted) return;
 
     mode.isTradeExecuted = true;
+    mode.currentMartingaleStep = 0;
+    mode.isHandlingResult = false;
+
     const orderId = uuidv4();
+    const amount = config.settings.amount;
 
     const order: IndicatorOrder = {
       id: orderId,
       assetRic: config.asset!.ric,
       assetName: config.asset!.name,
       trend: prediction.recommendedTrend,
-      amount: config.settings.amount,
+      amount,
       executionTime: Date.now(),
       triggerLevel: prediction.targetPrice,
       triggerType: prediction.predictionType,
@@ -741,130 +845,233 @@ export class IndicatorService implements OnModuleDestroy {
     };
 
     mode.indicatorOrders.push(order);
-    mode.activeTradeOrderId = orderId;
+    mode.activeOrderId = orderId;
+    mode.activeOrderTrend = prediction.recommendedTrend;
+    mode.activeOrderAmount = amount;
+    mode.activeOrderExecutedAt = Date.now();
     mode.totalExecutions++;
+
+    // Tulis execution log (result akan diisi saat hasil tiba via WS)
+    this.writeLog(userId, {
+      id: `${orderId}_s0`,
+      orderId,
+      trend: prediction.recommendedTrend,
+      amount,
+      martingaleStep: 0,
+      executedAt: Date.now(),
+      indicatorType: mode.analysisResult?.indicatorType ?? 'UNKNOWN',
+      cycleNumber: mode.cycleNumber,
+      note: `${prediction.predictionType} triggered`,
+    });
 
     this.logger.log(`[${userId}] Executing trade: ${prediction.recommendedTrend} at ${prediction.targetPrice}`);
 
-    // Execute via WebSocket
-    void mode.wsClient.placeTrade(
-      this.buildTradePayload(session, config, config.settings.amount, prediction.recommendedTrend),
+    // ── FIX: await placeTrade() dan simpan dealId ─────────────────────────────
+    // placeTrade() mengembalikan numeric ID dari bo:opened.
+    // Ini dipakai sebagai fallback match di handleWsDealResult().
+    const tradeResult = await mode.wsClient.placeTrade(
+      this.buildTradePayload(session, config, amount, prediction.recommendedTrend),
     );
 
-    this.monitorTradeResult(userId, config, session, orderId);
-  }
-
-  private async monitorTradeResult(userId: string, config: IndicatorConfig, session: any, orderId: string) {
-    const mode = this.activeModes.get(userId);
-    if (!mode) return;
-
-    const maxWaitTime = 90000;
-    const startTime = Date.now();
-
-    const checkInterval = setInterval(async () => {
-      if (!mode.isActive || Date.now() - startTime > maxWaitTime) {
-        clearInterval(checkInterval);
-        await this.handleTradeTimeout(userId, orderId);
-        return;
-      }
-
-      try {
-        const result = await this.fetchTradeResult(session, config);
-        if (result) {
-          clearInterval(checkInterval);
-          await this.handleTradeResult(userId, config, session, orderId, result);
-        }
-      } catch (err) {
-        this.logger.error(`[${userId}] Error checking trade result: ${err}`);
-      }
-    }, 2000);
-  }
-
-  private async fetchTradeResult(session: any, config: IndicatorConfig): Promise<any | null> {
-  try {
-    const response = await axios.get(
-      // ✅ BENAR - sesuai Kotlin
-      `${BASE_URL}/bo-deals-history/v3/deals/trade?type=${config.isDemoAccount ? 'demo' : 'real'}&locale=id`,
-      {
-        headers: {
-          'authorization-token': session.stockityToken,
-          'device-id': session.deviceId,
-          'device-type': session.deviceType || 'web',
-          'user-timezone': session.userTimezone || 'Asia/Jakarta',
-          'User-Agent': session.userAgent,
-          'Accept': 'application/json, text/plain, */*',
-          'Origin': 'https://stockity.id',
-          'Referer': 'https://stockity.id/',
-        },
-        timeout: 5000,
-      },
-    );
-
-    if (response.data?.data) {
-      // Response structure dari Kotlin:
-      // response.data.data.standard_trade_deals atau response.data.data.deals
-      const deals = response.data.data.standard_trade_deals || response.data.data.deals || [];
-      const recentTrade = deals.find((t: any) => {
-        const tradeTime = new Date(t.created_at).getTime();
-        return tradeTime > Date.now() - 120000;
-      });
-      return recentTrade || null;
+    if (!tradeResult?.dealId) {
+      this.logger.error(`[${userId}] Trade placement failed: ${tradeResult?.error}`);
+      // Reset state karena trade gagal
+      mode.isTradeExecuted = false;
+      mode.activeOrderId = null;
+      mode.activeDealId = null;
+      return;
     }
-    return null;
-  } catch (err) {
-    this.logger.error(`Error fetching trade result: ${err}`);
-    return null;
-  }
-}
 
-  private async handleTradeResult(
+    mode.activeDealId = tradeResult.dealId;
+    this.logger.log(`[${userId}] Trade placed: orderId=${orderId} dealId=${tradeResult.dealId} trend=${prediction.recommendedTrend}`);
+
+    // ── FIX: Timeout fallback ─────────────────────────────────────────────────
+    // Jika WS tidak menerima hasil dalam RESULT_TIMEOUT_MS,
+    // fallback ke HTTP API (hanya sebagai last resort).
+    this.startResultTimeout(userId, orderId, session, config, 0);
+  }
+
+  // ==================== WS DEAL RESULT HANDLER ====================
+
+  /**
+   * FIX: Handler utama untuk hasil trade — dipanggil dari WS onDealResult.
+   *
+   * POLA MATCHING (sama seperti FastradeBaseExecutor):
+   *   1. Exact dealId match (numeric ID dari bo:opened)
+   *   2. UUID cross-reference (uuid dari bo:closed)
+   *   3. Fallback: amount + trend + 120s window
+   *
+   * Guard: isHandlingResult mencegah double-processing jika WS
+   *        dan timeout fallback keduanya mencoba handle di waktu yang sama.
+   */
+  private handleWsDealResult(userId: string, payload: DealResultPayload) {
+    const mode = this.activeModes.get(userId);
+    if (!mode || !mode.isActive || !mode.isTradeExecuted) return;
+
+    // ── FIX: Hanya proses terminal status ─────────────────────────────────────
+    // Ini yang mencegah deal OPEN (status="open") dianggap sebagai LOSE.
+    const statusStr = (payload.status || payload.result || '').toLowerCase();
+    if (!TERMINAL_STATUSES.has(statusStr)) {
+      this.logger.debug(`[${userId}] Skip non-terminal WS event status="${statusStr}"`);
+      return;
+    }
+
+    // ── FIX: Guard concurrent handling ────────────────────────────────────────
+    if (mode.isHandlingResult) {
+      this.logger.debug(`[${userId}] Skip WS result — already handling`);
+      return;
+    }
+
+    const dealId = String(payload.id ?? '');
+
+    // Strategy 1: exact dealId match (numeric)
+    let isMatch = mode.activeDealId !== null && mode.activeDealId === dealId;
+
+    // Strategy 2: UUID cross-reference
+    if (!isMatch && payload.uuid && mode.activeDealId) {
+      isMatch = mode.activeDealId === payload.uuid;
+      if (isMatch) this.logger.debug(`[${userId}] Match via UUID cross-ref`);
+    }
+
+    // Strategy 3: fallback (amount + trend + 120s window)
+    if (!isMatch) {
+      isMatch = this.isFallbackMatch(mode, payload);
+      if (isMatch) {
+        this.logger.warn(
+          `[${userId}] ⚠️ Fallback match: trend=${mode.activeOrderTrend} amount=${mode.activeOrderAmount} ` +
+          `elapsed=${Date.now() - mode.activeOrderExecutedAt}ms`,
+        );
+      }
+    }
+
+    if (!isMatch) return;
+
+    mode.isHandlingResult = true;
+    this.clearResultTimeout(mode);
+
+    const isWin = statusStr === 'won' || statusStr === 'win';
+    const isDraw = statusStr === 'stand' || statusStr === 'draw' || statusStr === 'tie';
+
+    this.processTradeOutcome(userId, isWin, isDraw, mode.currentMartingaleStep);
+  }
+
+  /**
+   * Fallback matching: amount + trend + 120s window.
+   * Identik dengan FastradeBaseExecutor.isFallbackMatch().
+   */
+  private isFallbackMatch(mode: ActiveMode, payload: DealResultPayload): boolean {
+    if (!mode.activeOrderExecutedAt) return false;
+    const elapsed = Date.now() - mode.activeOrderExecutedAt;
+    if (elapsed > FALLBACK_MATCH_WINDOW_MS) return false;
+    if (payload.amount !== undefined && payload.amount !== mode.activeOrderAmount) return false;
+    if (payload.trend && payload.trend !== mode.activeOrderTrend) return false;
+    return true;
+  }
+
+  // ==================== RESULT PROCESSING ====================
+
+  /**
+   * FIX: SATU titik pemrosesan hasil — menggantikan handleTradeResult
+   *      dan monitorMartingaleResult yang sebelumnya berjalan terpisah.
+   *
+   * Dipanggil dari:
+   *   - handleWsDealResult (real-time via WS)
+   *   - startResultTimeout fallback (via HTTP polling setelah timeout)
+   */
+  private async processTradeOutcome(
     userId: string,
-    config: IndicatorConfig,
-    session: any,
-    orderId: string,
-    result: any,
+    isWin: boolean,
+    isDraw: boolean,
+    step: number,
   ) {
     const mode = this.activeModes.get(userId);
-    if (!mode) return;
+    if (!mode || !mode.isActive) return;
 
-    const isWin = result.status?.toLowerCase() === 'won';
-    const order = mode.indicatorOrders.find((o) => o.id === orderId);
+    const config = await this.getConfig(userId);
+    const session = await this.authService.getSession(userId);
+    if (!session) return;
 
+    const result = isWin ? 'WIN' : isDraw ? 'DRAW' : 'LOSE';
+    this.logger.log(`[${userId}] Trade result: ${result} (step=${step})`);
+
+    // Hitung profit/loss untuk log
+    const config2 = await this.getConfig(userId);
+    const profitRate = 0.85; // default 85%, bisa ambil dari config asset jika ada
+    let tradePnL = 0;
+    if (isWin) tradePnL = Math.floor(mode.activeOrderAmount * profitRate);
+    else if (!isDraw) tradePnL = -mode.activeOrderAmount;
+    mode.sessionPnL += tradePnL;
+
+    // Write result log — pakai ID sama supaya Firestore upsert (overwrite execution log)
+    const resultLogId = `${mode.activeOrderId}_s${step}`;
+    this.writeLog(userId, {
+      id: resultLogId,
+      orderId: mode.activeOrderId!,
+      trend: mode.activeOrderTrend!,
+      amount: mode.activeOrderAmount,
+      martingaleStep: step,
+      dealId: mode.activeDealId ?? undefined,
+      result,
+      profit: tradePnL,
+      sessionPnL: mode.sessionPnL,
+      executedAt: Date.now(),
+      indicatorType: mode.analysisResult?.indicatorType ?? 'UNKNOWN',
+      cycleNumber: mode.cycleNumber,
+    });
+
+    // Update order state
+    const order = mode.indicatorOrders.find((o) => o.id === mode.activeOrderId);
     if (order) {
       order.martingaleState.isCompleted = true;
-      order.martingaleState.finalResult = isWin ? 'WIN' : 'LOSE';
+      order.martingaleState.finalResult = result;
+    }
 
+    if (isWin || isDraw) {
       if (isWin) {
-        order.martingaleState.totalRecovered = result.win || result.payment || 0;
         mode.consecutiveWins++;
         mode.consecutiveLosses = 0;
         mode.totalWins++;
-      } else {
-        order.martingaleState.totalLoss = config.settings.amount;
-        mode.consecutiveLosses++;
-        mode.consecutiveWins = 0;
-        mode.totalLosses++;
       }
-    }
-
-    this.logger.log(`[${userId}] Trade result: ${isWin ? 'WIN' : 'LOSE'}`);
-
-    if (!isWin && config.martingale.isEnabled) {
-      await this.startMartingale(userId, config, session, orderId);
+      // WIN atau DRAW → selesai, cycle baru
+      await this.handleCycleCompletion(userId, isWin ? 'INDICATOR_WIN' : 'DRAW', '');
     } else {
-      await this.handleCycleCompletion(userId, isWin ? 'INDICATOR_WIN' : 'SINGLE_LOSS', '');
+      // LOSE
+      mode.consecutiveLosses++;
+      mode.consecutiveWins = 0;
+      mode.totalLosses++;
+
+      if (config.martingale.isEnabled && step < config.martingale.maxSteps) {
+        // Lanjut martingale
+        await this.executeMartingaleStep(userId, config, session, step + 1);
+      } else {
+        // Max steps atau martingale off
+        if (step >= config.martingale.maxSteps && config.martingale.isEnabled) {
+          this.logger.log(`[${userId}] Max martingale steps reached`);
+          await this.handleCycleCompletion(userId, 'MARTINGALE_FAILED', 'Max steps reached');
+        } else {
+          await this.handleCycleCompletion(userId, 'SINGLE_LOSS', '');
+        }
+      }
     }
   }
 
-  private async startMartingale(
+  /**
+   * FIX: Menggantikan startMartingale() yang lama.
+   *
+   * Perbedaan utama:
+   *  - await placeTrade() untuk capture dealId
+   *  - Tidak membuat monitoring interval baru (tidak ada monitorMartingaleResult)
+   *  - Hasil di-handle lewat WS onDealResult yang sama
+   *  - startResultTimeout() sebagai fallback
+   */
+  private async executeMartingaleStep(
     userId: string,
     config: IndicatorConfig,
     session: any,
-    parentOrderId: string,
-    step: number = 1,
+    step: number,
   ) {
     const mode = this.activeModes.get(userId);
-    if (!mode) return;
+    if (!mode || !mode.isActive) return;
 
     if (step > config.martingale.maxSteps) {
       this.logger.log(`[${userId}] Max martingale steps reached`);
@@ -873,28 +1080,46 @@ export class IndicatorService implements OnModuleDestroy {
     }
 
     const martingaleAmount = this.calculateMartingaleAmount(config, step);
+    const trend = mode.activeOrderTrend!;
 
-    mode.currentMartingaleOrder = {
-      originalOrderId: parentOrderId,
-      currentStep: step,
-      maxSteps: config.martingale.maxSteps,
-      totalLoss: config.settings.amount,
-      nextAmount: martingaleAmount,
-      isActive: true,
-      indicatorType: mode.analysisResult?.indicatorType || 'UNKNOWN',
-      lastTriggerLevel: 0,
-    };
+    // Update state untuk trade martingale berikutnya
+    mode.currentMartingaleStep = step;
+    mode.activeOrderAmount = martingaleAmount;
+    mode.activeOrderExecutedAt = Date.now();
+    mode.isHandlingResult = false; // Reset guard untuk menerima hasil baru
 
     this.logger.log(`[${userId}] Martingale step ${step}: ${martingaleAmount}`);
 
-    const parentOrder = mode.indicatorOrders.find((o) => o.id === parentOrderId);
-    if (parentOrder) {
-      void mode.wsClient.placeTrade(
-        this.buildTradePayload(session, config, martingaleAmount, parentOrder.trend),
-      );
+    // Tulis execution log untuk martingale step ini
+    this.writeLog(userId, {
+      id: `${mode.activeOrderId}_s${step}`,
+      orderId: mode.activeOrderId!,
+      trend,
+      amount: martingaleAmount,
+      martingaleStep: step,
+      executedAt: Date.now(),
+      indicatorType: mode.analysisResult?.indicatorType ?? 'UNKNOWN',
+      cycleNumber: mode.cycleNumber,
+      note: `Martingale step ${step}`,
+    });
 
-      this.monitorMartingaleResult(userId, config, session, parentOrderId, step);
+    // ── FIX: await placeTrade() — sama seperti executeTrade() ─────────────────
+    const tradeResult = await mode.wsClient.placeTrade(
+      this.buildTradePayload(session, config, martingaleAmount, trend),
+    );
+
+    if (!tradeResult?.dealId) {
+      this.logger.error(`[${userId}] Martingale trade placement failed: ${tradeResult?.error}`);
+      await this.handleCycleCompletion(userId, 'MARTINGALE_FAILED', 'Trade placement error');
+      return;
     }
+
+    // Update dealId untuk matching hasil berikutnya
+    mode.activeDealId = tradeResult.dealId;
+    this.logger.log(`[${userId}] Martingale trade placed: step=${step} dealId=${tradeResult.dealId} trend=${trend}`);
+
+    // Timeout fallback untuk martingale trade ini
+    this.startResultTimeout(userId, mode.activeOrderId!, session, config, step);
   }
 
   private calculateMartingaleAmount(config: IndicatorConfig, step: number): number {
@@ -905,55 +1130,142 @@ export class IndicatorService implements OnModuleDestroy {
     return Math.floor(config.settings.amount * Math.pow(multiplier, step - 1));
   }
 
-  private async monitorMartingaleResult(
+  // ==================== RESULT TIMEOUT (Fallback) ====================
+
+  /**
+   * FIX: Timeout fallback — hanya digunakan jika WS tidak memberikan hasil.
+   *
+   * Setelah RESULT_TIMEOUT_MS, cek HTTP API.
+   * Berbeda dengan versi lama:
+   *  - Tidak berjalan setiap 2 detik — hanya satu kali setelah timeout
+   *  - Filter terminal status: hanya deal dengan status won/lost
+   *  - Filter dealId: hanya match dengan activeDealId
+   */
+  private startResultTimeout(
     userId: string,
-    config: IndicatorConfig,
+    orderId: string,
     session: any,
-    parentOrderId: string,
+    config: IndicatorConfig,
     step: number,
   ) {
     const mode = this.activeModes.get(userId);
     if (!mode) return;
 
-    const maxWaitTime = 90000;
-    const startTime = Date.now();
+    this.clearResultTimeout(mode);
 
-    const checkInterval = setInterval(async () => {
-      if (!mode.isActive || Date.now() - startTime > maxWaitTime) {
-        clearInterval(checkInterval);
-        return;
-      }
+    mode.resultTimeoutTimer = setTimeout(async () => {
+      const m = this.activeModes.get(userId);
+      if (!m || !m.isActive || m.isHandlingResult) return;
+      if (m.activeOrderId !== orderId && m.currentMartingaleStep !== step) return;
+
+      this.logger.warn(`[${userId}] Result timeout — falling back to HTTP API (step=${step})`);
 
       try {
-        const result = await this.fetchTradeResult(session, config);
+        const result = await this.fetchTradeResultById(session, config, m.activeDealId);
         if (result) {
-          clearInterval(checkInterval);
-
+          if (m.isHandlingResult) return; // WS sudah handle sebelum fallback selesai
+          m.isHandlingResult = true;
           const isWin = result.status?.toLowerCase() === 'won';
-
-          if (isWin) {
-            await this.handleCycleCompletion(userId, 'MARTINGALE_WIN', `Step ${step}`);
-          } else {
-            await this.startMartingale(userId, config, session, parentOrderId, step + 1);
-          }
+          const isDraw = ['stand', 'draw', 'tie'].includes(result.status?.toLowerCase() || '');
+          await this.processTradeOutcome(userId, isWin, isDraw, step);
+        } else {
+          this.logger.warn(`[${userId}] Fallback API tidak menemukan result — anggap LOSE`);
+          m.isHandlingResult = true;
+          await this.processTradeOutcome(userId, false, false, step);
         }
       } catch (err) {
-        this.logger.error(`[${userId}] Error checking martingale result: ${err}`);
+        this.logger.error(`[${userId}] Fallback HTTP error: ${err}`);
+        if (!m.isHandlingResult) {
+          m.isHandlingResult = true;
+          await this.processTradeOutcome(userId, false, false, step);
+        }
       }
-    }, 2000);
+    }, RESULT_TIMEOUT_MS);
   }
 
-  private async handleTradeTimeout(userId: string, orderId: string) {
-    this.logger.warn(`[${userId}] Trade result timeout for order ${orderId}`);
-    await this.handleCycleCompletion(userId, 'TIMEOUT', 'Trade result timeout');
+  private clearResultTimeout(mode: ActiveMode) {
+    if (mode.resultTimeoutTimer) {
+      clearTimeout(mode.resultTimeoutTimer);
+      mode.resultTimeoutTimer = null;
+    }
   }
+
+  /**
+   * FIX: fetchTradeResult yang benar — filter terminal status DAN filter dealId.
+   *
+   * Masalah versi lama:
+   *  1. Mengembalikan deal OPEN (status "open" → dianggap LOSE)
+   *  2. Tidak cocokkan dealId (bisa match deal dari cycle sebelumnya)
+   *
+   * Versi baru:
+   *  - Hanya return deal dengan terminal status
+   *  - Prioritas: match by dealId (numeric) jika ada
+   *  - Fallback: deal terbaru yang terminal dalam 120s
+   */
+  private async fetchTradeResultById(
+    session: any,
+    config: IndicatorConfig,
+    dealId: string | null,
+  ): Promise<any | null> {
+    try {
+      const response = await axios.get(
+        `${BASE_URL}/bo-deals-history/v3/deals/trade?type=${config.isDemoAccount ? 'demo' : 'real'}&locale=id`,
+        {
+          headers: {
+            'authorization-token': session.stockityToken,
+            'device-id': session.deviceId,
+            'device-type': session.deviceType || 'web',
+            'user-timezone': session.userTimezone || 'Asia/Jakarta',
+            'User-Agent': session.userAgent,
+            'Accept': 'application/json, text/plain, */*',
+            'Origin': 'https://stockity.id',
+            'Referer': 'https://stockity.id/',
+          },
+          timeout: 5000,
+        },
+      );
+
+      if (!response.data?.data) return null;
+
+      const deals: any[] = response.data.data.standard_trade_deals || response.data.data.deals || [];
+
+      // ── FIX: Filter hanya terminal status ────────────────────────────────────
+      const terminalDeals = deals.filter((t: any) => {
+        const status = (t.status || '').toLowerCase();
+        return TERMINAL_STATUSES.has(status);
+      });
+
+      // ── FIX: Coba match by dealId dulu ───────────────────────────────────────
+      if (dealId) {
+        const byId = terminalDeals.find(
+          (t: any) => String(t.id) === dealId || t.uuid === dealId,
+        );
+        if (byId) return byId;
+      }
+
+      // ── FIX: Fallback — deal terminal terbaru dalam 120s ─────────────────────
+      const recentTerminal = terminalDeals.find((t: any) => {
+        const tradeTime = new Date(t.created_at).getTime();
+        return tradeTime > Date.now() - FALLBACK_MATCH_WINDOW_MS;
+      });
+
+      return recentTerminal || null;
+    } catch (err) {
+      this.logger.error(`Error fetching trade result: ${err}`);
+      return null;
+    }
+  }
+
+  // ==================== CYCLE COMPLETION ====================
 
   private async handleCycleCompletion(userId: string, reason: string, message: string) {
     const mode = this.activeModes.get(userId);
     if (!mode) return;
 
+    this.clearResultTimeout(mode);
     if (mode.monitoringInterval) {
       clearInterval(mode.monitoringInterval);
+      mode.monitoringInterval = undefined;
     }
 
     this.logger.log(`[${userId}] Cycle completed: ${reason} - ${message}`);
@@ -962,12 +1274,20 @@ export class IndicatorService implements OnModuleDestroy {
       mode.consecutiveRestarts++;
       this.logger.log(`[${userId}] Auto-restarting cycle #${mode.consecutiveRestarts}`);
 
+      // Reset state untuk cycle baru
       mode.isTradeExecuted = false;
-      mode.activeTradeOrderId = null;
+      mode.activeOrderId = null;
+      mode.activeDealId = null;
+      mode.activeOrderTrend = null;
+      mode.activeOrderAmount = 0;
+      mode.activeOrderExecutedAt = 0;
+      mode.currentMartingaleStep = 0;
+      mode.isHandlingResult = false;
       mode.currentMartingaleOrder = null;
       mode.historicalCandles = [];
       mode.analysisResult = null;
       mode.pricePredictions = [];
+      // sessionPnL dan cycleNumber TIDAK di-reset antar cycle — akumulasi per sesi
 
       const config = await this.getConfig(userId);
       const session = await this.authService.getSession(userId);
@@ -981,11 +1301,74 @@ export class IndicatorService implements OnModuleDestroy {
     }
   }
 
-  // ==================== HELPERS ====================
+  // ==================== LOGS ====================
+
+  async getLogs(userId: string, limit = 100): Promise<IndicatorLog[]> {
+    const mode = this.activeModes.get(userId);
+    if (mode && mode.logs.length > 0) {
+      return mode.logs.slice(-limit);
+    }
+
+    // Fallback: ambil dari Firestore
+    try {
+      const snap = await this.firebaseService.db
+        .collection('indicator_logs')
+        .doc(userId)
+        .collection('entries')
+        .orderBy('executedAt', 'desc')
+        .limit(limit)
+        .get();
+
+      return snap.docs.map((d) => {
+        const data = d.data() as any;
+        return {
+          ...data,
+          executedAt: data.executedAt?.toMillis?.() ?? data.executedAt ?? 0,
+        } as IndicatorLog;
+      });
+    } catch (err) {
+      this.logger.error(`[${userId}] getLogs error: ${err}`);
+      return [];
+    }
+  }
 
   /**
-   * Builds a trade payload compatible with StockityWebSocketClient.placeTrade().
+   * Simpan log ke in-memory dan Firebase.
+   * Pakai upsert (set doc dengan ID tetap) supaya execution log
+   * tertimpa oleh result log — tidak ada duplikasi row di history.
    */
+  private writeLog(userId: string, log: IndicatorLog) {
+    const mode = this.activeModes.get(userId);
+    if (mode) {
+      const existingIdx = mode.logs.findIndex((l) => l.id === log.id);
+      if (existingIdx !== -1) {
+        mode.logs[existingIdx] = log;   // upsert in-memory
+      } else {
+        mode.logs.push(log);
+      }
+      if (mode.logs.length > 500) mode.logs.splice(0, mode.logs.length - 500);
+    }
+
+    // Simpan ke Firebase async (non-blocking)
+    this.appendLogToFirebase(userId, log).catch((err) =>
+      this.logger.error(`[${userId}] appendLogToFirebase error: ${err}`),
+    );
+  }
+
+  private async appendLogToFirebase(userId: string, log: IndicatorLog) {
+    await this.firebaseService.db
+      .collection('indicator_logs')
+      .doc(userId)
+      .collection('entries')
+      .doc(log.id)
+      .set({
+        ...log,
+        executedAt: this.firebaseService.Timestamp.fromMillis(log.executedAt),
+      });
+  }
+
+  // ==================== HELPERS ====================
+
   private buildTradePayload(session: any, config: IndicatorConfig, amount: number, trend: string): any {
     const nowMs = Date.now();
     const createdAtSec = Math.floor(nowMs / 1000) + 1;

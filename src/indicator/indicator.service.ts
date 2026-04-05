@@ -219,12 +219,20 @@ export class IndicatorService implements OnModuleDestroy {
     if (mode) {
       return {
         isActive: mode.isActive,
+        isRunning: mode.isActive,            // ← fix: field yg dibaca frontend
         botState: 'RUNNING',
+        totalTrades: mode.totalExecutions,   // ← fix: frontend pakai totalTrades
         totalExecutions: mode.totalExecutions,
         totalWins: mode.totalWins,
         totalLosses: mode.totalLosses,
         consecutiveWins: mode.consecutiveWins,
         consecutiveLosses: mode.consecutiveLosses,
+        currentIndicatorValue: mode.analysisResult?.finalIndicatorValue ?? null,
+        lastTrend: mode.analysisResult?.trend ?? null,
+        lastSignalTime: mode.indicatorOrders.length > 0
+          ? mode.indicatorOrders[mode.indicatorOrders.length - 1].executionTime
+          : null,
+        indicatorType: mode.analysisResult?.indicatorType ?? null,
         wsConnected: mode.wsClient.isConnected(),
         indicatorOrders: mode.indicatorOrders,
         pricePredictions: mode.pricePredictions,
@@ -236,7 +244,14 @@ export class IndicatorService implements OnModuleDestroy {
     const statusDoc = await this.firebaseService.db.collection('indicator_status').doc(userId).get();
     return {
       isActive: false,
+      isRunning: false,                      // ← fix: field yg dibaca frontend
       botState: statusDoc.exists ? (statusDoc.data()?.botState ?? 'STOPPED') : 'STOPPED',
+      totalTrades: 0,
+      totalWins: 0,
+      totalLosses: 0,
+      currentIndicatorValue: null,
+      lastTrend: null,
+      lastSignalTime: null,
       config,
     };
   }

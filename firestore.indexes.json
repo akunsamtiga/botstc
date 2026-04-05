@@ -1,0 +1,13 @@
+{
+  "indexes": [
+    {
+      "collectionGroup": "entries",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "orderId",       "order": "ASCENDING" },
+        { "fieldPath": "martingaleStep","order": "ASCENDING" }
+      ]
+    }
+  ],
+  "fieldOverrides": []
+}

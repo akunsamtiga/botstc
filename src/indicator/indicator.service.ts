@@ -37,6 +37,7 @@ export interface IndicatorLog {
   note?: string;
   indicatorType?: string;
   cycleNumber?: number;
+  isDemoAccount?: boolean; // true = demo, false = real (untuk filter profit hari ini)
 }
 
 // Statuses yang menandakan trade sudah selesai (terminal)

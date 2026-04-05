@@ -219,6 +219,7 @@ export abstract class FastradeBaseExecutor {
         id: uuidv4(), orderId, trend, amount, martingaleStep,
         result: 'FAILED', executedAt: now, cycleNumber: cycleNum,
         note: `Build error: ${err.message}`,
+        isDemoAccount: this.config.isDemoAccount,
       });
       return null;
     }
@@ -234,6 +235,7 @@ export abstract class FastradeBaseExecutor {
         id: uuidv4(), orderId, trend, amount, martingaleStep,
         result: 'FAILED', executedAt: now, cycleNumber: cycleNum,
         note: 'Trade gagal: amount di bawah minimum Stockity. Cek konfigurasi.',
+        isDemoAccount: this.config.isDemoAccount,
       });
       this.callbacks.onStatusChange(
         `❌ Amount ${amount} di bawah minimum Stockity — bot dihentikan. Cek konfigurasi.`,
@@ -275,6 +277,7 @@ export abstract class FastradeBaseExecutor {
       note: result.error === 'duplicate'
         ? 'Duplicate deal — menunggu hasil via WS'
         : (!dealId ? 'Trade gagal: WS tidak merespons' : undefined),
+      isDemoAccount: this.config.isDemoAccount,
     });
 
     // Jika error non-duplicate dan tidak ada dealId, return null (gagal)
@@ -418,6 +421,7 @@ export abstract class FastradeBaseExecutor {
       sessionPnL: this.sessionPnL,
       executedAt: Date.now(),
       cycleNumber: active.cycleNumber,
+      isDemoAccount: this.config.isDemoAccount,
     });
 
     const completedOrder: FastradeOrder = { ...active, result: result as any, dealId: dealId || active.dealId };

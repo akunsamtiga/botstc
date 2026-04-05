@@ -100,6 +100,7 @@ export interface ExecutionLog {
   sessionPnL?: number;  // running total P&L sesi setelah trade ini selesai
   executedAt: number;
   note?: string;
+  isDemoAccount?: boolean; // true = demo, false = real (untuk filter profit hari ini)
 }
 
 export interface StockityAsset {

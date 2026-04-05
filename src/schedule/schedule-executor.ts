@@ -276,6 +276,7 @@ export class ScheduleExecutor {
         trend: order.trend, amount, martingaleStep: step,
         result: 'FAILED', executedAt: Date.now(),
         note: `Timing error: ${err.message}`,
+        isDemoAccount: this.config.isDemoAccount,
       });
       return;
     }
@@ -293,6 +294,7 @@ export class ScheduleExecutor {
         trend: order.trend, amount, martingaleStep: step,
         result: 'FAILED', executedAt: Date.now(),
         note: 'Amount di bawah minimum Stockity',
+        isDemoAccount: this.config.isDemoAccount,
       });
       setTimeout(async () => { 
         this.stop(); 
@@ -329,6 +331,7 @@ export class ScheduleExecutor {
       result: (result.error && result.error !== 'duplicate') ? 'FAILED' : undefined,
       executedAt: Date.now(),
       note: result.error === 'duplicate' ? 'Duplicate deal — menunggu hasil via WS' : undefined,
+      isDemoAccount: this.config.isDemoAccount,
     });
   }
 
@@ -536,6 +539,7 @@ export class ScheduleExecutor {
         amount, martingaleStep: step,
         result: 'FAILED', executedAt: Date.now(),
         note: `Martingale timing error step ${step}: ${err.message}`,
+        isDemoAccount: this.config.isDemoAccount,
       });
       return;
     }
@@ -554,6 +558,7 @@ export class ScheduleExecutor {
         amount, martingaleStep: step,
         result: 'FAILED', executedAt: Date.now(),
         note: `Martingale step ${step}: amount di bawah minimum Stockity`,
+        isDemoAccount: this.config.isDemoAccount,
       });
       setTimeout(async () => { 
         this.stop(); 
@@ -588,6 +593,7 @@ export class ScheduleExecutor {
       note: result.error === 'duplicate'
         ? `Martingale step ${step}: duplicate deal — menunggu hasil via WS`
         : `Martingale step ${step}`,
+      isDemoAccount: this.config.isDemoAccount,
     });
   }
 
@@ -692,6 +698,7 @@ export class ScheduleExecutor {
       sessionPnL: this.sessionPnL,
       executedAt: Date.now(),
       note: `Result: ${finalResult} | PnL: ${tradePnL > 0 ? '+' : ''}${tradePnL}`,
+      isDemoAccount: this.config.isDemoAccount,
     });
 
     // ── Cek stop conditions ───────────────────────────────────────────────

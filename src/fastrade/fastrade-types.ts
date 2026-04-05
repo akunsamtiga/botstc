@@ -54,6 +54,7 @@ export interface FastradeLog {
   note?: string;
   cycleNumber: number;
   mode?: FastradeMode;
+  isDemoAccount?: boolean; // true = demo, false = real (untuk filter profit hari ini)
 }
 
 export interface FastradeTradeOrder {

@@ -1127,7 +1127,7 @@ export class IndicatorService implements OnModuleDestroy {
       ? config.martingale.multiplierValue
       : 1 + config.martingale.multiplierValue / 100;
 
-    return Math.floor(config.settings.amount * Math.pow(multiplier, step - 1));
+    return Math.floor(config.settings.amount * Math.pow(multiplier, step));
   }
 
   // ==================== RESULT TIMEOUT (Fallback) ====================

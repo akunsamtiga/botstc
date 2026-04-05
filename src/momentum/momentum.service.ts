@@ -299,22 +299,29 @@ export class MomentumService implements OnModuleDestroy {
     }
 
     // Fallback: Firebase (bot stopped, like fastrade pattern)
-    const snap = await this.firebaseService.db
-      .collection('momentum_logs')
-      .doc(userId)
-      .collection('entries')
-      .orderBy('executedAt', 'desc')
-      .limit(limit)
-      .get();
+    // FIX: wrap in try-catch — jika query Firebase gagal (misal index belum ada),
+    // return [] daripada throw 500 yang menyebabkan history page tampil kosong.
+    try {
+      const snap = await this.firebaseService.db
+        .collection('momentum_logs')
+        .doc(userId)
+        .collection('entries')
+        .orderBy('executedAt', 'desc')
+        .limit(limit)
+        .get();
 
-    return snap.docs.map((d) => {
-      const data = d.data() as any;
-      return {
-        ...data,
-        // FIX: convert Firestore Timestamp → millis (same fix as fastrade getLogs)
-        executedAt: data.executedAt?.toMillis?.() ?? data.executedAt ?? 0,
-      } as MomentumLog;
-    });
+      return snap.docs.map((d) => {
+        const data = d.data() as any;
+        return {
+          ...data,
+          // FIX: convert Firestore Timestamp → millis (same fix as fastrade getLogs)
+          executedAt: data.executedAt?.toMillis?.() ?? data.executedAt ?? 0,
+        } as MomentumLog;
+      });
+    } catch (err: any) {
+      this.logger.error(`[${userId}] getLogs Firebase error: ${err.message}`);
+      return [];
+    }
   }
 
   // ==================== CANDLE STORAGE & ANALYSIS ====================
@@ -1157,15 +1164,35 @@ export class MomentumService implements OnModuleDestroy {
    */
   private updateLog(userId: string, orderId: string, updates: Partial<MomentumLog>, step = 0) {
     const mode = this.activeModes.get(userId);
-    if (!mode) return;
 
-    // For martingale steps, find by orderId + martingaleStep
-    const idx = mode.logs.findIndex(
-      (l) => l.orderId === orderId && l.martingaleStep === step,
-    );
-    if (idx !== -1) {
-      mode.logs[idx] = { ...mode.logs[idx], ...updates };
-      this.persistLogToFirebase(userId, mode.logs[idx]).catch(() => {});
+    if (mode) {
+      // Update in-memory log dan persist ke Firebase
+      const idx = mode.logs.findIndex(
+        (l) => l.orderId === orderId && l.martingaleStep === step,
+      );
+      if (idx !== -1) {
+        mode.logs[idx] = { ...mode.logs[idx], ...updates };
+        this.persistLogToFirebase(userId, mode.logs[idx]).catch(() => {});
+      }
+    } else {
+      // FIX: mode sudah dihapus (bot di-stop), tapi WS result bisa datang mepet
+      // setelah stop. Langsung update doc di Firestore via query orderId+step.
+      this.firebaseService.db
+        .collection("momentum_logs")
+        .doc(userId)
+        .collection("entries")
+        .where("orderId", "==", orderId)
+        .where("martingaleStep", "==", step)
+        .limit(1)
+        .get()
+        .then((snap) => {
+          if (!snap.empty) {
+            snap.docs[0].ref
+              .update(updates)
+              .catch(() => {});
+          }
+        })
+        .catch(() => {});
     }
   }
 

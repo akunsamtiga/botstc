@@ -128,19 +128,9 @@ export class ScheduleExecutor {
     this.botState = 'STOPPED';
     this.stopMonitoringLoop();
     this.stopCompletionCheck();
-    if (this.activeMartingaleOrderId) {
-      const idx = this.orders.findIndex(o => o.id === this.activeMartingaleOrderId);
-      if (idx !== -1) {
-        this.orders[idx] = {
-          ...this.orders[idx],
-          martingaleState: {
-            ...this.orders[idx].martingaleState,
-            isActive: false, isCompleted: true,
-            finalResult: 'FAILED', failureReason: 'Bot stopped',
-          },
-        };
-      }
-    }
+    // Hapus semua order yang sudah dieksekusi (menunggu hasil atau stuck martingale)
+    // Firestore hanya menyimpan order yang benar-benar belum jalan
+    this.orders = this.orders.filter(o => !o.isExecuted);
     this.activeMartingaleOrderId = undefined;
     this.martingaleStartTime = undefined;
     this.alwaysSignalLossState = undefined;
@@ -217,15 +207,20 @@ export class ScheduleExecutor {
       const timeUntil = target - now;
 
       if (timeUntil < -EXECUTION_WINDOW_MS) {
-        this.orders[i] = { ...order, isSkipped: true, skipReason: `Expired ${Math.abs(timeUntil)}ms ago` };
-        changed = true;
+        // Hapus langsung dari list — tidak perlu isSkipped yang menumpuk di Firestore
         this.logger.warn(`[${this.userId}] ⏭️ Skipped expired: ${order.time} ${order.trend}`);
+        this.orders.splice(i, 1);
+        i--;
+        changed = true;
         continue;
       }
 
       if (timeUntil <= 0 && timeUntil >= -EXECUTION_WINDOW_MS) {
         if (this.activeMartingaleOrderId && this.activeMartingaleOrderId !== order.id) {
-          this.orders[i] = { ...order, isSkipped: true, skipReason: 'Martingale aktif dari order lain' };
+          // Hapus langsung — order bentrok dengan martingale aktif tidak perlu disimpan
+          this.logger.warn(`[${this.userId}] ⏭️ Skipped (martingale aktif): ${order.time} ${order.trend}`);
+          this.orders.splice(i, 1);
+          i--;
           changed = true;
           continue;
         }
@@ -237,11 +232,6 @@ export class ScheduleExecutor {
         this.executeOrder(this.orders[i], true);
       }
     }
-
-    const startToday = this.getStartOfJakartaDay();
-    const before = this.orders.length;
-    this.orders = this.orders.filter(o => !((o.isExecuted || o.isSkipped) && o.timeInMillis < startToday));
-    if (this.orders.length !== before) changed = true;
 
     if (changed) this.callbacks.onOrdersUpdate(this.orders);
   }
@@ -638,16 +628,11 @@ export class ScheduleExecutor {
     const order = this.orders[orderIdx];
     const finalResult = result === 'WIN' ? 'WIN' : result === 'DRAW' ? 'DRAW' : 'LOSS';
 
-    // Clear activeMartingaleOrderId if this completed order was the active one
     if (this.activeMartingaleOrderId === order.id) {
       this.activeMartingaleOrderId = undefined;
       this.martingaleStartTime = undefined;
     }
 
-    // ── Hitung profit/loss trade ini ─────────────────────────────────────
-    // WIN  → amount * profitRate (default 85% jika profitRate tidak tersedia)
-    // LOSE → -amount
-    // DRAW → 0
     const profitRate = (this.config.asset.profitRate ?? 85) / 100;
     let tradePnL = 0;
     if (result === 'WIN') {
@@ -662,29 +647,15 @@ export class ScheduleExecutor {
 
     this.sessionPnL += tradePnL;
 
-    this.orders[orderIdx] = {
-      ...order, result,
-      activeDealId: dealId,
-      martingaleState: {
-        ...order.martingaleState,
-        isActive: false, isCompleted: true,
-        finalResult, lastUpdateTime: Date.now(),
-      },
-    };
-    this.callbacks.onOrdersUpdate(this.orders);
     this.logger.log(
       `[${this.userId}] ✅ ${order.time} ${order.trend} → ${result} ` +
       `| tradePnL=${tradePnL > 0 ? '+' : ''}${tradePnL} sessionPnL=${this.sessionPnL > 0 ? '+' : ''}${this.sessionPnL}`,
     );
 
-    // ── Emit result log ke Firebase history ──────────────────────────────
-    // Pakai ID deterministik (orderId_sStep) yang sama dengan execution log
-    // → Firestore overwrite entry lama → tidak ada 2 baris untuk 1 trade.
-    const resultStep = order.martingaleState.isActive
-      ? order.martingaleState.currentStep
-      : 0;
+    const resultStep = order.martingaleState.isActive ? order.martingaleState.currentStep : 0;
     const resultAmount = this.calcAmount(resultStep);
 
+    // Emit log ke Firebase history (terpisah dari orders)
     this.callbacks.onLog({
       id: `${order.id}_s${resultStep}`,
       orderId: order.id,
@@ -701,7 +672,11 @@ export class ScheduleExecutor {
       isDemoAccount: this.config.isDemoAccount,
     });
 
-    // ── Cek stop conditions ───────────────────────────────────────────────
+    // Hapus langsung dari list — Firestore hanya menyimpan order yang BELUM selesai
+    // Ini mencegah konflik dedup saat jadwal baru dibuat keesokan harinya
+    this.orders.splice(orderIdx, 1);
+    this.callbacks.onOrdersUpdate(this.orders);
+
     this.checkStopConditions();
   }
 
@@ -802,31 +777,41 @@ export class ScheduleExecutor {
   private checkCompletion() {
     if (this.botState !== 'RUNNING') return;
     const now = Date.now();
-    if (now - this.lastCompletionCheck < 2000) return;  // Match interval
+    if (now - this.lastCompletionCheck < 2000) return;
     this.lastCompletionCheck = now;
 
-    const hasPending         = this.orders.some(o => !o.isExecuted && !o.isSkipped);
-    const hasIncompleteMart  = this.orders.some(o => o.martingaleState.isActive && !o.martingaleState.isCompleted);
+    // Dengan pendekatan hapus-langsung:
+    //   pending  = order yang belum dieksekusi sama sekali (!isExecuted)
+    //   awaiting = order yang sudah dieksekusi tapi belum dapat hasil WS (isExecuted, masih di list)
+    const hasPending = this.orders.some(o => !o.isExecuted);
 
-    const hasAwaitingResult = this.orders.some(o => {
-      if (!o.isExecuted || o.isSkipped || o.martingaleState.isCompleted) return false;
-      const waitedMs = now - o.timeInMillis;
+    // Cek awaiting + tangani timeout
+    const timedOut: string[] = [];
+    let hasAwaiting = false;
+    for (const o of this.orders) {
+      if (!o.isExecuted) continue;
+      const info = this.executionInfoMap.get(o.id);
+      const waitedMs = now - (info?.executedAt ?? o.timeInMillis);
       if (waitedMs > MAX_RESULT_WAIT_MS) {
         this.logger.warn(
-          `[${this.userId}] ⚠️ Result timeout ${o.time} (waited ${Math.round(waitedMs / 1000)}s) — force complete`,
+          `[${this.userId}] ⚠️ Result timeout ${o.time} (${Math.round(waitedMs / 1000)}s) — force remove`,
         );
         this.executionInfoMap.delete(o.id);
-        return false;
+        timedOut.push(o.id);
+      } else {
+        hasAwaiting = true;
       }
-      return true;
-    });
+    }
+    if (timedOut.length > 0) {
+      this.orders = this.orders.filter(o => !timedOut.includes(o.id));
+      this.callbacks.onOrdersUpdate(this.orders);
+    }
 
-    if (!hasPending && !this.activeMartingaleOrderId && !hasIncompleteMart && !hasAwaitingResult && this.orders.length > 0) {
+    if (!hasPending && !hasAwaiting && !this.activeMartingaleOrderId && this.orders.length === 0) {
       this.logger.log(`[${this.userId}] ✅ All schedules completed`);
       setTimeout(async () => { 
         this.stop(); 
         try {
-          // Guard: hanya panggil onAllCompleted sekali
           if (!this.hasCompleted) {
             this.hasCompleted = true;
             await this.callbacks.onAllCompleted();
@@ -907,22 +892,18 @@ export class ScheduleExecutor {
     return Math.floor(m.baseAmount * Math.pow(mult, step));
   }
 
-  private getStartOfJakartaDay(): number {
-    const d = new Date(Date.now() + JAKARTA_OFFSET_MS);
-    d.setHours(0, 0, 0, 0);
-    return d.getTime() - JAKARTA_OFFSET_MS;
-  }
-
   getStatus(): object {
-    const pending = this.orders.filter(o => !o.isExecuted && !o.isSkipped);
+    const pending = this.orders.filter(o => !o.isExecuted);
+    const awaiting = this.orders.filter(o => o.isExecuted);
     const next    = [...pending].sort((a, b) => a.timeInMillis - b.timeInMillis)[0];
     const now     = Date.now();
     return {
       botState: this.botState,
       totalOrders: this.orders.length,
       pendingOrders: pending.length,
-      executedOrders: this.orders.filter(o => o.isExecuted).length,
-      skippedOrders: this.orders.filter(o => o.isSkipped).length,
+      awaitingOrders: awaiting.length,
+      executedOrders: 0,   // completed orders dihapus dari list — lihat di history logs
+      skippedOrders: 0,
       activeMartingaleOrderId: this.activeMartingaleOrderId ?? null,
       alwaysSignalActive: !!this.alwaysSignalLossState?.hasOutstandingLoss,
       alwaysSignalStep: this.alwaysSignalLossState?.currentMartingaleStep ?? 0,

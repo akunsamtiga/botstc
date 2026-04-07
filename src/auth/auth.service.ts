@@ -8,10 +8,7 @@ const BASE_URL = 'https://api.stockity.id';
 
 // ✅ FIX: User-Agent harus Chrome/146 — diambil dari HAR capture browser asli
 //         Chrome/139 ditolak Stockity (header mismatch → 401)
-const DEFAULT_USER_AGENT =
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
-  '(KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36';
-
+const DEFAULT_USER_AGENT = 'curl/8.5.0';
 // ✅ FIX: Timezone harus Asia/Bangkok — sama dengan yang dikirim browser Stockity
 //         Asia/Jakarta menyebabkan header mismatch → request ditolak
 const DEFAULT_TIMEZONE = 'Asia/Bangkok';

@@ -1,16 +1,18 @@
 import { Injectable, Logger, UnauthorizedException } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import { FirebaseService } from '../firebase/firebase.service';
-import axios from 'axios';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
 import { v4 as uuidv4 } from 'uuid';
+
+const execFileAsync = promisify(execFile);
 
 const BASE_URL = 'https://api.stockity.id';
 
-// ✅ FIX: User-Agent harus Chrome/146 — diambil dari HAR capture browser asli
-//         Chrome/139 ditolak Stockity (header mismatch → 401)
-const DEFAULT_USER_AGENT = 'curl/8.5.0';
-// ✅ FIX: Timezone harus Asia/Bangkok — sama dengan yang dikirim browser Stockity
-//         Asia/Jakarta menyebabkan header mismatch → request ditolak
+const DEFAULT_USER_AGENT =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
+  '(KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36';
+
 const DEFAULT_TIMEZONE = 'Asia/Bangkok';
 
 @Injectable()
@@ -21,6 +23,52 @@ export class AuthService {
     private jwtService: JwtService,
     private firebaseService: FirebaseService,
   ) {}
+
+  // ── curlPost ─────────────────────────────────────────────────────────────────
+  // Gunakan curl binary (bukan axios) untuk bypass Cloudflare JA3/JA4 fingerprint
+  // blocking. Node.js/axios memiliki TLS fingerprint berbeda dari browser/curl,
+  // sehingga Cloudflare silently hang koneksinya (ETIMEDOUT, no response).
+  // curl dari VPS ini terbukti lolos (HTTP 422 pada test dengan kredensial salah).
+  private async curlPost(
+    url: string,
+    body: object,
+    headers: Record<string, string>,
+  ): Promise<{ status: number; data: any }> {
+    const headerArgs: string[] = [];
+    for (const [k, v] of Object.entries(headers)) {
+      headerArgs.push('-H', `${k}: ${v}`);
+    }
+
+    const { stdout } = await execFileAsync('curl', [
+      '-s',
+      '-X', 'POST',
+      url,
+      ...headerArgs,
+      '-H', 'Content-Type: application/json',
+      '-d', JSON.stringify(body),
+      '--max-time', '15',
+      '-w', '\n__HTTP_STATUS__%{http_code}',
+    ]);
+
+    const parts      = stdout.split('\n__HTTP_STATUS__');
+    const statusCode = parseInt(parts[1]?.trim() ?? '0', 10);
+    const rawBody    = parts[0].trim();
+
+    if (!rawBody || statusCode === 0) {
+      const err: any = new Error('');
+      err.code = 'ETIMEDOUT';
+      throw err;
+    }
+
+    let parsed: any;
+    try {
+      parsed = JSON.parse(rawBody);
+    } catch {
+      throw new Error(`Non-JSON response (HTTP ${statusCode}): ${rawBody.slice(0, 300)}`);
+    }
+
+    return { status: statusCode, data: parsed };
+  }
 
   async login(email: string, password: string) {
     this.logger.log(`Login attempt: ${email}`);
@@ -39,39 +87,50 @@ export class AuthService {
       }
     } catch (_) {}
 
-    // Login ke Stockity
-    // Response shape dikonfirmasi dari HAR: { data: { authtoken: string, user_id: string } }
     let stockityAuthToken: string;
     let stockityUserId: string;
 
     try {
-      const response = await axios.post(
-  `${BASE_URL}/passport/v2/sign_in?locale=id`,
-  { email, password },
-  {
-    headers: {
-      'device-id':     deviceId,
-      'device-type':   'web',
-      'user-timezone': DEFAULT_TIMEZONE,
-      'accept':        'application/json, text/plain, */*',
-      'content-type':  'application/json',
-      'User-Agent':    DEFAULT_USER_AGENT,
-      'Origin':        'https://stockity.id',
-      'Referer':       'https://stockity.id/',
-      // ✅ HAPUS: 'cache-control' — tidak ada di curl yang berhasil
-      // ✅ HAPUS: 'Cookie' — ini yang paling mungkin menyebabkan hang
-    },
-    timeout: 15000,
-  },
-);
+      const result = await this.curlPost(
+        `${BASE_URL}/passport/v2/sign_in?locale=id`,
+        { email, password },
+        {
+          'device-id':     deviceId,
+          'device-type':   'web',
+          'user-timezone': DEFAULT_TIMEZONE,
+          'accept':        'application/json, text/plain, */*',
+          'User-Agent':    DEFAULT_USER_AGENT,
+          'Origin':        'https://stockity.id',
+          'Referer':       'https://stockity.id/',
+        },
+      );
 
+      if (result.status >= 400) {
+        const body = result.data;
+        this.logger.error(
+          `Stockity login error [HTTP ${result.status}]: ` +
+          `${JSON.stringify(body).slice(0, 500)}`,
+        );
+        const errMsg: string =
+          body?.errors?.[0]?.message ||
+          body?.errors?.[0]           ||
+          body?.message               ||
+          body?.error                 ||
+          (result.status === 401 || result.status === 403 || result.status === 422
+            ? 'Email atau password salah'
+            : result.status === 423
+            ? 'Akun diblokir'
+            : result.status >= 500
+            ? 'Server Stockity bermasalah, coba lagi nanti'
+            : 'Login gagal');
+        throw new UnauthorizedException(errMsg);
+      }
 
-      // Response confirmed dari HAR: { data: { authtoken: "...", user_id: "..." } }
-      const d = response.data?.data ?? {};
+      // Response shape: { data: { authtoken: string, user_id: string } }
+      const d = result.data?.data ?? {};
 
       stockityAuthToken = d.authtoken ?? '';
-      // user_id bisa string atau number — normalize ke string
-      stockityUserId = String(d.user_id ?? d.userId ?? '');
+      stockityUserId    = String(d.user_id ?? d.userId ?? '');
 
       if (!stockityAuthToken) {
         this.logger.error(
@@ -87,40 +146,23 @@ export class AuthService {
       }
 
     } catch (err: any) {
-  if (err instanceof UnauthorizedException) throw err;
+      if (err instanceof UnauthorizedException) throw err;
 
-  // ✅ FIX: Log lengkap untuk diagnosis
-  const status    = err?.response?.status;
-  const body      = err?.response?.data;
-  const errCode   = err?.code;                          // ECONNREFUSED, ETIMEDOUT, dll
-  const hasReq    = !!err?.request;                     // request dikirim tapi no response
-  const hasRes    = !!err?.response;                    // response diterima
-  const rawMsg    = err?.message || '(empty message)';  // ✅ FIX: fallback eksplisit
+      const errCode  = err?.code ?? 'unknown';
+      const rawMsg   = err?.message || '(empty message)';
+      this.logger.error(
+        `Stockity login error\n` +
+        `  code    : ${errCode}\n` +
+        `  message : ${rawMsg}`,
+      );
 
-  this.logger.error(
-    `Stockity login error\n` +
-    `  code    : ${errCode ?? 'none'}\n` +
-    `  hasReq  : ${hasReq} | hasRes: ${hasRes}\n` +
-    `  HTTP    : ${status ?? 'no-response'}\n` +
-    `  message : ${rawMsg}\n` +
-    `  body    : ${JSON.stringify(body ?? '(no body)').slice(0, 500)}`,
-  );
+      const errMsg =
+        errCode === 'ETIMEDOUT'     ? 'Koneksi ke Stockity timeout, coba lagi' :
+        errCode === 'ECONNREFUSED'  ? 'Tidak bisa terhubung ke Stockity'       :
+        rawMsg || 'Login gagal';
 
-  const errMsg: string =
-    body?.errors?.[0]?.message ||
-    body?.errors?.[0]           ||
-    body?.message               ||
-    body?.error                 ||
-    (status === 401 || status === 403 ? 'Email atau password salah' :
-     status === 422                   ? 'Email atau password salah' :  // ✅ tambah 422
-     status === 423                   ? 'Akun diblokir'             :
-     status >= 500                    ? 'Server Stockity bermasalah' :
-     rawMsg.includes('timeout')       ? 'Koneksi ke Stockity timeout' :
-     rawMsg.includes('ECONNREFUSED')  ? 'Tidak bisa terhubung ke Stockity' :
-     rawMsg || 'Login gagal');
-
-  throw new UnauthorizedException(errMsg);
-}
+      throw new UnauthorizedException(errMsg);
+    }
 
     // Simpan session ke Firebase
     await this.firebaseService.db

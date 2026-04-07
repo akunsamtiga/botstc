@@ -49,26 +49,25 @@ export class AuthService {
 
     try {
       const response = await axios.post(
-        `${BASE_URL}/passport/v2/sign_in?locale=id`,
-        { email, password },
-        {
-          headers: {
-            // ✅ FIX: Semua header diambil persis dari HAR capture browser asli
-            //         Request tanpa header ini akan di-reject Stockity (401/403)
-            'cache-control': 'no-cache, no-store, must-revalidate', // ✅ KRITIS — was missing
-            'device-id':     deviceId,
-            'device-type':   'web',
-            'user-timezone': DEFAULT_TIMEZONE,                      // ✅ Bangkok, bukan Jakarta
-            'accept':        'application/json, text/plain, */*',   // ✅ exact match browser
-            'content-type':  'application/json',
-            'User-Agent':    DEFAULT_USER_AGENT,                    // ✅ Chrome/146
-            'Origin':        'https://stockity.id',                 // ✅ was missing
-            'Referer':       'https://stockity.id/',                // ✅ was missing
-            'Cookie':        `device_type=web; device_id=${deviceId}`,
-          },
-          timeout: 15000,
-        },
-      );
+  `${BASE_URL}/passport/v2/sign_in?locale=id`,
+  { email, password },
+  {
+    headers: {
+      'device-id':     deviceId,
+      'device-type':   'web',
+      'user-timezone': DEFAULT_TIMEZONE,
+      'accept':        'application/json, text/plain, */*',
+      'content-type':  'application/json',
+      'User-Agent':    DEFAULT_USER_AGENT,
+      'Origin':        'https://stockity.id',
+      'Referer':       'https://stockity.id/',
+      // ✅ HAPUS: 'cache-control' — tidak ada di curl yang berhasil
+      // ✅ HAPUS: 'Cookie' — ini yang paling mungkin menyebabkan hang
+    },
+    timeout: 15000,
+  },
+);
+
 
       // Response confirmed dari HAR: { data: { authtoken: "...", user_id: "..." } }
       const d = response.data?.data ?? {};

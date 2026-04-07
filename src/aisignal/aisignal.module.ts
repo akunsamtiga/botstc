@@ -1,13 +1,19 @@
 import { Module } from '@nestjs/common';
-import { AISignalService } from './aisignal.service';
 import { AISignalController } from './aisignal.controller';
+import { AISignalService } from './aisignal.service';
+import { AISignalMonitorService } from './ai-signal-monitor.service';
+import { FirebaseMessagingService } from '../firebase/firebase-messaging.service';
 import { FirebaseModule } from '../firebase/firebase.module';
 import { AuthModule } from '../auth/auth.module';
 
 @Module({
   imports: [FirebaseModule, AuthModule],
-  providers: [AISignalService],
   controllers: [AISignalController],
-  exports: [AISignalService],
+  providers: [
+    AISignalService,
+    AISignalMonitorService,
+    FirebaseMessagingService,
+  ],
+  exports: [AISignalService, AISignalMonitorService],
 })
 export class AISignalModule {}

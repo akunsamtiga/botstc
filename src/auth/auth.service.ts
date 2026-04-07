@@ -91,28 +91,40 @@ export class AuthService {
       }
 
     } catch (err: any) {
-      if (err instanceof UnauthorizedException) throw err;
+  if (err instanceof UnauthorizedException) throw err;
 
-      // Log detail response Stockity untuk debugging
-      const status = err?.response?.status;
-      const body   = err?.response?.data;
-      this.logger.error(
-        `Stockity login error [HTTP ${status ?? 'no-response'}]: ` +
-        `${JSON.stringify(body ?? err.message ?? 'unknown').slice(0, 500)}`,
-      );
+  // ✅ FIX: Log lengkap untuk diagnosis
+  const status    = err?.response?.status;
+  const body      = err?.response?.data;
+  const errCode   = err?.code;                          // ECONNREFUSED, ETIMEDOUT, dll
+  const hasReq    = !!err?.request;                     // request dikirim tapi no response
+  const hasRes    = !!err?.response;                    // response diterima
+  const rawMsg    = err?.message || '(empty message)';  // ✅ FIX: fallback eksplisit
 
-      const errMsg: string =
-        body?.errors?.[0]?.message ||
-        body?.errors?.[0]           ||
-        body?.message               ||
-        body?.error                 ||
-        (status === 401 || status === 403 ? 'Email atau password salah' :
-         status === 423                   ? 'Akun diblokir'             :
-         status >= 500                    ? 'Server Stockity bermasalah, coba lagi nanti' :
-         err.message || 'Login gagal');
+  this.logger.error(
+    `Stockity login error\n` +
+    `  code    : ${errCode ?? 'none'}\n` +
+    `  hasReq  : ${hasReq} | hasRes: ${hasRes}\n` +
+    `  HTTP    : ${status ?? 'no-response'}\n` +
+    `  message : ${rawMsg}\n` +
+    `  body    : ${JSON.stringify(body ?? '(no body)').slice(0, 500)}`,
+  );
 
-      throw new UnauthorizedException(errMsg);
-    }
+  const errMsg: string =
+    body?.errors?.[0]?.message ||
+    body?.errors?.[0]           ||
+    body?.message               ||
+    body?.error                 ||
+    (status === 401 || status === 403 ? 'Email atau password salah' :
+     status === 422                   ? 'Email atau password salah' :  // ✅ tambah 422
+     status === 423                   ? 'Akun diblokir'             :
+     status >= 500                    ? 'Server Stockity bermasalah' :
+     rawMsg.includes('timeout')       ? 'Koneksi ke Stockity timeout' :
+     rawMsg.includes('ECONNREFUSED')  ? 'Tidak bisa terhubung ke Stockity' :
+     rawMsg || 'Login gagal');
+
+  throw new UnauthorizedException(errMsg);
+}
 
     // Simpan session ke Firebase
     await this.firebaseService.db

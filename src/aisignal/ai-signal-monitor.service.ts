@@ -40,6 +40,7 @@ export class AISignalMonitorService implements OnModuleDestroy {
   private processedResults = new Map<string, string>();
   private monitoringIntervals = new Map<string, NodeJS.Timeout>();
   private lastWebSocketUpdateTime = Date.now();
+  private userSessions = new Map<string, any>();
 
   onModuleDestroy() {
     for (const [userId, interval] of this.monitoringIntervals) {
@@ -49,11 +50,17 @@ export class AISignalMonitorService implements OnModuleDestroy {
     this.monitoringIntervals.clear();
     this.activeMonitoring.clear();
     this.processedResults.clear();
+    this.userSessions.clear();
   }
 
-  /**
-   * Start monitoring for a specific user
-   */
+  setUserSession(userId: string, session: any): void {
+    this.userSessions.set(userId, session);
+  }
+
+  private getUserSession(userId: string): any | null {
+    return this.userSessions.get(userId) || null;
+  }
+
   startMonitoring(
     userId: string,
     wsClient: StockityWebSocketClient,
@@ -65,11 +72,8 @@ export class AISignalMonitorService implements OnModuleDestroy {
     }
 
     this.logger.log(`[${userId}] Starting AI Signal monitoring`);
-
-    // Set up WebSocket message handler
     this.setupWebSocketHandler(userId, wsClient, onTradeResult);
 
-    // Start API polling interval
     const interval = setInterval(async () => {
       await this.checkOrdersViaApi(userId, onTradeResult);
     }, this.MONITORING_INTERVAL_MS);
@@ -77,9 +81,6 @@ export class AISignalMonitorService implements OnModuleDestroy {
     this.monitoringIntervals.set(userId, interval);
   }
 
-  /**
-   * Stop monitoring for a specific user
-   */
   stopMonitoring(userId: string): void {
     const interval = this.monitoringIntervals.get(userId);
     if (interval) {
@@ -87,19 +88,16 @@ export class AISignalMonitorService implements OnModuleDestroy {
       this.monitoringIntervals.delete(userId);
     }
 
-    // Clean up monitoring orders for this user
     for (const [key, order] of this.activeMonitoring) {
       if (key.startsWith(`${userId}_`)) {
         this.activeMonitoring.delete(key);
       }
     }
 
+    this.userSessions.delete(userId);
     this.logger.log(`[${userId}] Monitoring stopped`);
   }
 
-  /**
-   * Start monitoring a specific order
-   */
   startMonitoringOrder(
     userId: string,
     parentOrderId: string,
@@ -138,9 +136,6 @@ export class AISignalMonitorService implements OnModuleDestroy {
     );
   }
 
-  /**
-   * Handle WebSocket trade update
-   */
   handleWebSocketTradeUpdate(
     userId: string,
     message: any,
@@ -168,10 +163,13 @@ export class AISignalMonitorService implements OnModuleDestroy {
     wsClient: StockityWebSocketClient,
     onTradeResult: (result: TradeResult) => void,
   ): void {
-    // Note: This assumes wsClient has an onMessage method
-    // You may need to modify StockityWebSocketClient to support this
     if ((wsClient as any).onMessage) {
       (wsClient as any).onMessage((message: any) => {
+        this.handleWebSocketTradeUpdate(userId, message, onTradeResult);
+      });
+    }
+    if ((wsClient as any).setMessageCallback) {
+      (wsClient as any).setMessageCallback((message: any) => {
         this.handleWebSocketTradeUpdate(userId, message, onTradeResult);
       });
     }
@@ -185,7 +183,6 @@ export class AISignalMonitorService implements OnModuleDestroy {
     const ordersToCheck: MonitoringOrder[] = [];
     const ordersToComplete: string[] = [];
 
-    // Collect orders to check
     for (const [key, monitoring] of this.activeMonitoring) {
       if (!key.startsWith(`${userId}_`)) continue;
 
@@ -202,7 +199,6 @@ export class AISignalMonitorService implements OnModuleDestroy {
       }
     }
 
-    // Remove completed/timed out orders
     for (const key of ordersToComplete) {
       this.activeMonitoring.delete(key);
       const orderId = key.replace(`${userId}_`, '');
@@ -210,8 +206,6 @@ export class AISignalMonitorService implements OnModuleDestroy {
     }
 
     if (ordersToCheck.length === 0) return;
-
-    // Check orders via API
     await this.checkOrdersForUser(userId, ordersToCheck, onTradeResult);
   }
 
@@ -220,9 +214,84 @@ export class AISignalMonitorService implements OnModuleDestroy {
     orders: MonitoringOrder[],
     onTradeResult: (result: TradeResult) => void,
   ): Promise<void> {
-    // Note: This requires access to user session
-    // You may need to pass session or auth token when calling this method
+    if (orders.length === 0) return;
+
     this.logger.debug(`[${userId}] Checking ${orders.length} orders via API`);
+
+    const session = this.getUserSession(userId);
+    if (!session) {
+      this.logger.warn(`[${userId}] No session found for API check`);
+      return;
+    }
+
+    try {
+      const config: AISignalConfig = {
+        asset: { ric: orders[0].assetRic, name: orders[0].assetRic },
+        baseAmount: orders[0].amount,
+        martingale: {
+          isEnabled: false,
+          maxSteps: 2,
+          multiplierValue: 2.5,
+          multiplierType: 'FIXED',
+          isAlwaysSignal: false,
+        },
+        isDemoAccount: orders[0].isDemoAccount,
+        currency: 'IDR',
+      };
+
+      const recentTrade = await this.fetchTradeResultFromApi(session, config);
+      if (!recentTrade) return;
+
+      for (const order of orders) {
+        if (order.webSocketResultReceived || order.isCompleted) continue;
+
+        const tradeTime = new Date(recentTrade.created_at).getTime();
+        const timeDiff = Math.abs(tradeTime - order.executionTime);
+        const amountMatch = Math.abs(recentTrade.amount - order.amount) < 100;
+        const trendMatch = recentTrade.trend?.toLowerCase() === order.trend.toLowerCase();
+
+        if (timeDiff < 120000 && amountMatch && trendMatch) {
+          this.logger.log(
+            `[${userId}] Trade result detected (API): ${order.monitoringOrderId} - ${recentTrade.status?.toUpperCase()}`,
+          );
+
+          const isWin = recentTrade.status?.toLowerCase() === 'won';
+          const key = `${userId}_${order.monitoringOrderId}`;
+
+          this.activeMonitoring.set(key, {
+            ...order,
+            webSocketResultReceived: true,
+            isCompleted: true,
+          });
+
+          this.processedResults.set(`${userId}_${order.monitoringOrderId}`, recentTrade.id);
+
+          const result: TradeResult = {
+            parentOrderId: order.parentOrderId,
+            monitoringOrderId: order.monitoringOrderId,
+            isWin,
+            isMartingale: order.isMartingale,
+            martingaleStep: order.martingaleStep,
+            details: new Map([
+              ['trade_id', recentTrade.id],
+              ['amount', recentTrade.amount],
+              ['trend', recentTrade.trend],
+              ['status', recentTrade.status],
+              ['win_amount', recentTrade.win || 0],
+              ['payment', recentTrade.payment || 0],
+              ['detection_method', 'ai_signal_monitor_api'],
+              ['detection_time', Date.now()],
+              ['monitoring_duration', Date.now() - order.startTime],
+            ]),
+          };
+
+          onTradeResult(result);
+          break;
+        }
+      }
+    } catch (err: any) {
+      this.logger.error(`[${userId}] Error in API check: ${err?.message || err}`);
+    }
   }
 
   private processWebSocketResult(
@@ -234,7 +303,6 @@ export class AISignalMonitorService implements OnModuleDestroy {
     payload: any,
     onTradeResult: (result: TradeResult) => void,
   ): void {
-    // Find matching monitoring order
     let matchingMonitoring: MonitoringOrder | null = null;
     let matchingKey: string | null = null;
 
@@ -254,7 +322,6 @@ export class AISignalMonitorService implements OnModuleDestroy {
     }
 
     if (matchingMonitoring && matchingKey) {
-      // Update monitoring order
       this.activeMonitoring.set(matchingKey, {
         ...matchingMonitoring,
         webSocketResultReceived: true,
@@ -291,9 +358,6 @@ export class AISignalMonitorService implements OnModuleDestroy {
     }
   }
 
-  /**
-   * Fetch trade result from API (fallback when WebSocket fails)
-   */
   async fetchTradeResultFromApi(
     session: any,
     config: AISignalConfig,

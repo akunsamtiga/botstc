@@ -1,4 +1,4 @@
-import { IsBoolean, IsNumber, IsOptional, Min, Max } from 'class-validator';
+import { IsBoolean, IsNumber, IsOptional, Min, Max, IsString, IsIn } from 'class-validator';
 
 export class UpdateAISignalConfigDto {
   @IsNumber()
@@ -32,7 +32,54 @@ export class UpdateAISignalConfigDto {
 }
 
 export class ReceiveSignalDto {
+  @IsString()
+  @IsIn(['buy', 'sell', 'call', 'put', 'B', 'S', 'b', 's'])
   trend: string;
+
+  @IsNumber()
+  @IsOptional()
   executionTime?: number;
+
+  @IsString()
+  @IsOptional()
   originalMessage?: string;
+}
+
+/**
+ * DTO untuk webhook Telegram
+ */
+export class TelegramWebhookDto {
+  @IsString()
+  userId: string;
+
+  @IsString()
+  @IsIn(['buy', 'sell', 'call', 'put', 'B', 'S', 'b', 's'])
+  trend: string;
+
+  @IsNumber()
+  @IsOptional()
+  executionTime?: number;
+
+  @IsString()
+  @IsOptional()
+  originalMessage?: string;
+
+  // Optional fields untuk waktu spesifik
+  @IsNumber()
+  @IsOptional()
+  @Min(0)
+  @Max(23)
+  hour?: number;
+
+  @IsNumber()
+  @IsOptional()
+  @Min(0)
+  @Max(59)
+  minute?: number;
+
+  @IsNumber()
+  @IsOptional()
+  @Min(0)
+  @Max(59)
+  second?: number;
 }

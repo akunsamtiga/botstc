@@ -7,10 +7,11 @@ import {
   Request,
   UseGuards,
   HttpCode,
+  Headers,
 } from '@nestjs/common';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { AISignalService } from './aisignal.service';
-import { UpdateAISignalConfigDto, ReceiveSignalDto } from './dto/update-config.dto';
+import { UpdateAISignalConfigDto, ReceiveSignalDto, TelegramWebhookDto } from './dto/update-config.dto';
 
 @UseGuards(JwtAuthGuard)
 @Controller('aisignal')
@@ -72,6 +73,10 @@ export class AISignalController {
   }
 
   // ==================== SIGNAL RECEIVING ====================
+  
+  /**
+   * Receive signal via HTTP POST (manual trigger)
+   */
   @Post('signal')
   @HttpCode(200)
   async receiveSignal(@Request() req, @Body() dto: ReceiveSignalDto) {
@@ -80,6 +85,49 @@ export class AISignalController {
       executionTime: dto.executionTime,
       originalMessage: dto.originalMessage,
     });
+  }
+
+  /**
+   * Webhook endpoint untuk menerima sinyal dari Telegram Bot
+   * Endpoint ini bisa dipanggil oleh Telegram Bot atau service lain
+   * untuk mengirim sinyal trading
+   * 
+   * Note: Bisa di-protect dengan API key atau secret jika diperlukan
+   */
+  @Post('webhook/telegram')
+  @HttpCode(200)
+  async receiveTelegramWebhook(
+    @Body() dto: TelegramWebhookDto,
+    @Headers('x-api-key') apiKey?: string,
+  ) {
+    // Optional: Validasi API key jika diperlukan
+    // if (apiKey !== process.env.TELEGRAM_WEBHOOK_API_KEY) {
+    //   throw new UnauthorizedException('Invalid API key');
+    // }
+
+    // Parse sinyal dari webhook
+    const signal = {
+      trend: dto.trend,
+      executionTime: dto.executionTime,
+      originalMessage: dto.originalMessage || `Webhook Signal: ${dto.trend}`,
+    };
+
+    // Forward ke service
+    return this.svc.receiveSignal(dto.userId, signal);
+  }
+
+  // ==================== TESTING ====================
+  
+  /**
+   * Inject test signal untuk testing
+   */
+  @Post('test-signal')
+  @HttpCode(200)
+  async injectTestSignal(
+    @Request() req,
+    @Body() body: { trend: string; delayMs?: number },
+  ) {
+    return this.svc.injectTestSignal(req.user.userId, body.trend, body.delayMs);
   }
 
   // ==================== STATUS ====================
@@ -109,13 +157,16 @@ export class AISignalController {
         'Martingale standar (lanjut langsung setelah loss)',
         'Always Signal mode (lanjut pada sinyal berikutnya)',
         'Monitoring hasil trade real-time',
+        'Webhook endpoint untuk menerima sinyal dari Telegram Bot',
       ],
       martingaleModes: {
         standard: 'Martingale langsung setelah loss',
         alwaysSignal: 'Martingale pada sinyal berikutnya (tidak blocking)',
       },
       endpoints: {
-        receiveSignal: 'POST /aisignal/signal - Menerima sinyal baru',
+        receiveSignal: 'POST /aisignal/signal - Menerima sinyal baru (manual)',
+        telegramWebhook: 'POST /aisignal/webhook/telegram - Webhook untuk Telegram Bot',
+        testSignal: 'POST /aisignal/test-signal - Inject test signal',
       },
     };
   }

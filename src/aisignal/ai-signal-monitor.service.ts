@@ -1,7 +1,7 @@
 import { Injectable, Logger, OnModuleDestroy } from '@nestjs/common';
 import axios from 'axios';
-import { AISignalConfig, AISignalOrder, AISignalOrderStatus } from './types';
-import { StockityWebSocketClient } from '../schedule/websocket-client';
+import { AISignalConfig, AISignalOrderStatus } from './types';
+import { StockityWebSocketClient, DealResultPayload } from '../schedule/websocket-client';
 
 interface MonitoringOrder {
   parentOrderId: string;
@@ -61,6 +61,9 @@ export class AISignalMonitorService implements OnModuleDestroy {
     return this.userSessions.get(userId) || null;
   }
 
+  /**
+   * Start monitoring untuk user tertentu
+   */
   startMonitoring(
     userId: string,
     wsClient: StockityWebSocketClient,
@@ -72,15 +75,23 @@ export class AISignalMonitorService implements OnModuleDestroy {
     }
 
     this.logger.log(`[${userId}] Starting AI Signal monitoring`);
+
+    // ✅ Setup WebSocket handler menggunakan method yang tersedia
     this.setupWebSocketHandler(userId, wsClient, onTradeResult);
 
+    // Start API monitoring interval
     const interval = setInterval(async () => {
       await this.checkOrdersViaApi(userId, onTradeResult);
     }, this.MONITORING_INTERVAL_MS);
 
     this.monitoringIntervals.set(userId, interval);
+
+    this.logger.log(`[${userId}] Monitoring started (${this.MONITORING_INTERVAL_MS}ms interval)`);
   }
 
+  /**
+   * Stop monitoring untuk user tertentu
+   */
   stopMonitoring(userId: string): void {
     const interval = this.monitoringIntervals.get(userId);
     if (interval) {
@@ -88,6 +99,7 @@ export class AISignalMonitorService implements OnModuleDestroy {
       this.monitoringIntervals.delete(userId);
     }
 
+    // Hapus semua order monitoring untuk user ini
     for (const [key, order] of this.activeMonitoring) {
       if (key.startsWith(`${userId}_`)) {
         this.activeMonitoring.delete(key);
@@ -98,6 +110,9 @@ export class AISignalMonitorService implements OnModuleDestroy {
     this.logger.log(`[${userId}] Monitoring stopped`);
   }
 
+  /**
+   * Start monitoring untuk order tertentu
+   */
   startMonitoringOrder(
     userId: string,
     parentOrderId: string,
@@ -136,6 +151,9 @@ export class AISignalMonitorService implements OnModuleDestroy {
     );
   }
 
+  /**
+   * Handle WebSocket trade update
+   */
   handleWebSocketTradeUpdate(
     userId: string,
     message: any,
@@ -158,23 +176,41 @@ export class AISignalMonitorService implements OnModuleDestroy {
     }
   }
 
+  /**
+   * Setup WebSocket handler untuk menerima deal results
+   * ✅ Menggunakan setOnDealResult yang tersedia di StockityWebSocketClient
+   */
   private setupWebSocketHandler(
     userId: string,
     wsClient: StockityWebSocketClient,
     onTradeResult: (result: TradeResult) => void,
   ): void {
-    if ((wsClient as any).onMessage) {
-      (wsClient as any).onMessage((message: any) => {
-        this.handleWebSocketTradeUpdate(userId, message, onTradeResult);
-      });
-    }
-    if ((wsClient as any).setMessageCallback) {
-      (wsClient as any).setMessageCallback((message: any) => {
-        this.handleWebSocketTradeUpdate(userId, message, onTradeResult);
-      });
-    }
+    // ✅ Gunakan setOnDealResult yang tersedia
+    wsClient.setOnDealResult((payload: DealResultPayload) => {
+      this.logger.debug(`[${userId}] Deal result from WebSocket: ${JSON.stringify(payload)}`);
+
+      // Convert DealResultPayload ke format yang dibutuhkan
+      const message = {
+        event: payload.status ? 'deal_result' : 'closed',
+        payload: {
+          id: payload.id,
+          status: payload.status,
+          amount: payload.amount,
+          trend: payload.trend,
+          win: payload.win,
+          payment: payload.payment,
+        },
+      };
+
+      this.handleWebSocketTradeUpdate(userId, message, onTradeResult);
+    });
+
+    this.logger.log(`[${userId}] WebSocket handler setup complete`);
   }
 
+  /**
+   * Check orders via API
+   */
   private async checkOrdersViaApi(
     userId: string,
     onTradeResult: (result: TradeResult) => void,
@@ -209,6 +245,9 @@ export class AISignalMonitorService implements OnModuleDestroy {
     await this.checkOrdersForUser(userId, ordersToCheck, onTradeResult);
   }
 
+  /**
+   * Check orders untuk user tertentu via API
+   */
   private async checkOrdersForUser(
     userId: string,
     orders: MonitoringOrder[],
@@ -225,68 +264,63 @@ export class AISignalMonitorService implements OnModuleDestroy {
     }
 
     try {
-      const config: AISignalConfig = {
-        asset: { ric: orders[0].assetRic, name: orders[0].assetRic },
-        baseAmount: orders[0].amount,
-        martingale: {
-          isEnabled: false,
-          maxSteps: 2,
-          multiplierValue: 2.5,
-          multiplierType: 'FIXED',
-          isAlwaysSignal: false,
+      // Fetch trading history dari API
+      const response = await axios.get(
+        `${this.BASE_URL}/profile/trading-history?type=${orders[0].isDemoAccount ? 'demo' : 'real'}`,
+        {
+          headers: this.buildStockityHeaders(session),
+          timeout: 5000,
         },
-        isDemoAccount: orders[0].isDemoAccount,
-        currency: 'IDR',
-      };
+      );
 
-      const recentTrade = await this.fetchTradeResultFromApi(session, config);
-      if (!recentTrade) return;
+      if (response.data?.data) {
+        const trades = response.data.data;
 
-      for (const order of orders) {
-        if (order.webSocketResultReceived || order.isCompleted) continue;
+        // Cari trade yang cocok dengan order yang sedang dimonitor
+        for (const order of orders) {
+          if (order.webSocketResultReceived || order.isCompleted) continue;
 
-        const tradeTime = new Date(recentTrade.created_at).getTime();
-        const timeDiff = Math.abs(tradeTime - order.executionTime);
-        const amountMatch = Math.abs(recentTrade.amount - order.amount) < 100;
-        const trendMatch = recentTrade.trend?.toLowerCase() === order.trend.toLowerCase();
+          const matchingTrade = this.findMatchingTrade(trades, order);
 
-        if (timeDiff < 120000 && amountMatch && trendMatch) {
-          this.logger.log(
-            `[${userId}] Trade result detected (API): ${order.monitoringOrderId} - ${recentTrade.status?.toUpperCase()}`,
-          );
+          if (matchingTrade) {
+            this.logger.log(
+              `[${userId}] Trade result detected (API): ${order.monitoringOrderId} - ${matchingTrade.status?.toUpperCase()}`,
+            );
 
-          const isWin = recentTrade.status?.toLowerCase() === 'won';
-          const key = `${userId}_${order.monitoringOrderId}`;
+            const isWin = matchingTrade.status?.toLowerCase() === 'won';
+            const key = `${userId}_${order.monitoringOrderId}`;
 
-          this.activeMonitoring.set(key, {
-            ...order,
-            webSocketResultReceived: true,
-            isCompleted: true,
-          });
+            // Mark as completed
+            this.activeMonitoring.set(key, {
+              ...order,
+              webSocketResultReceived: true,
+              isCompleted: true,
+            });
 
-          this.processedResults.set(`${userId}_${order.monitoringOrderId}`, recentTrade.id);
+            this.processedResults.set(`${userId}_${order.monitoringOrderId}`, matchingTrade.id);
 
-          const result: TradeResult = {
-            parentOrderId: order.parentOrderId,
-            monitoringOrderId: order.monitoringOrderId,
-            isWin,
-            isMartingale: order.isMartingale,
-            martingaleStep: order.martingaleStep,
-            details: new Map([
-              ['trade_id', recentTrade.id],
-              ['amount', recentTrade.amount],
-              ['trend', recentTrade.trend],
-              ['status', recentTrade.status],
-              ['win_amount', recentTrade.win || 0],
-              ['payment', recentTrade.payment || 0],
-              ['detection_method', 'ai_signal_monitor_api'],
-              ['detection_time', Date.now()],
-              ['monitoring_duration', Date.now() - order.startTime],
-            ]),
-          };
+            // Build result
+            const result: TradeResult = {
+              parentOrderId: order.parentOrderId,
+              monitoringOrderId: order.monitoringOrderId,
+              isWin,
+              isMartingale: order.isMartingale,
+              martingaleStep: order.martingaleStep,
+              details: new Map([
+                ['trade_id', matchingTrade.id],
+                ['amount', matchingTrade.amount],
+                ['trend', matchingTrade.trend],
+                ['status', matchingTrade.status],
+                ['win_amount', matchingTrade.win || 0],
+                ['payment', matchingTrade.payment || 0],
+                ['detection_method', 'ai_signal_monitor_api'],
+                ['detection_time', Date.now()],
+                ['monitoring_duration', Date.now() - order.startTime],
+              ]),
+            };
 
-          onTradeResult(result);
-          break;
+            onTradeResult(result);
+          }
         }
       }
     } catch (err: any) {
@@ -294,6 +328,32 @@ export class AISignalMonitorService implements OnModuleDestroy {
     }
   }
 
+  /**
+   * Find matching trade dari history
+   */
+  private findMatchingTrade(trades: any[], order: MonitoringOrder): any | null {
+    const recentTimeThreshold = Date.now() - 120000; // 2 menit terakhir
+
+    for (const trade of trades) {
+      const tradeTime = new Date(trade.created_at).getTime();
+      const timeDiff = Math.abs(tradeTime - order.executionTime);
+      const amountMatch = Math.abs(trade.amount - order.amount) < 100;
+      const trendMatch = trade.trend?.toLowerCase() === order.trend.toLowerCase();
+      const isCompleted = ['won', 'lost'].includes(trade.status?.toLowerCase());
+      const isRecent = tradeTime >= recentTimeThreshold;
+      const isNotProcessed = trade.uuid !== this.processedResults.get(order.monitoringOrderId);
+
+      if (isRecent && amountMatch && trendMatch && isCompleted && isNotProcessed) {
+        return trade;
+      }
+    }
+
+    return null;
+  }
+
+  /**
+   * Process WebSocket result
+   */
   private processWebSocketResult(
     userId: string,
     tradeId: string,
@@ -303,6 +363,7 @@ export class AISignalMonitorService implements OnModuleDestroy {
     payload: any,
     onTradeResult: (result: TradeResult) => void,
   ): void {
+    // Cari order yang cocok
     let matchingMonitoring: MonitoringOrder | null = null;
     let matchingKey: string | null = null;
 
@@ -322,6 +383,7 @@ export class AISignalMonitorService implements OnModuleDestroy {
     }
 
     if (matchingMonitoring && matchingKey) {
+      // Mark as completed
       this.activeMonitoring.set(matchingKey, {
         ...matchingMonitoring,
         webSocketResultReceived: true,
@@ -358,6 +420,9 @@ export class AISignalMonitorService implements OnModuleDestroy {
     }
   }
 
+  /**
+   * Fetch trade result dari API
+   */
   async fetchTradeResultFromApi(
     session: any,
     config: AISignalConfig,
@@ -386,6 +451,9 @@ export class AISignalMonitorService implements OnModuleDestroy {
     }
   }
 
+  /**
+   * Build headers untuk Stockity API
+   */
   private buildStockityHeaders(session: any): Record<string, string> {
     return {
       'authorization-token': session.stockityToken,
@@ -399,6 +467,9 @@ export class AISignalMonitorService implements OnModuleDestroy {
     };
   }
 
+  /**
+   * Get monitoring status
+   */
   getMonitoringStatus(userId: string): any {
     const userOrders = Array.from(this.activeMonitoring.entries()).filter(([key]) =>
       key.startsWith(`${userId}_`),

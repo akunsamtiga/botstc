@@ -3,9 +3,9 @@ import * as admin from 'firebase-admin';
 import { FirebaseService } from '../firebase/firebase.service';
 import { AuthService } from '../auth/auth.service';
 import { FirebaseMessagingService } from '../firebase/firebase-messaging.service';
+import { TelegramSignalService } from './telegram-signal.service';
 import { StockityWebSocketClient } from '../schedule/websocket-client';
 import { AISignalMonitorService } from './ai-signal-monitor.service';
-import axios from 'axios';
 import { v4 as uuidv4 } from 'uuid';
 import {
   AISignalOrderStatus,
@@ -27,29 +27,32 @@ interface SessionStats {
   sessionPnL: number;
 }
 
+interface ActiveMode {
+  isActive: boolean;
+  wsClient: StockityWebSocketClient;
+  pendingOrders: AISignalOrder[];
+  executedOrdersMap: Map<string, AISignalOrder>;
+  activeMartingaleOrders: Map<string, MartingaleSequenceInfo>;
+  alwaysSignalLossTracking: AlwaysSignalLossState | null;
+  executionInterval?: NodeJS.Timeout;
+  processedOrderIds: Set<string>;
+  session: any;
+  config: AISignalConfig;
+  stats: SessionStats;
+}
+
 @Injectable()
 export class AISignalService implements OnModuleDestroy {
   private readonly logger = new Logger(AISignalService.name);
   private configs = new Map<string, AISignalConfig>();
-  private activeModes = new Map<string, {
-    isActive: boolean;
-    wsClient: StockityWebSocketClient;
-    pendingOrders: AISignalOrder[];
-    executedOrdersMap: Map<string, AISignalOrder>;
-    activeMartingaleOrders: Map<string, MartingaleSequenceInfo>;
-    alwaysSignalLossTracking: AlwaysSignalLossState | null;
-    executionInterval?: NodeJS.Timeout;
-    processedOrderIds: Set<string>;
-    session: any;
-    config: AISignalConfig;
-    stats: SessionStats;
-  }>();
+  private activeModes = new Map<string, ActiveMode>();
 
   constructor(
     private readonly firebaseService: FirebaseService,
     private readonly authService: AuthService,
     private readonly firebaseMessaging: FirebaseMessagingService,
     private readonly aiSignalMonitor: AISignalMonitorService,
+    private readonly telegramSignalService: TelegramSignalService,
   ) {}
 
   onModuleDestroy() {
@@ -166,8 +169,21 @@ export class AISignalService implements OnModuleDestroy {
       stats,
     });
 
+    // Setup signal callback untuk menerima sinyal dari TelegramSignalService
+    this.telegramSignalService.setSignalCallback((uid, signal) => {
+      if (uid === userId) {
+        this.handleIncomingSignal(uid, signal);
+      }
+    });
+
+    // Start listening untuk sinyal dari Telegram/FCM
+    await this.telegramSignalService.startListening(userId);
+
     // Set user session for monitor service
     this.aiSignalMonitor.setUserSession(userId, session);
+
+    // Setup WebSocket handler untuk deal results
+    this.setupWebSocketHandler(userId, ws);
 
     // Start monitoring service
     this.aiSignalMonitor.startMonitoring(userId, ws, (result) => {
@@ -193,6 +209,9 @@ export class AISignalService implements OnModuleDestroy {
     if (mode.executionInterval) {
       clearInterval(mode.executionInterval);
     }
+
+    // Stop listening untuk sinyal
+    this.telegramSignalService.stopListening(userId);
 
     // Stop monitoring
     this.aiSignalMonitor.stopMonitoring(userId);
@@ -224,6 +243,7 @@ export class AISignalService implements OnModuleDestroy {
         wsConnected: mode.wsClient.isConnected(),
         alwaysSignalStatus: this.getAlwaysSignalStatus(mode, config),
         monitoringStatus: this.aiSignalMonitor.getMonitoringStatus(userId),
+        telegramSignalStatus: this.telegramSignalService.getStatus(userId),
         stats: mode.stats,
         sessionPnL: mode.stats.sessionPnL,
         totalWins: mode.stats.wins,
@@ -241,7 +261,7 @@ export class AISignalService implements OnModuleDestroy {
     };
   }
 
-  private getAlwaysSignalStatus(mode: any, config: AISignalConfig): object {
+  private getAlwaysSignalStatus(mode: ActiveMode, config: AISignalConfig): object {
     if (!config.martingale.isAlwaysSignal || !mode.alwaysSignalLossTracking) {
       return { isActive: false, status: 'No outstanding loss' };
     }
@@ -261,6 +281,25 @@ export class AISignalService implements OnModuleDestroy {
   }
 
   // ==================== SIGNAL HANDLING ====================
+
+  /**
+   * Handle sinyal yang masuk dari TelegramSignalService
+   */
+  private async handleIncomingSignal(userId: string, signal: TelegramSignal): Promise<void> {
+    try {
+      this.logger.log(
+        `[${userId}] Incoming signal received: ${signal.trend} at ${new Date(signal.executionTime).toISOString()}`,
+      );
+
+      await this.receiveSignal(userId, {
+        trend: signal.trend,
+        executionTime: signal.executionTime,
+        originalMessage: signal.originalMessage,
+      });
+    } catch (error) {
+      this.logger.error(`[${userId}] Error handling incoming signal: ${(error as Error).message}`);
+    }
+  }
 
   async receiveSignal(
     userId: string,
@@ -421,6 +460,39 @@ export class AISignalService implements OnModuleDestroy {
     return { message: `Martingale Step ${nextStep}/${config.martingale.maxSteps}` };
   }
 
+  // ==================== WEBSOCKET HANDLER ====================
+
+  /**
+   * Setup WebSocket handler untuk menerima deal results
+   */
+  private setupWebSocketHandler(userId: string, wsClient: StockityWebSocketClient): void {
+    wsClient.setOnDealResult((payload) => {
+      this.logger.debug(`[${userId}] Deal result received: ${JSON.stringify(payload)}`);
+
+      // Convert ke format yang dibutuhkan AISignalMonitorService
+      const message = {
+        event: payload.status ? 'deal_result' : 'closed',
+        payload: {
+          id: payload.id,
+          status: payload.status,
+          amount: payload.amount,
+          trend: payload.trend,
+          win: payload.win,
+          payment: payload.payment,
+        },
+      };
+
+      // Forward ke monitor service
+      this.aiSignalMonitor.handleWebSocketTradeUpdate(userId, message, (result) => {
+        this.handleMonitorTradeResult(userId, result);
+      });
+    });
+
+    wsClient.setOnStatusChange((connected, reason) => {
+      this.logger.log(`[${userId}] WebSocket status: ${connected ? 'connected' : 'disconnected'} - ${reason || ''}`);
+    });
+  }
+
   // ==================== EXECUTION MONITORING ====================
 
   private startExecutionMonitoring(userId: string) {
@@ -439,6 +511,8 @@ export class AISignalService implements OnModuleDestroy {
         this.logger.error(`[${userId}] Error in execution monitoring: ${err?.message || err}`);
       }
     }, EXECUTION_CHECK_INTERVAL_MS);
+
+    this.logger.log(`[${userId}] Execution monitoring started (${EXECUTION_CHECK_INTERVAL_MS}ms interval)`);
   }
 
   private async checkAndExecutePendingOrders(userId: string) {
@@ -473,10 +547,40 @@ export class AISignalService implements OnModuleDestroy {
 
     this.logger.log(`[${userId}] Executing AI Signal order: ${order.trend} - ${order.amount}`);
 
-    // Execute via WebSocket
-    void mode.wsClient.placeTrade(
-      this.buildTradePayload(mode.session, mode.config, order.amount, order.trend),
-    );
+    // ✅ Tunggu hasil dengan await
+    try {
+      const result = await mode.wsClient.placeTrade(
+        this.buildTradePayload(mode.session, mode.config, order.amount, order.trend),
+      );
+
+      if (result.dealId) {
+        this.logger.log(`[${userId}] Trade placed successfully: ${result.dealId}`);
+      } else {
+        this.logger.error(`[${userId}] Trade failed: ${result.error}`);
+        // Reset order status untuk retry
+        const idx = mode.pendingOrders.findIndex((o) => o.id === order.id);
+        if (idx !== -1) {
+          mode.pendingOrders[idx] = {
+            ...mode.pendingOrders[idx],
+            status: AISignalOrderStatus.WAITING,
+            isExecuted: false,
+          };
+        }
+        return; // Jangan lanjut monitoring jika gagal
+      }
+    } catch (error) {
+      this.logger.error(`[${userId}] Error placing trade: ${(error as Error).message}`);
+      // Reset order status
+      const idx = mode.pendingOrders.findIndex((o) => o.id === order.id);
+      if (idx !== -1) {
+        mode.pendingOrders[idx] = {
+          ...mode.pendingOrders[idx],
+          status: AISignalOrderStatus.WAITING,
+          isExecuted: false,
+        };
+      }
+      return;
+    }
 
     // Start monitoring this order
     this.aiSignalMonitor.startMonitoringOrder(
@@ -490,7 +594,7 @@ export class AISignalService implements OnModuleDestroy {
       order.martingaleStep,
     );
 
-    // Update status to monitoring
+    // Update status to monitoring setelah 2 detik
     setTimeout(() => {
       const idx = mode.pendingOrders.findIndex((o) => o.id === order.id);
       if (idx !== -1 && mode.pendingOrders[idx].status === AISignalOrderStatus.EXECUTING) {
@@ -501,59 +605,9 @@ export class AISignalService implements OnModuleDestroy {
         mode.executedOrdersMap.set(order.id, mode.pendingOrders[idx]);
       }
     }, 2000);
-
-    this.monitorTradeResult(userId, order.id, order.martingaleStep > 0);
   }
 
-  private async monitorTradeResult(userId: string, orderId: string, isMartingale: boolean) {
-    const mode = this.activeModes.get(userId);
-    if (!mode) return;
-
-    const maxWaitTime = 90000;
-    const startTime = Date.now();
-
-    const checkInterval = setInterval(async () => {
-      if (!mode.isActive || Date.now() - startTime > maxWaitTime) {
-        clearInterval(checkInterval);
-        return;
-      }
-
-      try {
-        const result = await this.fetchTradeResult(mode.session, mode.config);
-        if (result) {
-          clearInterval(checkInterval);
-          await this.handleTradeResult(userId, orderId, result, isMartingale);
-        }
-      } catch (err: any) {
-        this.logger.error(`[${userId}] Error checking trade result: ${err?.message || err}`);
-      }
-    }, 2000);
-  }
-
-  private async fetchTradeResult(session: any, config: AISignalConfig): Promise<any | null> {
-    try {
-      const response = await axios.get(
-        `${BASE_URL}/profile/trading-history?type=${config.isDemoAccount ? 'demo' : 'real'}`,
-        {
-          headers: this.buildStockityHeaders(session),
-          timeout: 5000,
-        },
-      );
-
-      if (response.data?.data) {
-        const trades = response.data.data;
-        const recentTrade = trades.find((t: any) => {
-          const tradeTime = new Date(t.created_at).getTime();
-          return tradeTime > Date.now() - 120000;
-        });
-        return recentTrade || null;
-      }
-      return null;
-    } catch (err: any) {
-      this.logger.error(`Error fetching trade result: ${err?.message || err}`);
-      return null;
-    }
-  }
+  // ==================== TRADE RESULT HANDLING ====================
 
   private async handleMonitorTradeResult(
     userId: string,
@@ -584,11 +638,11 @@ export class AISignalService implements OnModuleDestroy {
     mode.stats.totalTrades++;
     if (result.isWin) {
       mode.stats.wins++;
-      const profit = Math.floor(order?.amount || mode.config.baseAmount * 0.85);
+      const profit = Math.floor((order?.amount || mode.config.baseAmount) * 0.85);
       mode.stats.sessionPnL += profit;
     } else {
       mode.stats.losses++;
-      mode.stats.sessionPnL -= (order?.amount || mode.config.baseAmount);
+      mode.stats.sessionPnL -= order?.amount || mode.config.baseAmount;
     }
 
     this.logger.log(
@@ -606,60 +660,6 @@ export class AISignalService implements OnModuleDestroy {
 
     setTimeout(() => {
       const idx = mode.pendingOrders.findIndex((o) => o.id === result.parentOrderId);
-      if (idx !== -1) {
-        mode.pendingOrders[idx] = {
-          ...mode.pendingOrders[idx],
-          status: AISignalOrderStatus.WAITING,
-        };
-      }
-    }, 3000);
-  }
-
-  private async handleTradeResult(
-    userId: string,
-    orderId: string,
-    result: any,
-    isMartingale: boolean,
-  ) {
-    const mode = this.activeModes.get(userId);
-    if (!mode) return;
-
-    if (mode.processedOrderIds.has(orderId)) return;
-    mode.processedOrderIds.add(orderId);
-
-    const isWin = result.status?.toLowerCase() === 'won';
-    const order =
-      mode.executedOrdersMap.get(orderId) || mode.pendingOrders.find((o) => o.id === orderId);
-
-    if (order) {
-      order.result = isWin ? 'WIN' : 'LOSE';
-      order.status = isWin ? AISignalOrderStatus.WIN : AISignalOrderStatus.LOSE;
-    }
-
-    // Update stats
-    mode.stats.totalTrades++;
-    if (isWin) {
-      mode.stats.wins++;
-      const profit = Math.floor(order?.amount || mode.config.baseAmount * 0.85);
-      mode.stats.sessionPnL += profit;
-    } else {
-      mode.stats.losses++;
-      mode.stats.sessionPnL -= (order?.amount || mode.config.baseAmount);
-    }
-
-    this.logger.log(`[${userId}] AI Signal result: ${isWin ? 'WIN' : 'LOSE'} - Martingale: ${isMartingale}`);
-
-    if (isMartingale) {
-      const martingaleInfo = mode.activeMartingaleOrders.get(orderId);
-      if (martingaleInfo) {
-        await this.handleMartingaleResult(userId, orderId, martingaleInfo, isWin);
-      }
-    } else {
-      await this.handleInitialTradeResult(userId, orderId, isWin);
-    }
-
-    setTimeout(() => {
-      const idx = mode.pendingOrders.findIndex((o) => o.id === orderId);
       if (idx !== -1) {
         mode.pendingOrders[idx] = {
           ...mode.pendingOrders[idx],
@@ -788,9 +788,19 @@ export class AISignalService implements OnModuleDestroy {
 
     this.logger.log(`[${userId}] Executing martingale step ${step}: ${amount}`);
 
-    void mode.wsClient.placeTrade(
-      this.buildTradePayload(mode.session, mode.config, amount, trend),
-    );
+    // ✅ Tunggu hasil dengan await
+    mode.wsClient
+      .placeTrade(this.buildTradePayload(mode.session, mode.config, amount, trend))
+      .then((result) => {
+        if (result.dealId) {
+          this.logger.log(`[${userId}] Martingale trade placed: ${result.dealId}`);
+        } else {
+          this.logger.error(`[${userId}] Martingale trade failed: ${result.error}`);
+        }
+      })
+      .catch((error: unknown) => {
+        this.logger.error(`[${userId}] Error placing martingale trade: ${(error as Error).message}`);
+      });
 
     this.aiSignalMonitor.startMonitoringOrder(
       userId,
@@ -802,8 +812,6 @@ export class AISignalService implements OnModuleDestroy {
       true,
       step,
     );
-
-    this.monitorTradeResult(userId, martingaleOrderId, true);
   }
 
   private calculateMartingaleAmount(config: AISignalConfig, step: number): number {
@@ -839,25 +847,14 @@ export class AISignalService implements OnModuleDestroy {
     };
   }
 
-  private buildStockityHeaders(session: any): Record<string, string> {
-    return {
-      'authorization-token': session.stockityToken,
-      'device-id': session.deviceId,
-      'device-type': session.deviceType || 'web',
-      'user-timezone': session.userTimezone || 'Asia/Jakarta',
-      'User-Agent': session.userAgent,
-      Accept: 'application/json, text/plain, */*',
-      Origin: 'https://stockity.id',
-      Referer: 'https://stockity.id/',
-    };
-  }
-
   private async updateStatus(userId: string, botState: string) {
     await this.firebaseService.db.collection('aisignal_status').doc(userId).set(
       { botState, updatedAt: this.firebaseService.FieldValue.serverTimestamp() },
       { merge: true },
     );
   }
+
+  // ==================== PUBLIC METHODS ====================
 
   getPendingOrders(userId: string): AISignalOrder[] {
     const mode = this.activeModes.get(userId);
@@ -867,5 +864,13 @@ export class AISignalService implements OnModuleDestroy {
   getExecutedOrders(userId: string): AISignalOrder[] {
     const mode = this.activeModes.get(userId);
     return mode ? mode.pendingOrders.filter((o) => o.isExecuted) : [];
+  }
+
+  /**
+   * Inject test signal untuk testing
+   */
+  async injectTestSignal(userId: string, trend: string, delayMs?: number): Promise<{ message: string }> {
+    await this.telegramSignalService.injectTestSignal(userId, trend, delayMs);
+    return { message: `Test signal injected: ${trend}` };
   }
 }

@@ -2,7 +2,7 @@ import { Injectable, Logger, OnModuleDestroy } from '@nestjs/common';
 import { FirebaseService } from '../firebase/firebase.service';
 import { AuthService } from '../auth/auth.service';
 import { StockityWebSocketClient, DealResultPayload } from '../schedule/websocket-client';
-import axios from 'axios';
+import { curlGet } from '../common/http-utils';
 import { v4 as uuidv4 } from 'uuid';
 import {
   IndicatorSettings,
@@ -395,17 +395,16 @@ export class IndicatorService implements OnModuleDestroy {
       const dateForApi = targetTime.toISOString().slice(0, 13) + ':00:00';
 
       try {
-        const response = await axios.get<CandleApiResponse>(
+        const headers = this.buildStockityHeaders(session);
+        const response = await curlGet(
           `${BASE_URL}/candles/v1/${encodedSymbol}/${dateForApi}/5`,
-          {
-            headers: this.buildStockityHeaders(session),
-            timeout: 5000,
-          },
+          headers,
+          5000,
         );
 
-        if (response.data?.data) {
+        if (response?.data?.data) {
           const parsed = response.data.data
-            .map((d) => this.parseCandleData(d))
+            .map((d: any) => this.parseCandleData(d))
             .filter((c): c is Candle => c !== null);
           fiveSecondCandles.push(...parsed);
         }
@@ -784,15 +783,14 @@ export class IndicatorService implements OnModuleDestroy {
       const now = new Date();
       const dateForApi = now.toISOString().slice(0, 13) + ':00:00';
 
-      const response = await axios.get<CandleApiResponse>(
+      const headers = this.buildStockityHeaders(session);
+      const response = await curlGet(
         `${BASE_URL}/candles/v1/${encodedSymbol}/${dateForApi}/5`,
-        {
-          headers: this.buildStockityHeaders(session),
-          timeout: 5000,
-        },
+        headers,
+        5000,
       );
 
-      if (response.data?.data?.length > 0) {
+      if (response?.data?.data?.length > 0) {
         const lastCandle = response.data.data[response.data.data.length - 1];
         return parseFloat(lastCandle.close);
       }
@@ -1209,24 +1207,24 @@ export class IndicatorService implements OnModuleDestroy {
     dealId: string | null,
   ): Promise<any | null> {
     try {
-      const response = await axios.get(
+      const headers = {
+        'authorization-token': session.stockityToken,
+        'device-id': session.deviceId,
+        'device-type': session.deviceType || 'web',
+        'user-timezone': session.userTimezone || 'Asia/Jakarta',
+        'User-Agent': session.userAgent,
+        'Accept': 'application/json, text/plain, */*',
+        'Origin': 'https://stockity.id',
+        'Referer': 'https://stockity.id/',
+      };
+
+      const response = await curlGet(
         `${BASE_URL}/bo-deals-history/v3/deals/trade?type=${config.isDemoAccount ? 'demo' : 'real'}&locale=id`,
-        {
-          headers: {
-            'authorization-token': session.stockityToken,
-            'device-id': session.deviceId,
-            'device-type': session.deviceType || 'web',
-            'user-timezone': session.userTimezone || 'Asia/Jakarta',
-            'User-Agent': session.userAgent,
-            'Accept': 'application/json, text/plain, */*',
-            'Origin': 'https://stockity.id',
-            'Referer': 'https://stockity.id/',
-          },
-          timeout: 5000,
-        },
+        headers,
+        5000,
       );
 
-      if (!response.data?.data) return null;
+      if (!response?.data?.data) return null;
 
       const deals: any[] = response.data.data.standard_trade_deals || response.data.data.deals || [];
 

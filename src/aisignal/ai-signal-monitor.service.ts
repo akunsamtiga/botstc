@@ -1,7 +1,7 @@
 import { Injectable, Logger, OnModuleDestroy } from '@nestjs/common';
-import axios from 'axios';
 import { AISignalConfig, AISignalOrderStatus } from './types';
 import { StockityWebSocketClient, DealResultPayload } from '../schedule/websocket-client';
+import { curlGet } from '../common/http-utils';
 
 interface MonitoringOrder {
   parentOrderId: string;
@@ -264,16 +264,15 @@ export class AISignalMonitorService implements OnModuleDestroy {
     }
 
     try {
-      // Fetch trading history dari API
-      const response = await axios.get(
+      // Fetch trading history dari API via curl
+      const headers = this.buildStockityHeaders(session);
+      const response = await curlGet(
         `${this.BASE_URL}/profile/trading-history?type=${orders[0].isDemoAccount ? 'demo' : 'real'}`,
-        {
-          headers: this.buildStockityHeaders(session),
-          timeout: 5000,
-        },
+        headers,
+        5000,
       );
 
-      if (response.data?.data) {
+      if (response?.data?.data) {
         const trades = response.data.data;
 
         // Cari trade yang cocok dengan order yang sedang dimonitor
@@ -421,22 +420,21 @@ export class AISignalMonitorService implements OnModuleDestroy {
   }
 
   /**
-   * Fetch trade result dari API
+   * Fetch trade result dari API via curl
    */
   async fetchTradeResultFromApi(
     session: any,
     config: AISignalConfig,
   ): Promise<any | null> {
     try {
-      const response = await axios.get(
+      const headers = this.buildStockityHeaders(session);
+      const response = await curlGet(
         `${this.BASE_URL}/profile/trading-history?type=${config.isDemoAccount ? 'demo' : 'real'}`,
-        {
-          headers: this.buildStockityHeaders(session),
-          timeout: 5000,
-        },
+        headers,
+        5000,
       );
 
-      if (response.data?.data) {
+      if (response?.data?.data) {
         const trades = response.data.data;
         const recentTrade = trades.find((t: any) => {
           const tradeTime = new Date(t.created_at).getTime();

@@ -2,7 +2,7 @@ import { Injectable, Logger, OnModuleDestroy } from '@nestjs/common';
 import { FirebaseService } from '../firebase/firebase.service';
 import { AuthService } from '../auth/auth.service';
 import { StockityWebSocketClient } from '../schedule/websocket-client';
-import axios from 'axios';
+import { curlGet } from '../common/http-utils';
 import { v4 as uuidv4 } from 'uuid';
 import {
   MomentumType,
@@ -10,7 +10,6 @@ import {
   MomentumOrder,
   MomentumMartingaleOrder,
   Candle,
-  CandleApiResponse,
   BollingerBands,
   SignalState,
   MomentumStates,
@@ -381,18 +380,16 @@ export class MomentumService implements OnModuleDestroy {
       const now = new Date();
       const dateForApi = now.toISOString().slice(0, 13) + ':00:00';
 
-      const response = await axios.get<CandleApiResponse>(
+      const response = await curlGet(
         `${BASE_URL}/candles/v1/${encodedSymbol}/${dateForApi}/5`,
-        {
-          headers: this.buildStockityHeaders(session),
-          timeout: 5000,
-        },
+        this.buildStockityHeaders(session),
+        5, // timeout 5s
       );
 
       if (response.data?.data) {
         const candles5Sec = response.data.data
-          .map((d) => this.parseCandleData(d))
-          .filter((c): c is Candle => c !== null);
+          .map((d: any) => this.parseCandleData(d))
+          .filter((c: Candle | null): c is Candle => c !== null);
 
         const last12Candles = candles5Sec.slice(-CANDLES_5SEC_PER_MINUTE);
         return this.aggregateCandlesToOneMinute(last12Candles);
@@ -926,12 +923,10 @@ export class MomentumService implements OnModuleDestroy {
     try {
       // FIX: Gunakan endpoint yang benar — sama dengan IndicatorService.fetchTradeResultById()
       // Endpoint lama /profile/trading-history mengembalikan 404.
-      const response = await axios.get(
+      const response = await curlGet(
         `${BASE_URL}/bo-deals-history/v3/deals/trade?type=${config.isDemoAccount ? 'demo' : 'real'}&locale=id`,
-        {
-          headers: this.buildStockityHeaders(session),
-          timeout: 5000,
-        },
+        this.buildStockityHeaders(session),
+        5, // timeout 5s
       );
 
       if (!response.data?.data) return null;

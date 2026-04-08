@@ -6,7 +6,7 @@ import { ScheduleExecutor, ExecutorCallbacks } from './schedule-executor';
 import { UpdateScheduleConfigDto } from './dto/update-config.dto';
 import { ScheduledOrder, ScheduleConfig, ExecutionLog, StockityAsset } from './types';
 import { v4 as uuidv4 } from 'uuid';
-import axios from 'axios';
+import { curlGet } from '../common/http-utils';
 
 const JAKARTA_OFFSET_MS = 7 * 60 * 60 * 1000;
 const BASE_URL = 'https://api.stockity.id';
@@ -114,10 +114,11 @@ export class ScheduleService implements OnModuleInit, OnModuleDestroy {
     const headers = this.buildStockityHeaders(session);
 
     try {
-      const resp = await axios.get(`${BASE_URL}/bo-assets/v6/assets?locale=id`, {
+      const resp = await curlGet(
+        `${BASE_URL}/bo-assets/v6/assets?locale=id`,
         headers,
-        timeout: 15000,
-      });
+        15, // timeout 15s
+      );
 
       const rawAssets: any[] = resp.data?.data?.assets || [];
       const processed: StockityAsset[] = [];

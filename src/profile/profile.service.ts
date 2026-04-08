@@ -1,6 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { FirebaseService } from '../firebase/firebase.service';
-import axios from 'axios';
+import { curlGet } from '../common/http-utils';
 
 const BASE_URL = 'https://api.stockity.id';
 
@@ -16,26 +16,27 @@ export class ProfileService {
     return doc.data();
   }
 
-  private buildHeaders(session: any) {
+  private buildHeaders(session: any): Record<string, string> {
     return {
       'device-id': session.deviceId,
       'device-type': session.deviceType || 'web',
       'user-timezone': session.userTimezone || 'Asia/Jakarta',
       'authorization-token': session.stockityToken,
       'User-Agent': session.userAgent,
-      Accept: 'application/json, text/plain, */*',
-      Origin: 'https://stockity.id',
-      Referer: 'https://stockity.id/',
+      'Accept': 'application/json, text/plain, */*',
+      'Origin': 'https://stockity.id',
+      'Referer': 'https://stockity.id/',
     };
   }
 
   async getProfile(userId: string) {
     const session = await this.getSession(userId);
     try {
-      const resp = await axios.get(`${BASE_URL}/passport/v1/user_profile?locale=id`, {
-        headers: this.buildHeaders(session),
-        timeout: 10000,
-      });
+      const resp = await curlGet(
+        `${BASE_URL}/passport/v1/user_profile?locale=id`,
+        this.buildHeaders(session),
+        10, // timeout 10s
+      );
       return resp.data?.data || resp.data;
     } catch (err: any) {
       this.logger.error(`getProfile error: ${err.message}`);
@@ -46,10 +47,11 @@ export class ProfileService {
   async getBalance(userId: string) {
     const session = await this.getSession(userId);
     try {
-      const resp = await axios.get(`${BASE_URL}/bank/v1/read?locale=id`, {
-        headers: { ...this.buildHeaders(session), 'Cache-Control': 'no-cache' },
-        timeout: 10000,
-      });
+      const resp = await curlGet(
+        `${BASE_URL}/bank/v1/read?locale=id`,
+        { ...this.buildHeaders(session), 'Cache-Control': 'no-cache' },
+        10, // timeout 10s
+      );
       const data: any[] = resp.data?.data || [];
       const real = data.find((d) => d.account_type === 'real');
       const demo = data.find((d) => d.account_type === 'demo');
@@ -68,10 +70,11 @@ export class ProfileService {
   async getCurrencies(userId: string) {
     const session = await this.getSession(userId);
     try {
-      const resp = await axios.get(`${BASE_URL}/platform/private/v2/currencies?locale=id`, {
-        headers: { ...this.buildHeaders(session), 'cache-control': 'no-cache' },
-        timeout: 10000,
-      });
+      const resp = await curlGet(
+        `${BASE_URL}/platform/private/v2/currencies?locale=id`,
+        { ...this.buildHeaders(session), 'cache-control': 'no-cache' },
+        10, // timeout 10s
+      );
       return resp.data?.data || resp.data;
     } catch (err: any) {
       throw new Error('Gagal mengambil currencies dari Stockity');
@@ -81,10 +84,11 @@ export class ProfileService {
   async getAssets(userId: string) {
     const session = await this.getSession(userId);
     try {
-      const resp = await axios.get(`${BASE_URL}/bo-assets/v6/assets?locale=id`, {
-        headers: this.buildHeaders(session),
-        timeout: 15000,
-      });
+      const resp = await curlGet(
+        `${BASE_URL}/bo-assets/v6/assets?locale=id`,
+        this.buildHeaders(session),
+        15, // timeout 15s
+      );
       const raw: any[] = resp.data?.data?.assets || [];
       return raw
         .map((a) => {

@@ -1,13 +1,13 @@
 import { Logger } from '@nestjs/common';
 import { v4 as uuidv4 } from 'uuid';
-import axios from 'axios';
+import { curlGet } from '../common/http-utils';
 import { StockityWebSocketClient, DealResultPayload } from '../schedule/websocket-client';
 import {
   FastradeConfig, FastradeLog, FastradeOrder, TrendType, FastradeTradeOrder,
 } from './fastrade-types';
 
 const BASE_URL = 'https://api.stockity.id';
-const MAX_PRICE_FETCH_TIME = 5000;
+const MAX_PRICE_FETCH_TIME = 5; // seconds for curl timeout
 const FALLBACK_MATCH_WINDOW_MS = 120_000;
 const TERMINAL_STATUSES = new Set(['won', 'win', 'lost', 'lose', 'loss', 'stand', 'draw', 'tie']);
 
@@ -107,7 +107,7 @@ export abstract class FastradeBaseExecutor {
   // ── Candle price fetch ─────────────────────────────
 
   /**
-   * Fetches the latest candle close price from Stockity API.
+   * Fetches the latest candle close price from Stockity API using curl.
    * Mirrors Kotlin fetchPriceDataWithPreWarming() + parseCandleResponse().
    * Returns the close price of the last candle, or null on failure.
    */
@@ -117,27 +117,24 @@ export abstract class FastradeBaseExecutor {
       const dateStr = this.formatApiDate(utcDate);
       const encodedSymbol = encodeURIComponent(this.config.asset.ric);
 
-      const response = await Promise.race<any>([
-        axios.get(`${BASE_URL}/candles/v1/${encodedSymbol}/${dateStr}/5`, {
-          headers: {
-            'authorization-token': this.session.stockityToken,
-            'device-id': this.session.deviceId,
-            'device-type': this.session.deviceType,
-            'User-Agent': this.session.userAgent,
-            'user-timezone': this.session.userTimezone ?? 'Asia/Bangkok',
-            'Accept': 'application/json, text/plain, */*',
-            'Accept-Language': 'id-ID,id;q=0.9',
-            'Origin': 'https://stockity.id',
-            'Referer': 'https://stockity.id/',
-            'Cache-Control': 'no-cache, no-store, must-revalidate',
-            'Content-Type': 'application/json',
-          },
-          timeout: MAX_PRICE_FETCH_TIME,
-        }),
-        new Promise<null>((resolve) => setTimeout(() => resolve(null), MAX_PRICE_FETCH_TIME + 500)),
-      ]);
+      const response = await curlGet(
+        `${BASE_URL}/candles/v1/${encodedSymbol}/${dateStr}/5`,
+        {
+          'authorization-token': this.session.stockityToken,
+          'device-id': this.session.deviceId,
+          'device-type': this.session.deviceType,
+          'User-Agent': this.session.userAgent,
+          'user-timezone': this.session.userTimezone ?? 'Asia/Bangkok',
+          'Accept': 'application/json, text/plain, */*',
+          'Accept-Language': 'id-ID,id;q=0.9',
+          'Origin': 'https://stockity.id',
+          'Referer': 'https://stockity.id/',
+          'Cache-Control': 'no-cache, no-store, must-revalidate',
+        },
+        MAX_PRICE_FETCH_TIME,
+      );
 
-      if (!response || !response.data?.data) return null;
+      if (!response.data?.data) return null;
 
       const candles: any[] = response.data.data;
       if (!candles || candles.length === 0) return null;
@@ -541,4 +538,5 @@ export abstract class FastradeBaseExecutor {
     const res = this._sleepResolve;
     this._sleepResolve = undefined;
     res?.();
-  }}
+  }
+}

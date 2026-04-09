@@ -269,7 +269,7 @@ export class AISignalMonitorService implements OnModuleDestroy {
       const response = await curlGet(
         `${this.BASE_URL}/profile/trading-history?type=${orders[0].isDemoAccount ? 'demo' : 'real'}`,
         headers,
-        5000,
+        15, // seconds — curlGet takes timeoutSec, not timeoutMs
       );
 
       if (response?.data?.data) {
@@ -279,7 +279,7 @@ export class AISignalMonitorService implements OnModuleDestroy {
         for (const order of orders) {
           if (order.webSocketResultReceived || order.isCompleted) continue;
 
-          const matchingTrade = this.findMatchingTrade(trades, order);
+          const matchingTrade = this.findMatchingTrade(trades, order, userId);
 
           if (matchingTrade) {
             this.logger.log(
@@ -330,17 +330,17 @@ export class AISignalMonitorService implements OnModuleDestroy {
   /**
    * Find matching trade dari history
    */
-  private findMatchingTrade(trades: any[], order: MonitoringOrder): any | null {
+  private findMatchingTrade(trades: any[], order: MonitoringOrder, userId: string): any | null {
     const recentTimeThreshold = Date.now() - 120000; // 2 menit terakhir
 
     for (const trade of trades) {
       const tradeTime = new Date(trade.created_at).getTime();
-      const timeDiff = Math.abs(tradeTime - order.executionTime);
       const amountMatch = Math.abs(trade.amount - order.amount) < 100;
       const trendMatch = trade.trend?.toLowerCase() === order.trend.toLowerCase();
       const isCompleted = ['won', 'lost'].includes(trade.status?.toLowerCase());
       const isRecent = tradeTime >= recentTimeThreshold;
-      const isNotProcessed = trade.uuid !== this.processedResults.get(order.monitoringOrderId);
+      // Use same key format as the setters: `${userId}_${monitoringOrderId}`
+      const isNotProcessed = trade.uuid !== this.processedResults.get(`${userId}_${order.monitoringOrderId}`);
 
       if (isRecent && amountMatch && trendMatch && isCompleted && isNotProcessed) {
         return trade;
@@ -431,7 +431,7 @@ export class AISignalMonitorService implements OnModuleDestroy {
       const response = await curlGet(
         `${this.BASE_URL}/profile/trading-history?type=${config.isDemoAccount ? 'demo' : 'real'}`,
         headers,
-        5000,
+        15, // seconds — curlGet takes timeoutSec, not timeoutMs
       );
 
       if (response?.data?.data) {

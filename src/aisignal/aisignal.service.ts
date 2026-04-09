@@ -180,8 +180,12 @@ export class AISignalService implements OnModuleDestroy {
     // Set user session for monitor service
     this.aiSignalMonitor.setUserSession(userId, session);
 
-    // Setup WebSocket handler untuk deal results
-    this.setupWebSocketHandler(userId, ws);
+    // AISignalMonitorService.startMonitoring calls ws.setOnDealResult internally.
+    // Do NOT call ws.setOnDealResult here — it would be overwritten immediately.
+    // Deal results flow: WS → monitor.onDealResult → handleMonitorTradeResult callback.
+    ws.setOnStatusChange((connected, reason) => {
+      this.logger.log(`[${userId}] WebSocket status: ${connected ? 'connected' : 'disconnected'} - ${reason || ''}`);
+    });
 
     // Start monitoring service
     this.aiSignalMonitor.startMonitoring(userId, ws, (result) => {
@@ -457,39 +461,6 @@ export class AISignalService implements OnModuleDestroy {
     this.logger.log(`[${userId}] Always Signal Martingale Step ${nextStep}: ${nextAmount}`);
 
     return { message: `Martingale Step ${nextStep}/${config.martingale.maxSteps}` };
-  }
-
-  // ==================== WEBSOCKET HANDLER ====================
-
-  /**
-   * Setup WebSocket handler untuk menerima deal results
-   */
-  private setupWebSocketHandler(userId: string, wsClient: StockityWebSocketClient): void {
-    wsClient.setOnDealResult((payload) => {
-      this.logger.debug(`[${userId}] Deal result received: ${JSON.stringify(payload)}`);
-
-      // Convert ke format yang dibutuhkan AISignalMonitorService
-      const message = {
-        event: payload.status ? 'deal_result' : 'closed',
-        payload: {
-          id: payload.id,
-          status: payload.status,
-          amount: payload.amount,
-          trend: payload.trend,
-          win: payload.win,
-          payment: payload.payment,
-        },
-      };
-
-      // Forward ke monitor service
-      this.aiSignalMonitor.handleWebSocketTradeUpdate(userId, message, (result) => {
-        this.handleMonitorTradeResult(userId, result);
-      });
-    });
-
-    wsClient.setOnStatusChange((connected, reason) => {
-      this.logger.log(`[${userId}] WebSocket status: ${connected ? 'connected' : 'disconnected'} - ${reason || ''}`);
-    });
   }
 
   // ==================== EXECUTION MONITORING ====================

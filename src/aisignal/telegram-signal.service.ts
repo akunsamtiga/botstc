@@ -227,8 +227,14 @@ export class TelegramSignalService implements OnModuleDestroy {
   }
 
   /**
-   * Calculate execution timestamp from explicit hour:minute:second.
-   * If the time is in the past, schedule for tomorrow.
+   * Calculate execution timestamp from explicit hour:minute:second (WIB time).
+   *
+   * hour:minute:second from the Python bridge are already in WIB (UTC+7).
+   * The VPS server runs in UTC, so we must NOT use plain new Date().setHours()
+   * (that would interpret the value as UTC, shifting the result by +7 hours).
+   * Instead we mirror ScheduleService.toJakartaMs(): build a Date in the
+   * "Jakarta frame" by adding JAKARTA_OFFSET_MS, apply setHours there, then
+   * subtract the offset to get the correct UTC epoch milliseconds.
    */
   private calculateExecutionTime(
     hour: number,
@@ -236,19 +242,25 @@ export class TelegramSignalService implements OnModuleDestroy {
     second: number,
     referenceMs: number,
   ): number {
-    const target = new Date();
-    target.setHours(hour, minute, second, 0);
-    let ts = target.getTime();
+    const JAKARTA_OFFSET_MS = 7 * 60 * 60 * 1000; // UTC+7
 
-    if (ts < referenceMs) {
-      target.setDate(target.getDate() + 1);
-      ts = target.getTime();
+    // Build a Date shifted into Jakarta time so setHours works in WIB
+    const jakartaNow = new Date(Date.now() + JAKARTA_OFFSET_MS);
+    const target = new Date(jakartaNow);
+    target.setHours(hour, minute, second, 0);
+
+    // Convert back to real UTC epoch
+    let utcMs = target.getTime() - JAKARTA_OFFSET_MS;
+
+    // If the calculated time is already in the past, schedule for tomorrow
+    if (utcMs < referenceMs) {
+      utcMs += 86_400_000; // +1 day
       this.logger.log(
-        `Time already passed, scheduling for tomorrow: ${target.toISOString()}`,
+        `Time already passed, scheduling for tomorrow: ${new Date(utcMs).toISOString()}`,
       );
     }
 
-    return ts;
+    return utcMs;
   }
 
   /**

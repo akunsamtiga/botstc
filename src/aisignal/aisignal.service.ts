@@ -169,11 +169,9 @@ export class AISignalService implements OnModuleDestroy {
       stats,
     });
 
-    // Setup signal callback untuk menerima sinyal dari TelegramSignalService
-    this.telegramSignalService.setSignalCallback((uid, signal) => {
-      if (uid === userId) {
-        this.handleIncomingSignal(uid, signal);
-      }
+    // Setup per-user signal callback untuk menerima sinyal dari TelegramSignalService
+    this.telegramSignalService.setSignalCallback(userId, (uid, signal) => {
+      this.handleIncomingSignal(uid, signal);
     });
 
     // Start listening untuk sinyal dari Telegram/FCM

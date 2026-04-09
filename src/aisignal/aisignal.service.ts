@@ -407,7 +407,8 @@ export class AISignalService implements OnModuleDestroy {
       await this.firebaseMessaging.send(message);
       this.logger.log(`[${userId}] Signal sent to FCM topic '${topic}'`);
     } catch (err: any) {
-      this.logger.error(`[${userId}] Failed to send FCM: ${err?.message || err}`);
+      // FCM send opsional - Python bridge yang handle FCM ke mobile
+      this.logger.debug(`[${userId}] FCM send skipped: ${err?.message || err}`);
     }
   }
 
@@ -547,8 +548,16 @@ export class AISignalService implements OnModuleDestroy {
 
     // ✅ Tunggu hasil dengan await
     try {
+      const isScheduled = order.martingaleStep === 0;
       const result = await mode.wsClient.placeTrade(
-        this.buildTradePayload(mode.session, mode.config, order.amount, order.trend),
+        this.buildTradePayload(
+          mode.session,
+          mode.config,
+          order.amount,
+          order.trend,
+          isScheduled,
+          isScheduled ? order.executionTime : undefined,
+        ),
       );
 
       if (result.dealId) {
@@ -790,9 +799,9 @@ export class AISignalService implements OnModuleDestroy {
     mode.wsClient
       .placeTrade(this.buildTradePayload(mode.session, mode.config, amount, trend))
       .then((result) => {
-        if (result.dealId) {
+        if (result && result.dealId) {
           this.logger.log(`[${userId}] Martingale trade placed: ${result.dealId}`);
-        } else {
+        } else if (result) {
           this.logger.error(`[${userId}] Martingale trade failed: ${result.error}`);
         }
       })
@@ -821,23 +830,54 @@ export class AISignalService implements OnModuleDestroy {
     return Math.floor(config.baseAmount * Math.pow(multiplier, step - 1));
   }
 
+  /**
+   * Build trade payload — identik dengan ScheduleExecutor.buildTradeOrder().
+   * isScheduled=true  → order dijadwalkan, pakai executionTimeMs sebagai base
+   * isScheduled=false → martingale/instant, pakai Date.now()
+   */
   private buildTradePayload(
     session: any,
     config: AISignalConfig,
     amount: number,
     trend: string,
+    isScheduled = true,
+    executionTimeMs?: number,
   ): any {
-    const nowMs = Date.now();
-    const createdAtSec = Math.floor(nowMs / 1000) + 1;
-    const secondsInMinute = createdAtSec % 60;
-    const remaining = 60 - secondsInMinute;
-    const expireAt = remaining >= 45 ? createdAtSec + remaining : createdAtSec + remaining + 60;
+    const baseMs           = isScheduled && executionTimeMs ? executionTimeMs : Date.now();
+    const createdAtSeconds = Math.floor(baseMs / 1000);
+    const secondsInMinute  = createdAtSeconds % 60;
+
+    let finalExpireAt: number;
+
+    if (isScheduled) {
+      // Scheduled: expire di boundary menit jadwal
+      let expireAtSeconds: number;
+      if (secondsInMinute <= 10) {
+        expireAtSeconds = createdAtSeconds + (60 - secondsInMinute);
+      } else {
+        expireAtSeconds = createdAtSeconds + (120 - secondsInMinute);
+      }
+      const duration = expireAtSeconds - createdAtSeconds;
+      finalExpireAt = (duration < 55 || duration > 120) ? createdAtSeconds + 60 : expireAtSeconds;
+    } else {
+      // Martingale/instant: nearest minute boundary, min 45s
+      const remainingInMinute = 60 - secondsInMinute;
+      finalExpireAt = remainingInMinute >= 45
+        ? createdAtSeconds + remainingInMinute
+        : createdAtSeconds + remainingInMinute + 60;
+    }
+
+    // Safety fallback
+    const duration = finalExpireAt - createdAtSeconds;
+    if (duration < 45 || duration > 125) {
+      finalExpireAt = createdAtSeconds + 60;
+    }
 
     return {
       amount,
-      createdAt: createdAtSec * 1000,
+      createdAt: createdAtSeconds * 1000,
       dealType: config.isDemoAccount ? 'demo' : 'real',
-      expireAt,
+      expireAt: finalExpireAt,
       iso: session.currencyIso || config.currency || 'IDR',
       optionType: 'turbo',
       ric: config.asset!.ric,

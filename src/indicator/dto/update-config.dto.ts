@@ -38,4 +38,8 @@ export class UpdateIndicatorConfigDto {
   @IsOptional()
   @Min(1400000)
   amount?: number;
+
+  @IsBoolean()
+  @IsOptional()
+  isAlwaysSignal?: boolean;
 }

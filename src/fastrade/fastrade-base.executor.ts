@@ -4,10 +4,11 @@ import { curlGet } from '../common/http-utils';
 import { StockityWebSocketClient, DealResultPayload } from '../schedule/websocket-client';
 import {
   FastradeConfig, FastradeLog, FastradeOrder, TrendType, FastradeTradeOrder,
+  FastradeAlwaysSignalLossState,
 } from './fastrade-types';
 
 const BASE_URL = 'https://api.stockity.id';
-const MAX_PRICE_FETCH_TIME = 5; // seconds for curl timeout
+const MAX_PRICE_FETCH_TIME = 5;
 const FALLBACK_MATCH_WINDOW_MS = 120_000;
 const TERMINAL_STATUSES = new Set(['won', 'win', 'lost', 'lose', 'loss', 'stand', 'draw', 'tie']);
 
@@ -28,7 +29,6 @@ export interface SessionInfo {
 export abstract class FastradeBaseExecutor {
   protected logger: Logger;
 
-  // ── State ──────────────────────────────────────────
   protected isRunning = false;
   protected cycleNumber = 0;
   protected currentTrend?: TrendType;
@@ -37,21 +37,18 @@ export abstract class FastradeBaseExecutor {
   protected totalLosses = 0;
   protected totalTrades = 0;
 
-  // ── Active order tracking ──────────────────────────
   protected activeOrder?: FastradeOrder;
   protected executionTime?: number;
 
-  // ── Martingale state ───────────────────────────────
   protected martingaleStep = 0;
   protected martingaleActive = false;
   protected martingaleTotalLoss = 0;
 
-  // ── Timers ─────────────────────────────────────────
+  // Always Signal state - melacak loss yang belum tertutupi
+  protected alwaysSignalLossState: FastradeAlwaysSignalLossState | null = null;
+
   protected resultTimeoutTimer?: NodeJS.Timeout;
 
-  // ── Interruptible sleep ─────────────────────────────
-  // Allows stop() to immediately cancel any active sleep(), so the executor
-  // doesn't hang for up to 60s waiting for a minute boundary after stop is called.
   private _sleepTimer?: NodeJS.Timeout;
   private _sleepResolve?: () => void;
 
@@ -63,11 +60,8 @@ export abstract class FastradeBaseExecutor {
     protected readonly callbacks: FastradeExecutorCallbacks,
   ) {
     this.logger = new Logger(this.constructor.name);
-    // Register deal result handler on WS
     this.wsClient.setOnDealResult((p) => this.handleDealResult(p));
   }
-
-  // ── Lifecycle ──────────────────────────────────────
 
   start() {
     if (this.isRunning) return;
@@ -80,6 +74,7 @@ export abstract class FastradeBaseExecutor {
     this.activeOrder = undefined;
     this.executionTime = undefined;
     this.resetMartingale();
+    this.alwaysSignalLossState = null;
     this.logger.log(`[${this.userId}] ▶️ Starting`);
     this.startNewCycle();
   }
@@ -88,29 +83,22 @@ export abstract class FastradeBaseExecutor {
     if (!this.isRunning && !this.activeOrder) return;
     this.isRunning = false;
     this.clearResultTimeout();
-    this.wakeUp();           // FIX: interrupt any active sleep() immediately
+    this.wakeUp();
     this.activeOrder = undefined;
     this.executionTime = undefined;
     this.resetMartingale();
+    this.alwaysSignalLossState = null;
     this.logger.log(`[${this.userId}] ⏹️ Stopped`);
     this.callbacks.onStopped();
   }
 
   isActive(): boolean { return this.isRunning; }
 
-  // ── Abstract methods (subclass implements) ─────────
   protected abstract startNewCycle(): void;
   protected abstract onWin(order: FastradeOrder): void;
   protected abstract onLose(order: FastradeOrder): void;
   protected abstract onDraw(order: FastradeOrder): void;
 
-  // ── Candle price fetch ─────────────────────────────
-
-  /**
-   * Fetches the latest candle close price from Stockity API using curl.
-   * Mirrors Kotlin fetchPriceDataWithPreWarming() + parseCandleResponse().
-   * Returns the close price of the last candle, or null on failure.
-   */
   protected async fetchCandleClosePrice(): Promise<number | null> {
     try {
       const utcDate = new Date();
@@ -139,7 +127,6 @@ export abstract class FastradeBaseExecutor {
       const candles: any[] = response.data.data;
       if (!candles || candles.length === 0) return null;
 
-      // Sort by created_at asc, take last candle close price
       const sorted = [...candles].sort((a, b) =>
         (a.created_at as string).localeCompare(b.created_at as string),
       );
@@ -153,37 +140,22 @@ export abstract class FastradeBaseExecutor {
     }
   }
 
-  /**
-   * Compares two close prices and returns trend direction.
-   * FTT: returns null if equal (triggers cycle restart).
-   * CTC overrides this to return 'put' on equal.
-   */
   protected determineTrend(price1: number, price2: number): TrendType | null {
     if (price2 > price1) return 'call';
     if (price2 < price1) return 'put';
-    return null; // Equal → subclass decides behavior
+    return null;
   }
 
   protected reverseTrend(trend: TrendType): TrendType {
     return trend === 'call' ? 'put' : 'call';
   }
 
-  // ── Time utilities ─────────────────────────────────
-
-  /**
-   * Returns the Unix ms timestamp of the next minute boundary.
-   * E.g. if now is 12:34:42.500, returns 12:35:00.000
-   */
   protected getNextMinuteBoundary(): number {
     const now = Date.now();
     const msIntoMinute = now % 60_000;
     return now + (60_000 - msIntoMinute);
   }
 
-  /**
-   * Formats date as "yyyy-MM-ddTHH:00:00" in UTC — Stockity candle API format.
-   * Mirrors Kotlin apiDateFormat.
-   */
   protected formatApiDate(date: Date): string {
     const pad = (n: number) => String(n).padStart(2, '0');
     return (
@@ -192,12 +164,6 @@ export abstract class FastradeBaseExecutor {
     );
   }
 
-  // ── Trade execution ────────────────────────────────
-
-  /**
-   * Builds and places an instant (non-scheduled) trade via WebSocket.
-   * Returns the created FastradeOrder, or null if placement failed.
-   */
   protected async executeTrade(
     trend: TrendType,
     amount: number,
@@ -223,7 +189,6 @@ export abstract class FastradeBaseExecutor {
 
     const result = await this.wsClient.placeTrade(tradeData as any);
 
-    // ── Handle permanent errors — stop bot immediately ───────────────
     if (result.error === 'amount_min') {
       this.logger.error(
         `[${this.userId}] ❌ Amount ${amount} di bawah minimum Stockity — bot dihentikan`,
@@ -241,12 +206,10 @@ export abstract class FastradeBaseExecutor {
       return null;
     }
 
-    // ── Handle duplicate — trade sudah masuk, lanjut tanpa dealId ────
     if (result.error === 'duplicate') {
       this.logger.warn(
         `[${this.userId}] ⚠️ Duplicate deal — trade probably went through, tracking without dealId`,
       );
-      // Lanjut dengan dealId null, fallback match akan handle result dari WS
     }
 
     const dealId = result.dealId ?? null;
@@ -263,8 +226,6 @@ export abstract class FastradeBaseExecutor {
     };
 
     this.callbacks.onLog({
-      // ID deterministik: orderId + step → Firestore akan overwrite entry ini
-      // saat handleDealResult() emit result log dengan ID yang sama.
       id: `${orderId}_s${martingaleStep}`,
       orderId, trend, amount, martingaleStep,
       dealId: dealId ?? undefined,
@@ -277,28 +238,22 @@ export abstract class FastradeBaseExecutor {
       isDemoAccount: this.config.isDemoAccount,
     });
 
-    // Jika error non-duplicate dan tidak ada dealId, return null (gagal)
     if (!dealId && result.error !== 'duplicate') return null;
 
     this.executionTime = now;
     return order;
   }
 
-  /**
-   * Builds instant trade timing — identical to ScheduleExecutor.buildTradeOrder(isScheduledOrder=false).
-   * Uses nearest minute boundary with min 45s rule.
-   */
   protected buildInstantTrade(trend: TrendType, amount: number): FastradeTradeOrder {
     const nowMs = Date.now();
     const createdAtSeconds = Math.floor(nowMs / 1000) + 1;
     const secondsInMinute = createdAtSeconds % 60;
     const remainingInMinute = 60 - secondsInMinute;
 
-    // Nearest minute boundary with min 45s (Kotlin: isScheduledOrder=false branch)
     const expireAt =
       remainingInMinute >= 45
-        ? createdAtSeconds + remainingInMinute        // this minute boundary
-        : createdAtSeconds + remainingInMinute + 60; // next minute boundary
+        ? createdAtSeconds + remainingInMinute
+        : createdAtSeconds + remainingInMinute + 60;
 
     const duration = expireAt - createdAtSeconds;
     if (duration < 45) throw new Error(`Duration terlalu pendek: ${duration}s (min 45s)`);
@@ -317,12 +272,6 @@ export abstract class FastradeBaseExecutor {
     };
   }
 
-  // ── Martingale ─────────────────────────────────────
-
-  /**
-   * Calculates trade amount for a given martingale step.
-   * Identical to ScheduleExecutor.calcAmount().
-   */
   protected calcAmount(step: number): number {
     const m = this.config.martingale;
     if (!m.isEnabled || step === 0) return m.baseAmount;
@@ -339,19 +288,77 @@ export abstract class FastradeBaseExecutor {
     this.martingaleTotalLoss = 0;
   }
 
-  // ── Deal result handler ────────────────────────────
+  /**
+   * Handle Always Signal feature
+   * Dipanggil saat loss terjadi dan isAlwaysSignal aktif
+   */
+  protected handleAlwaysSignalLoss(order: FastradeOrder): void {
+    const m = this.config.martingale;
+    if (!m.isEnabled || !m.isAlwaysSignal) return;
+
+    const nextStep = (this.alwaysSignalLossState?.currentMartingaleStep ?? 0) + 1;
+
+    if (nextStep > m.maxSteps) {
+      this.logger.log(`[${this.userId}] Always Signal: Max steps reached - RESET`);
+      this.alwaysSignalLossState = null;
+      return;
+    }
+
+    this.alwaysSignalLossState = {
+      hasOutstandingLoss: true,
+      currentMartingaleStep: nextStep,
+      originalOrderId: order.id,
+      totalLoss: (this.alwaysSignalLossState?.totalLoss ?? 0) + order.amount,
+      currentTrend: order.trend,
+    };
+
+    this.logger.log(
+      `[${this.userId}] 📊 Always Signal: Loss recorded, step ${nextStep}/${m.maxSteps}, ` +
+      `totalLoss=${this.alwaysSignalLossState.totalLoss}`
+    );
+  }
 
   /**
-   * Handles incoming WebSocket deal results.
-   * Uses 3-layer matching identical to ScheduleExecutor.handleDealResult():
-   *   1. Exact dealId match
-   *   2. UUID cross-reference
-   *   3. Fallback: amount + trend + 120s window (Kotlin isWebSocketTradeMatch)
+   * Execute Always Signal martingale pada sinyal berikutnya
    */
+  protected async executeAlwaysSignalMartingale(): Promise<boolean> {
+    if (!this.alwaysSignalLossState?.hasOutstandingLoss) return false;
+
+    const m = this.config.martingale;
+    const step = this.alwaysSignalLossState.currentMartingaleStep;
+    const trend = this.alwaysSignalLossState.currentTrend;
+    const amount = this.calcAmount(step);
+
+    this.logger.log(
+      `[${this.userId}] 🔄 Always Signal: Executing step ${step}/${m.maxSteps} ` +
+      `trend=${trend.toUpperCase()} amount=${amount}`
+    );
+
+    const order = await this.executeTrade(trend, amount, step, this.cycleNumber);
+
+    if (order) {
+      this.activeOrder = order;
+      this.martingaleStep = step;
+      this.martingaleActive = true;
+      return true;
+    }
+
+    return false;
+  }
+
+  /**
+   * Clear Always Signal state saat WIN terjadi
+   */
+  protected clearAlwaysSignalLoss(): void {
+    if (this.alwaysSignalLossState) {
+      this.logger.log(`[${this.userId}] ✅ Always Signal: Loss cleared (WIN)`);
+      this.alwaysSignalLossState = null;
+    }
+  }
+
   protected handleDealResult(payload: DealResultPayload) {
     const s = (payload.status || payload.result || '').toLowerCase();
 
-    // Critical guard: statusMatch — only process terminal statuses (Kotlin pattern)
     if (!TERMINAL_STATUSES.has(s)) {
       this.logger.debug(`[${this.userId}] Skip non-terminal status="${s}"`);
       return;
@@ -361,19 +368,16 @@ export abstract class FastradeBaseExecutor {
     if (!active) return;
 
     const dealId = String(payload.id ?? '');
-    const isWin  = s === 'won' || s === 'win';
+    const isWin  = s === 'won'  || s === 'win';
     const isDraw = s === 'stand' || s === 'draw' || s === 'tie';
 
-    // Strategy 1: exact dealId
     let isMatch = active.dealId === dealId;
 
-    // Strategy 2: UUID cross-reference
     if (!isMatch && payload.uuid && payload.uuid !== dealId) {
       isMatch = active.dealId === payload.uuid;
       if (isMatch) this.logger.debug(`[${this.userId}] Match via UUID cross-ref`);
     }
 
-    // Strategy 3: fallback (amount + trend + 120s window)
     if (!isMatch) {
       isMatch = this.isFallbackMatch(payload, active);
       if (isMatch) {
@@ -405,8 +409,6 @@ export abstract class FastradeBaseExecutor {
     );
 
     this.callbacks.onLog({
-      // Pakai ID yang sama dengan execution log → Firestore overwrite entry lama
-      // sehingga tidak ada 2 baris untuk 1 trade.
       id: `${active.id}_s${active.martingaleStep}`,
       orderId: active.id,
       trend: active.trend,
@@ -427,20 +429,27 @@ export abstract class FastradeBaseExecutor {
 
     if (!this.isRunning) return;
 
-    // Check stop conditions before routing result
     if (this.checkStopConditions()) return;
 
-    if (isWin) this.onWin(completedOrder);
-    else if (isDraw) this.onDraw(completedOrder);
-    else this.onLose(completedOrder);
+    // Handle Always Signal logic
+    if (isWin) {
+      this.clearAlwaysSignalLoss();
+      this.onWin(completedOrder);
+    } else if (isDraw) {
+      this.onDraw(completedOrder);
+    } else {
+      // LOSE - check if Always Signal mode
+      if (this.config.martingale.isAlwaysSignal) {
+        this.handleAlwaysSignalLoss(completedOrder);
+        // Jangan lanjutkan martingale langsung, tunggu sinyal berikutnya
+        this.resetMartingale();
+        this.onLose(completedOrder);
+      } else {
+        this.onLose(completedOrder);
+      }
+    }
   }
 
-  /**
-   * Fallback matching identical to Kotlin isWebSocketTradeMatch():
-   *   timeMatch  = elapsed < 120_000ms
-   *   amountMatch = payload.amount == info.amount
-   *   trendMatch  = !payloadTrend || payloadTrend == order.trend
-   */
   protected isFallbackMatch(payload: DealResultPayload, order: FastradeOrder): boolean {
     if (!this.executionTime) return false;
     const elapsed = Date.now() - this.executionTime;
@@ -449,8 +458,6 @@ export abstract class FastradeBaseExecutor {
     if (payload.trend && payload.trend !== order.trend) return false;
     return true;
   }
-
-  // ── Stop conditions ────────────────────────────────
 
   protected checkStopConditions(): boolean {
     const { stopLoss, stopProfit } = this.config;
@@ -472,8 +479,6 @@ export abstract class FastradeBaseExecutor {
     return false;
   }
 
-  // ── Result timeout ─────────────────────────────────
-
   protected startResultTimeout(orderId: string, timeoutMs = 180_000) {
     this.clearResultTimeout();
     this.resultTimeoutTimer = setTimeout(() => {
@@ -493,8 +498,6 @@ export abstract class FastradeBaseExecutor {
     }
   }
 
-  // ── Status ─────────────────────────────────────────
-
   getStatus() {
     return {
       isRunning: this.isRunning,
@@ -511,15 +514,12 @@ export abstract class FastradeBaseExecutor {
       totalLosses: this.totalLosses,
       activeOrderId: this.activeOrder?.id ?? null,
       wsConnected: this.wsClient.isConnected(),
+      alwaysSignalActive: this.alwaysSignalLossState?.hasOutstandingLoss ?? false,
+      alwaysSignalStep: this.alwaysSignalLossState?.currentMartingaleStep ?? 0,
     };
   }
 
-  // ── Utility ────────────────────────────────────────
-
   protected sleep(ms: number): Promise<void> {
-    // Interruptible sleep: calling wakeUp() resolves this promise early.
-    // This ensures stop() exits runCycle() within milliseconds instead of
-    // waiting up to 60s for a minute boundary sleep to finish.
     return new Promise((resolve) => {
       this._sleepResolve = resolve;
       this._sleepTimer = setTimeout(() => {

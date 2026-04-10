@@ -33,4 +33,8 @@ export class UpdateMomentumConfigDto {
   @IsOptional()
   @Min(1400000)
   baseAmount?: number;
+
+  @IsBoolean()
+  @IsOptional()
+  isAlwaysSignal?: boolean;
 }

@@ -16,6 +16,7 @@ export interface FastradeMartingale {
   baseAmount: number;
   multiplierValue: number;
   multiplierType: 'FIXED' | 'PERCENTAGE';
+  isAlwaysSignal: boolean;
 }
 
 export interface FastradeConfig {
@@ -54,7 +55,7 @@ export interface FastradeLog {
   note?: string;
   cycleNumber: number;
   mode?: FastradeMode;
-  isDemoAccount?: boolean; // true = demo, false = real (untuk filter profit hari ini)
+  isDemoAccount?: boolean;
 }
 
 export interface FastradeTradeOrder {
@@ -66,4 +67,13 @@ export interface FastradeTradeOrder {
   optionType: string;
   ric: string;
   trend: TrendType;
+}
+
+// Always Signal Loss State untuk melacak loss yang belum tertutupi
+export interface FastradeAlwaysSignalLossState {
+  hasOutstandingLoss: boolean;
+  currentMartingaleStep: number;
+  originalOrderId: string;
+  totalLoss: number;
+  currentTrend: TrendType;
 }

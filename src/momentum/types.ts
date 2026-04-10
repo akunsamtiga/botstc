@@ -60,6 +60,16 @@ export interface MomentumMartingaleResult {
   momentumType: MomentumType;
 }
 
+// Always Signal Loss State untuk momentum mode
+export interface MomentumAlwaysSignalLossState {
+  hasOutstandingLoss: boolean;
+  currentMartingaleStep: number;
+  originalOrderId: string;
+  totalLoss: number;
+  currentTrend: string;
+  momentumType: MomentumType;
+}
+
 export interface Candle {
   open: number;
   close: number;
@@ -102,10 +112,10 @@ export interface MomentumStates {
   bbSarBreak: SignalState;
 }
 
-export const SIGNAL_COOLDOWN_MS = 3 * 60 * 1000; // 3 minutes
-export const PRICE_MOVE_THRESHOLD = 0.0003; // 0.03%
+export const SIGNAL_COOLDOWN_MS = 3 * 60 * 1000;
+export const PRICE_MOVE_THRESHOLD = 0.0003;
 export const MAX_SIGNALS_PER_HOUR = 10;
-export const SIGNAL_HISTORY_CLEANUP_MS = 60 * 60 * 1000; // 1 hour
+export const SIGNAL_HISTORY_CLEANUP_MS = 60 * 60 * 1000;
 export const MAX_CANDLES_STORAGE = 100;
 export const MIN_CANDLES_FOR_BB_SAR = 10;
 export const CANDLES_5SEC_PER_MINUTE = 12;

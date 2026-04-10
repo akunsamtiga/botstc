@@ -18,6 +18,7 @@ export class FastradeMartingaleDto {
   @IsNumber() @Min(1) baseAmount: number;
   @IsNumber() @Min(0) multiplierValue: number;
   @IsIn(['FIXED', 'PERCENTAGE']) multiplierType: 'FIXED' | 'PERCENTAGE';
+  @IsBoolean() isAlwaysSignal: boolean;
 }
 
 export class StartFastradeDto {

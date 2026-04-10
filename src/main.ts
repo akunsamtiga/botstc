@@ -23,6 +23,7 @@ async function bootstrap() {
   app.enableCors({
     origin: [
       'https://v2.stcautotrade.id',
+      'https://stcautotradepro.id',
       'http://localhost:3000',
       'http://localhost:3001',
       'https://bot.stcautotrade.id',

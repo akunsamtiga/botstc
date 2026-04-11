@@ -256,9 +256,23 @@ export class FttExecutor extends FastradeBaseExecutor {
         return;
       }
 
+      // Martingale max step tercapai → langsung reverse arah dan order (tanpa tunggu cycle baru)
+      const reversedTrend = this.reverseTrend(trend);
+      this.currentTrend = reversedTrend;
+      this.resetMartingale();
+
       this.logger.log(
-        `[${this.userId}] FTT: Martingale max reached (step ${this.martingaleStep}/${m.maxSteps}) — new cycle after delay`,
+        `[${this.userId}] FTT: Martingale max reached (step ${this.martingaleStep}/${m.maxSteps}) ` +
+        `— REVERSE ${trend.toUpperCase()} → ${reversedTrend.toUpperCase()} (langsung order)`,
       );
+      this.callbacks.onStatusChange(
+        `FTT Martingale max ❌ — REVERSED → ${reversedTrend.toUpperCase()} (order segera)`,
+      );
+
+      setTimeout(() => {
+        if (this.isRunning) this.executeWithTrend(reversedTrend, 0);
+      }, 200);
+      return;
     }
 
     this.phase = 'WAITING_LOSS_DELAY';

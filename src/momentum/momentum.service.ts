@@ -1003,8 +1003,18 @@ export class MomentumService implements OnModuleDestroy {
       `result=${isWin ? 'WIN' : isDraw ? 'DRAW' : 'LOSE'} profit=${profit}`,
     );
 
-    // Handle Always Signal loss tracking
     const config = await this.getConfig(userId);
+
+    // Handle Martingale for STANDARD mode (non Always Signal) - via WebSocket
+    if (!isWin && !isDraw && config.martingale.isEnabled && !config.martingale.isAlwaysSignal && matchedLog.martingaleStep === 0) {
+      const session = await this.authService.getSession(userId);
+      if (session) {
+        this.logger.log(`[${userId}] WS triggered standard martingale for ${matchedLog.momentumType}`);
+        await this.startMartingale(userId, config, session, matchedLog.orderId, matchedLog.momentumType || MomentumType.CANDLE_SABIT);
+      }
+    }
+
+    // Handle Always Signal loss tracking
     if (!isWin && !isDraw && config.martingale.isAlwaysSignal && matchedLog.martingaleStep === 0) {
       const nextStep = 1;
       if (nextStep <= config.martingale.maxSteps) {

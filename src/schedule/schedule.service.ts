@@ -362,7 +362,20 @@ export class ScheduleService implements OnModuleInit, OnModuleDestroy {
       );
     }
 
-    const orders = await this.getOrders(userId);
+    const rawOrders = await this.getOrders(userId);
+
+    // Buang orders yang sudah kadaluarsa lebih dari satu jam (tidak mungkin dieksekusi).
+    // Ini mencegah tracking diisi dengan orders lama dari sesi sebelumnya yang akan
+    // langsung di-skip executor, tapi kalau ada error tidak sempat di-update dari PENDING.
+    const ONE_HOUR_MS = 3_600_000;
+    const now = Date.now();
+    const orders = rawOrders.filter(o => o.timeInMillis > now - ONE_HOUR_MS);
+
+    if (rawOrders.length !== orders.length) {
+      this.logger.warn(
+        `[${userId}] Filtered ${rawOrders.length - orders.length} expired orders before start`,
+      );
+    }
 
     await this.trackingService.archiveTracking(userId).catch(() => {});
     await this.trackingService.initializeTracking(userId, orders);
@@ -417,6 +430,8 @@ export class ScheduleService implements OnModuleInit, OnModuleDestroy {
         try {
           // Flush pending saves dulu sebelum update status STOPPED
           await this.flushPendingOrdersSave(userId);
+          // Cleanup non-terminal orders SEBELUM cache di-delete oleh updateBotState(STOPPED)
+          await this.trackingService.cleanupPendingOrders(userId, 'Session selesai');
           await this.updateStatus(userId, 'STOPPED', sessionPnL);
           await this.trackingService.updateBotState(userId, 'STOPPED');
           this.logger.log(`[${userId}] Status updated to STOPPED`);
@@ -464,6 +479,8 @@ export class ScheduleService implements OnModuleInit, OnModuleDestroy {
     // Flush pending saves sebelum save final
     await this.flushPendingOrdersSave(userId);
     await this.saveOrders(userId, exec.getOrders());
+    // Cleanup non-terminal orders SEBELUM cache di-delete oleh updateBotState(STOPPED)
+    await this.trackingService.cleanupPendingOrders(userId, 'Bot dihentikan manual');
     await this.updateStatus(userId, 'STOPPED');
     await this.trackingService.updateBotState(userId, 'STOPPED');
     await new Promise(r => setTimeout(r, 300));

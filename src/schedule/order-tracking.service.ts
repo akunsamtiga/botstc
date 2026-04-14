@@ -127,7 +127,15 @@ export class OrderTrackingService {
   async initializeTracking(userId: string, orders: ScheduledOrder[]): Promise<void> {
     const trackedOrders: TrackedOrder[] = orders.map(order => ({
       ...order,
-      trackingStatus: 'PENDING',
+      // Hormati flag isExecuted/isSkipped dari sesi sebelumnya.
+      // Order isSkipped → SKIPPED (sudah terminal).
+      // Order isExecuted tapi belum dapat WS result → FAILED (tidak bisa dilanjutkan).
+      // Order baru → PENDING.
+      trackingStatus: order.isSkipped
+        ? 'SKIPPED'
+        : order.isExecuted
+          ? 'FAILED'
+          : 'PENDING',
       currentMartingaleStep: 0,
     }));
 
@@ -488,6 +496,53 @@ export class OrderTrackingService {
   async getActiveOrders(userId: string): Promise<TrackedOrder[]> {
     const tracking = await this.getTracking(userId, { onlyActive: true });
     return tracking?.orders || [];
+  }
+
+  /**
+   * Update semua orders dengan status non-terminal (PENDING, MONITORING, MARTINGALE_STEP_X)
+   * menjadi FAILED saat bot stop/crash.
+   *
+   * Dipanggil SEBELUM updateBotState(STOPPED) agar cache masih ada saat method ini berjalan.
+   * Ini mencegah orders nyangkut di PENDING/MONITORING di history setelah bot berhenti.
+   */
+  async cleanupPendingOrders(userId: string, reason: string): Promise<void> {
+    try {
+      const data = await this.loadCache(userId);
+      if (!data) return;
+
+      const nonTerminalStatuses: OrderTrackingStatus[] = [
+        'PENDING',
+        'MONITORING',
+        'MARTINGALE_STEP_1',
+        'MARTINGALE_STEP_2',
+        'MARTINGALE_STEP_3',
+        'MARTINGALE_STEP_4',
+        'MARTINGALE_STEP_5',
+      ];
+
+      const orders: TrackedOrder[] = (data.orders || []).map((o: TrackedOrder) => {
+        if (!nonTerminalStatuses.includes(o.trackingStatus)) return o;
+        return {
+          ...o,
+          trackingStatus: 'FAILED' as OrderTrackingStatus,
+          completedAt: Date.now(),
+          skipReason: reason,
+        };
+      });
+
+      const hasChanges = orders.some((o: TrackedOrder, i: number) =>
+        o.trackingStatus !== (data.orders || [])[i]?.trackingStatus,
+      );
+
+      if (!hasChanges) return;
+
+      this.setCache(userId, { ...data, orders });
+      await this.flushCache(userId, true); // force flush — terminal event
+
+      this.logger.log(`[${userId}] Cleaned up non-terminal orders: "${reason}"`);
+    } catch (error: any) {
+      this.logger.error(`[${userId}] Failed to cleanup pending orders: ${error.message}`);
+    }
   }
 
   /**

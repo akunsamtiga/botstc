@@ -5,7 +5,7 @@ import { ScheduleModule } from '@nestjs/schedule';
 import { FirebaseModule } from './firebase/firebase.module';
 import { AuthModule } from './auth/auth.module';
 import { ProfileModule } from './profile/profile.module';
-import { ScheduleAppModule } from './schedule/schedule.module';
+import { ScheduleModule as ScheduleAppModule } from './schedule/schedule.module';
 import { FastradeModule } from './fastrade/fastrade.module';
 import { IndicatorModule } from './indicator/indicator.module';
 import { MomentumModule } from './momentum/momentum.module';

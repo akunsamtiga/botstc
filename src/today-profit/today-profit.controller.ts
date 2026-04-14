@@ -3,7 +3,7 @@ import {
   Controller,
   Get,
   Query,
-  Param,  
+  Param,
   Request,
   UseGuards,
   HttpCode,
@@ -18,31 +18,37 @@ export class TodayProfitController {
 
   /**
    * GET /today-profit
-   * Get today's profit summary across all trading modes
-   * 
+   * Get today's profit summary across all trading modes + Stockity API.
+   *
    * Query params:
-   * - date: optional, format YYYY-MM-DD (default: today)
+   *   - date:        optional, YYYY-MM-DD (default: today)
+   *   - accountType: 'real' | 'demo' | 'both' (default: 'real')
+   *                  Controls which Stockity account type is fetched from the API.
+   *                  Firebase mode logs are always fetched regardless of this param.
    */
   @Get()
   @HttpCode(200)
   async getTodayProfit(
     @Request() req,
     @Query('date') date?: string,
+    @Query('accountType') accountType?: 'real' | 'demo' | 'both',
   ) {
-    const result = await this.todayProfitService.getTodayProfit(req.user.userId, date);
-    return {
-      success: true,
-      data: result,
-    };
+    const result = await this.todayProfitService.getTodayProfit(
+      req.user.userId,
+      date,
+      accountType ?? 'real',
+    );
+    return { success: true, data: result };
   }
 
   /**
    * GET /today-profit/history
-   * Get profit history for a date range
-   * 
+   * Get profit history for a date range (day by day).
+   *
    * Query params:
-   * - startDate: required, format YYYY-MM-DD
-   * - endDate: required, format YYYY-MM-DD
+   *   - startDate:   required, YYYY-MM-DD
+   *   - endDate:     required, YYYY-MM-DD
+   *   - accountType: 'real' | 'demo' | 'both' (default: 'real')
    */
   @Get('history')
   @HttpCode(200)
@@ -57,35 +63,28 @@ export class TodayProfitController {
         error: 'startDate and endDate are required (YYYY-MM-DD format)',
       };
     }
-
     const result = await this.todayProfitService.getProfitHistory(
       req.user.userId,
       startDate,
       endDate,
     );
-    return {
-      success: true,
-      data: result,
-    };
+    return { success: true, data: result };
   }
 
   /**
    * GET /today-profit/realtime
-   * Get real-time profit including active sessions
+   * Get real-time profit including active sessions.
    */
   @Get('realtime')
   @HttpCode(200)
   async getRealtimeProfit(@Request() req) {
     const result = await this.todayProfitService.getRealtimeProfit(req.user.userId);
-    return {
-      success: true,
-      data: result,
-    };
+    return { success: true, data: result };
   }
 
   /**
    * GET /today-profit/by-mode/:mode
-   * Get detailed profit for a specific trading mode
+   * Placeholder for mode-specific detailed view.
    */
   @Get('by-mode/:mode')
   @HttpCode(200)
@@ -94,7 +93,6 @@ export class TodayProfitController {
     @Param('mode') mode: string,
     @Query('date') date?: string,
   ) {
-    // Implementation for mode-specific detailed view
     return {
       success: true,
       data: { mode, date: date || 'today' },

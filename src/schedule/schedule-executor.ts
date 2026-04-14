@@ -35,6 +35,20 @@ export interface ExecutorCallbacks {
   onLog: (log: ExecutionLog) => void;
   onAllCompleted: () => void;
   onStatusChange: (status: string) => void;
+  // Tracking callbacks
+  onOrderExecuted?: (orderId: string, dealId: string, amount: number, estimatedCompletionTime: number) => Promise<void>;
+  onMartingaleStep?: (orderId: string, step: number, amount: number, dealId?: string) => Promise<void>;
+  onOrderCompleted?: (orderId: string, result: 'WIN' | 'LOSE' | 'DRAW', profit: number, sessionPnL: number) => Promise<void>;
+  onOrderFailed?: (orderId: string, reason: string) => Promise<void>;
+  onOrderSkipped?: (orderId: string, reason: string) => Promise<void>;
+  onActiveMartingaleChange?: (martingaleInfo: {
+    orderId: string;
+    step: number;
+    maxSteps: number;
+    trend: TrendType;
+    amount: number;
+    startedAt: number;
+  } | null) => Promise<void>;
 }
 
 /**
@@ -52,6 +66,7 @@ interface ExecutionInfo {
   amount: number;
   trend: TrendType;
   executedAt: number;
+  estimatedCompletionTime: number;
 }
 
 export class ScheduleExecutor {
@@ -137,6 +152,8 @@ export class ScheduleExecutor {
     this.executionInfoMap.clear();
     this.sessionPnL = 0;
     this.callbacks.onOrdersUpdate(this.orders);
+    // Notify tracking service
+    this.callbacks.onActiveMartingaleChange?.(null).catch(() => {});
     this.logger.log(`[${this.userId}] ⏹️ Stopped`);
   }
 
@@ -163,7 +180,10 @@ export class ScheduleExecutor {
     const before = this.orders.length;
     this.orders = this.orders.filter(o => o.id !== orderId);
     this.executionInfoMap.delete(orderId);
-    if (this.activeMartingaleOrderId === orderId) this.activeMartingaleOrderId = undefined;
+    if (this.activeMartingaleOrderId === orderId) {
+      this.activeMartingaleOrderId = undefined;
+      this.callbacks.onActiveMartingaleChange?.(null).catch(() => {});
+    }
     if (this.orders.length !== before) this.callbacks.onOrdersUpdate(this.orders);
     if (this.orders.length === 0 && this.botState === 'RUNNING') {
       this.stop();
@@ -178,6 +198,7 @@ export class ScheduleExecutor {
     this.executionInfoMap.clear();
     if (this.botState === 'RUNNING') this.stop();
     this.callbacks.onOrdersUpdate([]);
+    this.callbacks.onActiveMartingaleChange?.(null).catch(() => {});
     this.callbacks.onAllCompleted();
   }
 
@@ -207,20 +228,20 @@ export class ScheduleExecutor {
       const timeUntil = target - now;
 
       if (timeUntil < -EXECUTION_WINDOW_MS) {
-        // Hapus langsung dari list — tidak perlu isSkipped yang menumpuk di Firestore
+        // Order kadaluarsa - skip dan notify tracking
         this.logger.warn(`[${this.userId}] ⏭️ Skipped expired: ${order.time} ${order.trend}`);
-        this.orders.splice(i, 1);
-        i--;
+        this.orders[i] = { ...this.orders[i], isSkipped: true, skipReason: 'Expired' };
+        this.callbacks.onOrderSkipped?.(order.id, 'Order expired').catch(() => {});
         changed = true;
         continue;
       }
 
       if (timeUntil <= 0 && timeUntil >= -EXECUTION_WINDOW_MS) {
         if (this.activeMartingaleOrderId && this.activeMartingaleOrderId !== order.id) {
-          // Hapus langsung — order bentrok dengan martingale aktif tidak perlu disimpan
+          // Order bentrok dengan martingale aktif - skip dan notify tracking
           this.logger.warn(`[${this.userId}] ⏭️ Skipped (martingale aktif): ${order.time} ${order.trend}`);
-          this.orders.splice(i, 1);
-          i--;
+          this.orders[i] = { ...this.orders[i], isSkipped: true, skipReason: 'Martingale conflict' };
+          this.callbacks.onOrderSkipped?.(order.id, 'Conflict with active martingale').catch(() => {});
           changed = true;
           continue;
         }
@@ -247,20 +268,12 @@ export class ScheduleExecutor {
 
     this.logger.log(`[${this.userId}] 🚀 Execute ${order.time} ${order.trend.toUpperCase()} amount=${amount} step=${step}`);
 
-    // Simpan sebelum placeTrade untuk fallback matching
-    this.executionInfoMap.set(order.id, {
-      orderId: order.id,
-      amount,
-      trend: order.trend,
-      executedAt: Date.now(),
-    });
-
     let tradeData: TradeOrderData;
     try {
       tradeData = this.buildTradeOrder(order.trend, amount, true, order.timeInMillis);
     } catch (err: any) {
       this.logger.error(`[${this.userId}] ❌ Trade timing error: ${err.message}`);
-      this.executionInfoMap.delete(order.id);
+      this.callbacks.onOrderFailed?.(order.id, `Timing error: ${err.message}`).catch(() => {});
       this.callbacks.onLog({
         id: uuidv4(), orderId: order.id, time: order.time,
         trend: order.trend, amount, martingaleStep: step,
@@ -271,14 +284,27 @@ export class ScheduleExecutor {
       return;
     }
 
+    // Calculate estimated completion time for tracking
+    const estimatedCompletionTime = tradeData.expireAt * 1000;
+
     const result = await this.wsClient.placeTrade(tradeData);
     const dealId = result.dealId;
+
+    // Simpan execution info untuk fallback matching
+    this.executionInfoMap.set(order.id, {
+      orderId: order.id,
+      amount,
+      trend: order.trend,
+      executedAt: Date.now(),
+      estimatedCompletionTime,
+    });
 
     // amount_min → stop bot, tidak ada gunanya retry
     if (result.error === 'amount_min') {
       this.logger.error(`[${this.userId}] ❌ Amount di bawah minimum Stockity — bot dihentikan`);
       this.callbacks.onStatusChange('Trade gagal: amount di bawah minimum Stockity. Cek konfigurasi.');
       this.executionInfoMap.delete(order.id);
+      this.callbacks.onOrderFailed?.(order.id, 'Amount di bawah minimum Stockity').catch(() => {});
       this.callbacks.onLog({
         id: uuidv4(), orderId: order.id, time: order.time,
         trend: order.trend, amount, martingaleStep: step,
@@ -286,8 +312,8 @@ export class ScheduleExecutor {
         note: 'Amount di bawah minimum Stockity',
         isDemoAccount: this.config.isDemoAccount,
       });
-      setTimeout(async () => { 
-        this.stop(); 
+      setTimeout(async () => {
+        this.stop();
         try {
           await this.callbacks.onAllCompleted();
         } catch (err: any) {
@@ -303,12 +329,17 @@ export class ScheduleExecutor {
         this.orders[idx] = { ...this.orders[idx], activeDealId: dealId };
         this.callbacks.onOrdersUpdate(this.orders);
       }
+      // Notify tracking service
+      await this.callbacks.onOrderExecuted?.(order.id, dealId, amount, estimatedCompletionTime).catch(() => {});
     } else if (result.error !== 'duplicate') {
       this.logger.error(`[${this.userId}] ❌ Trade failed for ${order.id}`);
       this.executionInfoMap.delete(order.id);
+      this.callbacks.onOrderFailed?.(order.id, result.error || 'Trade failed').catch(() => {});
       if (isAlways) this.advanceAlwaysSignalLoss(order, step, amount);
     } else {
       this.logger.warn(`[${this.userId}] ⚠️ Duplicate deal ${order.id} — menunggu hasil via WS`);
+      // Still notify tracking that order is being monitored
+      await this.callbacks.onOrderExecuted?.(order.id, dealId || 'pending', amount, estimatedCompletionTime).catch(() => {});
     }
 
     this.callbacks.onLog({
@@ -415,13 +446,17 @@ export class ScheduleExecutor {
     const isAlways  = this.config.martingale.isEnabled && this.config.martingale.isAlwaysSignal;
     const isRegular = this.config.martingale.isEnabled && !isAlways && this.config.martingale.maxSteps > 1;
 
-    if (isDraw) { this.completeOrder(orderIdx, 'DRAW', dealId); return; }
+    if (isDraw) {
+      this.completeOrder(orderIdx, 'DRAW', dealId);
+      return;
+    }
 
     if (isWin) {
       if (isAlways) this.alwaysSignalLossState = undefined;
       if (this.activeMartingaleOrderId === order.id) {
         this.activeMartingaleOrderId = undefined;
         this.martingaleStartTime = undefined;
+        this.callbacks.onActiveMartingaleChange?.(null).catch(() => {});
       }
       this.completeOrder(orderIdx, 'WIN', dealId);
     } else {
@@ -486,6 +521,7 @@ export class ScheduleExecutor {
       this.activeMartingaleOrderId = undefined;
       this.martingaleStartTime = undefined;
       this.executionInfoMap.delete(order.id);
+      this.callbacks.onActiveMartingaleChange?.(null).catch(() => {});
       this.completeOrder(orderIdx, 'DRAW', dealId);
       return;
     }
@@ -493,12 +529,14 @@ export class ScheduleExecutor {
       this.activeMartingaleOrderId = undefined;
       this.martingaleStartTime = undefined;
       this.executionInfoMap.delete(order.id);
+      this.callbacks.onActiveMartingaleChange?.(null).catch(() => {});
       this.completeOrder(orderIdx, 'WIN', dealId);
     } else {
       if (step >= max) {
         this.activeMartingaleOrderId = undefined;
         this.martingaleStartTime = undefined;
         this.executionInfoMap.delete(order.id);
+        this.callbacks.onActiveMartingaleChange?.(null).catch(() => {});
         this.completeOrder(orderIdx, 'LOSE', dealId);
       } else {
         const next = step + 1;
@@ -516,6 +554,7 @@ export class ScheduleExecutor {
       amount,
       trend: order.trend,
       executedAt: Date.now(),
+      estimatedCompletionTime: Date.now() + 60000, // Estimasi 60 detik
     });
 
     let tradeData: TradeOrderData;
@@ -543,6 +582,7 @@ export class ScheduleExecutor {
       this.executionInfoMap.delete(order.id);
       this.activeMartingaleOrderId = undefined;
       this.martingaleStartTime = undefined;
+      this.callbacks.onActiveMartingaleChange?.(null).catch(() => {});
       this.callbacks.onLog({
         id: uuidv4(), orderId: order.id, time: order.time, trend: order.trend,
         amount, martingaleStep: step,
@@ -550,8 +590,8 @@ export class ScheduleExecutor {
         note: `Martingale step ${step}: amount di bawah minimum Stockity`,
         isDemoAccount: this.config.isDemoAccount,
       });
-      setTimeout(async () => { 
-        this.stop(); 
+      setTimeout(async () => {
+        this.stop();
         try {
           await this.callbacks.onAllCompleted();
         } catch (err: any) {
@@ -567,10 +607,14 @@ export class ScheduleExecutor {
         this.orders[idx] = { ...this.orders[idx], activeDealId: dealId };
         this.callbacks.onOrdersUpdate(this.orders);
       }
+      // Notify tracking service
+      await this.callbacks.onMartingaleStep?.(order.id, step, amount, dealId).catch(() => {});
     } else if (result.error !== 'duplicate') {
       this.executionInfoMap.delete(order.id);
     } else {
       this.logger.warn(`[${this.userId}] ⚠️ Duplicate martingale deal step ${step} — menunggu hasil via WS`);
+      // Still notify tracking
+      await this.callbacks.onMartingaleStep?.(order.id, step, amount, dealId || 'pending').catch(() => {});
     }
 
     this.callbacks.onLog({
@@ -593,6 +637,16 @@ export class ScheduleExecutor {
     const step = 1;
     this.updateMartingaleStep(orderIdx, step);
     this.placeMartingaleTrade(order, step, this.calcAmount(step));
+
+    // Notify tracking service
+    this.callbacks.onActiveMartingaleChange?.({
+      orderId: order.id,
+      step: 1,
+      maxSteps: this.config.martingale.maxSteps,
+      trend: order.trend,
+      amount: this.calcAmount(1),
+      startedAt: Date.now(),
+    }).catch(() => {});
   }
 
   private updateMartingaleStep(orderIdx: number, step: number) {
@@ -631,6 +685,7 @@ export class ScheduleExecutor {
     if (this.activeMartingaleOrderId === order.id) {
       this.activeMartingaleOrderId = undefined;
       this.martingaleStartTime = undefined;
+      this.callbacks.onActiveMartingaleChange?.(null).catch(() => {});
     }
 
     const profitRate = (this.config.asset.profitRate ?? 85) / 100;
@@ -672,8 +727,11 @@ export class ScheduleExecutor {
       isDemoAccount: this.config.isDemoAccount,
     });
 
-    // Hapus langsung dari list — Firestore hanya menyimpan order yang BELUM selesai
-    // Ini mencegah konflik dedup saat jadwal baru dibuat keesokan harinya
+    // Notify tracking service
+    this.callbacks.onOrderCompleted?.(order.id, result, tradePnL, this.sessionPnL).catch(() => {});
+
+    // Hapus dari active orders list (tapi sudah di-track)
+    // Firestore hanya menyimpan order yang BELUM selesai untuk eksekusi
     this.orders.splice(orderIdx, 1);
     this.callbacks.onOrdersUpdate(this.orders);
 
@@ -695,8 +753,8 @@ export class ScheduleExecutor {
         `sessionPnL=${pnl} <= -${stopLoss} — bot berhenti`,
       );
       this.callbacks.onStatusChange(`Stop Loss triggered (PnL: ${pnl})`);
-      setTimeout(async () => { 
-        this.stop(); 
+      setTimeout(async () => {
+        this.stop();
         try {
           // Guard: hanya panggil onAllCompleted sekali
           if (!this.hasCompleted) {
@@ -717,8 +775,8 @@ export class ScheduleExecutor {
         `sessionPnL=${pnl} >= ${stopProfit} — bot berhenti`,
       );
       this.callbacks.onStatusChange(`Stop Profit triggered (PnL: +${pnl})`);
-      setTimeout(async () => { 
-        this.stop(); 
+      setTimeout(async () => {
+        this.stop();
         try {
           // Guard: hanya panggil onAllCompleted sekali
           if (!this.hasCompleted) {
@@ -737,7 +795,12 @@ export class ScheduleExecutor {
   private checkStuckMartingale(now: number) {
     if (!this.activeMartingaleOrderId) return;
     const idx = this.orders.findIndex(o => o.id === this.activeMartingaleOrderId);
-    if (idx === -1) { this.activeMartingaleOrderId = undefined; this.martingaleStartTime = undefined; return; }
+    if (idx === -1) {
+      this.activeMartingaleOrderId = undefined;
+      this.martingaleStartTime = undefined;
+      this.callbacks.onActiveMartingaleChange?.(null).catch(() => {});
+      return;
+    }
     const o = this.orders[idx];
     const dur      = this.martingaleStartTime ? now - this.martingaleStartTime : 0;
     const stepDur  = o.martingaleState.lastUpdateTime ? now - o.martingaleState.lastUpdateTime : 0;
@@ -759,6 +822,8 @@ export class ScheduleExecutor {
       this.activeMartingaleOrderId = undefined;
       this.martingaleStartTime = undefined;
       this.executionInfoMap.delete(o.id);
+      this.callbacks.onActiveMartingaleChange?.(null).catch(() => {});
+      this.callbacks.onOrderFailed?.(o.id, 'Martingale timeout/stuck').catch(() => {});
       this.callbacks.onOrdersUpdate(this.orders);
     }
   }
@@ -797,6 +862,7 @@ export class ScheduleExecutor {
           `[${this.userId}] ⚠️ Result timeout ${o.time} (${Math.round(waitedMs / 1000)}s) — force remove`,
         );
         this.executionInfoMap.delete(o.id);
+        this.callbacks.onOrderFailed?.(o.id, 'Result timeout').catch(() => {});
         timedOut.push(o.id);
       } else {
         hasAwaiting = true;
@@ -809,8 +875,8 @@ export class ScheduleExecutor {
 
     if (!hasPending && !hasAwaiting && !this.activeMartingaleOrderId && this.orders.length === 0) {
       this.logger.log(`[${this.userId}] ✅ All schedules completed`);
-      setTimeout(async () => { 
-        this.stop(); 
+      setTimeout(async () => {
+        this.stop();
         try {
           if (!this.hasCompleted) {
             this.hasCompleted = true;

@@ -4,13 +4,18 @@ import {
 } from '@nestjs/common';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { ScheduleService } from './schedule.service';
+import { OrderTrackingService } from './order-tracking.service';
 import { AddOrdersDto } from './dto/add-orders.dto';
 import { UpdateScheduleConfigDto } from './dto/update-config.dto';
+import { OrderTrackingFilterDto } from './dto/order-tracking-filter.dto';
 
 @UseGuards(JwtAuthGuard)
 @Controller('schedule')
 export class ScheduleController {
-  constructor(private readonly svc: ScheduleService) {}
+  constructor(
+    private readonly svc: ScheduleService,
+    private readonly trackingService: OrderTrackingService,
+  ) {}
 
   // ── Assets ──────────────────────────────────────────────────────────
   /**
@@ -54,11 +59,15 @@ export class ScheduleController {
   // ── Control ────────────────────────────────────────────────────────
   @Post('start')
   @HttpCode(200)
-  start(@Request() req) { return this.svc.startSchedule(req.user.userId); }
+  async start(@Request() req) {
+    return this.svc.startSchedule(req.user.userId);
+  }
 
   @Post('stop')
   @HttpCode(200)
-  stop(@Request() req) { return this.svc.stopSchedule(req.user.userId); }
+  async stop(@Request() req) {
+    return this.svc.stopSchedule(req.user.userId);
+  }
 
   @Post('pause')
   @HttpCode(200)
@@ -80,4 +89,170 @@ export class ScheduleController {
   @Post('parse')
   @HttpCode(200)
   parse(@Body() dto: AddOrdersDto) { return this.svc.parseInput(dto.input); }
+
+  // ── Order Tracking / Monitoring ────────────────────────────────────
+  /**
+   * GET /schedule/tracking
+   * Get semua order dengan status tracking lengkap.
+   * Response mencakup: PENDING, MONITORING, MARTINGALE_STEP_X, WIN, LOSE, DRAW, FAILED, SKIPPED
+   *
+   * Query Parameters:
+   * - status: Filter berdasarkan status (comma-separated, e.g., "PENDING,MONITORING")
+   * - fromTime: Filter dari timestamp (ms)
+   * - toTime: Filter sampai timestamp (ms)
+   * - onlyActive: true untuk hanya tampilkan order yang masih aktif
+   * - limit: Limit jumlah order
+   */
+  @Get('tracking')
+  async getTracking(
+    @Request() req,
+    @Query() filterDto: OrderTrackingFilterDto,
+  ) {
+    const tracking = await this.trackingService.getTracking(req.user.userId, {
+      status: filterDto.status,
+      fromTime: filterDto.fromTime,
+      toTime: filterDto.toTime,
+      onlyActive: filterDto.onlyActive,
+      limit: filterDto.limit,
+    });
+
+    if (!tracking) {
+      return {
+        userId: req.user.userId,
+        botState: 'STOPPED',
+        orders: [],
+        summary: {
+          total: 0,
+          pending: 0,
+          monitoring: 0,
+          martingaleActive: 0,
+          completed: 0,
+          win: 0,
+          lose: 0,
+          draw: 0,
+          failed: 0,
+          skipped: 0,
+        },
+        activeMartingale: null,
+        sessionPnL: 0,
+        timestamp: Date.now(),
+      };
+    }
+
+    return tracking;
+  }
+
+  /**
+   * GET /schedule/tracking/today
+   * Get tracking untuk hari ini (berdasarkan waktu Jakarta).
+   */
+  @Get('tracking/today')
+  async getTodayTracking(@Request() req) {
+    const tracking = await this.trackingService.getTodayTracking(req.user.userId);
+
+    if (!tracking) {
+      return {
+        userId: req.user.userId,
+        botState: 'STOPPED',
+        orders: [],
+        summary: {
+          total: 0,
+          pending: 0,
+          monitoring: 0,
+          martingaleActive: 0,
+          completed: 0,
+          win: 0,
+          lose: 0,
+          draw: 0,
+          failed: 0,
+          skipped: 0,
+        },
+        activeMartingale: null,
+        sessionPnL: 0,
+        timestamp: Date.now(),
+      };
+    }
+
+    return tracking;
+  }
+
+  /**
+   * GET /schedule/tracking/active
+   * Get hanya order yang masih aktif (PENDING, MONITORING, MARTINGALE).
+   */
+  @Get('tracking/active')
+  async getActiveOrders(@Request() req) {
+    const orders = await this.trackingService.getActiveOrders(req.user.userId);
+    return {
+      userId: req.user.userId,
+      orders,
+      count: orders.length,
+      timestamp: Date.now(),
+    };
+  }
+
+  /**
+   * GET /schedule/tracking/summary
+   * Get ringkasan tracking saja (tanpa detail order).
+   */
+  @Get('tracking/summary')
+  async getTrackingSummary(@Request() req) {
+    const tracking = await this.trackingService.getTracking(req.user.userId);
+
+    if (!tracking) {
+      return {
+        userId: req.user.userId,
+        botState: 'STOPPED',
+        summary: {
+          total: 0,
+          pending: 0,
+          monitoring: 0,
+          martingaleActive: 0,
+          completed: 0,
+          win: 0,
+          lose: 0,
+          draw: 0,
+          failed: 0,
+          skipped: 0,
+        },
+        activeMartingale: null,
+        sessionPnL: 0,
+        timestamp: Date.now(),
+      };
+    }
+
+    return {
+      userId: req.user.userId,
+      botState: tracking.botState,
+      summary: tracking.summary,
+      activeMartingale: tracking.activeMartingale,
+      sessionPnL: tracking.sessionPnL,
+      timestamp: tracking.timestamp,
+    };
+  }
+
+  /**
+   * GET /schedule/tracking/order/:id
+   * Get detail tracking untuk satu order.
+   */
+  @Get('tracking/order/:id')
+  async getOrderTracking(@Request() req, @Param('id') orderId: string) {
+    const tracking = await this.trackingService.getTracking(req.user.userId);
+
+    if (!tracking) {
+      return { error: 'No tracking data found' };
+    }
+
+    const order = tracking.orders.find(o => o.id === orderId);
+
+    if (!order) {
+      return { error: 'Order not found' };
+    }
+
+    return {
+      userId: req.user.userId,
+      order,
+      timestamp: Date.now(),
+    };
+  }
 }

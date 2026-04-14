@@ -1,6 +1,7 @@
 import { Injectable, Logger, OnModuleInit, OnModuleDestroy } from '@nestjs/common';
 import { FirebaseService } from '../firebase/firebase.service';
 import { AuthService } from '../auth/auth.service';
+import { OrderTrackingService } from './order-tracking.service';
 import { StockityWebSocketClient } from './websocket-client';
 import { ScheduleExecutor, ExecutorCallbacks } from './schedule-executor';
 import { UpdateScheduleConfigDto } from './dto/update-config.dto';
@@ -52,6 +53,7 @@ export class ScheduleService implements OnModuleInit, OnModuleDestroy {
   constructor(
     private readonly firebaseService: FirebaseService,
     private readonly authService: AuthService,
+    private readonly trackingService: OrderTrackingService,
   ) {}
 
   async onModuleInit() {
@@ -319,6 +321,12 @@ export class ScheduleService implements OnModuleInit, OnModuleDestroy {
 
     const orders = await this.getOrders(userId);
 
+    // Archive tracking sebelumnya jika ada
+    await this.trackingService.archiveTracking(userId).catch(() => {});
+
+    // Initialize tracking untuk session baru
+    await this.trackingService.initializeTracking(userId, orders);
+
     const ws = new StockityWebSocketClient(
       userId,
       session.stockityToken,
@@ -368,6 +376,7 @@ export class ScheduleService implements OnModuleInit, OnModuleDestroy {
         try {
           // Update status to STOPPED first before cleanup
           await this.updateStatus(userId, 'STOPPED', sessionPnL);
+          await this.trackingService.updateBotState(userId, 'STOPPED');
           this.logger.log(`[${userId}] Status updated to STOPPED`);
           // Small delay to ensure Firestore propagation before cleanup
           await new Promise(r => setTimeout(r, 500));
@@ -378,6 +387,27 @@ export class ScheduleService implements OnModuleInit, OnModuleDestroy {
         this.cleanup(userId);
       },
       onStatusChange: (s) => this.logger.debug(`[${userId}] ${s}`),
+      // Tracking callbacks
+      onOrderExecuted: async (orderId, dealId, amount, estimatedCompletionTime) => {
+        await this.trackingService.markOrderAsExecuted(
+          userId, orderId, dealId, amount, estimatedCompletionTime,
+        );
+      },
+      onMartingaleStep: async (orderId, step, amount, dealId) => {
+        await this.trackingService.updateMartingaleStep(userId, orderId, step, amount, dealId);
+      },
+      onOrderCompleted: async (orderId, result, profit, sessionPnL) => {
+        await this.trackingService.completeOrder(userId, orderId, result, profit, sessionPnL);
+      },
+      onOrderFailed: async (orderId, reason) => {
+        await this.trackingService.markOrderAsFailed(userId, orderId, reason);
+      },
+      onOrderSkipped: async (orderId, reason) => {
+        await this.trackingService.markOrderAsSkipped(userId, orderId, reason);
+      },
+      onActiveMartingaleChange: async (martingaleInfo) => {
+        await this.trackingService.updateActiveMartingale(userId, martingaleInfo);
+      },
     };
 
     const exec = new ScheduleExecutor(userId, ws, callbacks, orders, config);
@@ -385,6 +415,8 @@ export class ScheduleService implements OnModuleInit, OnModuleDestroy {
     exec.start();
 
     await this.updateStatus(userId, 'RUNNING');
+    await this.trackingService.updateBotState(userId, 'RUNNING');
+
     return { message: 'Schedule dimulai', status: exec.getStatus() };
   }
 
@@ -394,6 +426,7 @@ export class ScheduleService implements OnModuleInit, OnModuleDestroy {
     exec.stop();
     await this.saveOrders(userId, exec.getOrders());
     await this.updateStatus(userId, 'STOPPED');
+    await this.trackingService.updateBotState(userId, 'STOPPED');
     // Small delay to ensure Firestore propagation before cleanup
     await new Promise(r => setTimeout(r, 300));
     this.cleanup(userId);
@@ -405,6 +438,7 @@ export class ScheduleService implements OnModuleInit, OnModuleDestroy {
     if (!exec || exec.getBotState() !== 'RUNNING') return { message: 'Schedule tidak berjalan' };
     exec.pause();
     await this.updateStatus(userId, 'PAUSED');
+    await this.trackingService.updateBotState(userId, 'PAUSED');
     return { message: 'Schedule dijeda' };
   }
 
@@ -413,6 +447,7 @@ export class ScheduleService implements OnModuleInit, OnModuleDestroy {
     if (!exec || exec.getBotState() !== 'PAUSED') return { message: 'Schedule tidak dalam kondisi paused', status: {} };
     exec.resume();
     await this.updateStatus(userId, 'RUNNING');
+    await this.trackingService.updateBotState(userId, 'RUNNING');
     return { message: 'Schedule dilanjutkan', status: exec.getStatus() };
   }
 

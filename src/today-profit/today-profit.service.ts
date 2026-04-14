@@ -59,13 +59,10 @@ export class TodayProfitService {
   private readonly MODES = ['schedule', 'fastrade', 'indicator', 'momentum', 'aisignal'];
 
   /**
-   * Firestore path where user Stockity credentials are stored.
-   * Document fields expected: authToken, deviceId, deviceType, timezone?
-   *
-   * The bot saves these when the user connects their Stockity account.
-   * Change this path to match your actual Firestore structure.
+   * Firestore path where user sessions/credentials are stored.
+   * Login (auth.service.ts) saves to `sessions/{userId}` with field `stockityToken`.
    */
-  private readonly CREDENTIALS_COLLECTION = 'user_credentials';
+  private readonly CREDENTIALS_COLLECTION = 'sessions';
 
   constructor(
     private readonly firebaseService: FirebaseService,
@@ -385,26 +382,55 @@ export class TodayProfitService {
   /**
    * Load Stockity credentials from Firestore.
    *
-   * Expected document: `user_credentials/{userId}`
-   * Fields: authToken, deviceId, deviceType, timezone?
+   * Primary source : `sessions/{userId}` (written by auth.service.ts on login)
+   *   Fields: stockityToken, deviceId, deviceType, userTimezone?
    *
-   * The bot should write these when the user configures their Stockity account.
-   * Adjust the collection path if your schema differs.
+   * Fallback source: `user_credentials/{userId}` (legacy / manual config)
+   *   Fields: authToken, deviceId, deviceType, timezone?
    */
   private async loadStockityCredentials(
     userId: string,
   ): Promise<UserStockityCredentials | null> {
     try {
-      const doc = await this.firebaseService.db
-        .collection(this.CREDENTIALS_COLLECTION)
+      // ── Primary: sessions collection (populated on every login) ────────────
+      const sessionDoc = await this.firebaseService.db
+        .collection('sessions')
         .doc(userId)
         .get();
 
-      if (!doc.exists) return null;
+      if (sessionDoc.exists) {
+        const d = sessionDoc.data() as Record<string, any>;
+        const authToken  = d.stockityToken ?? d.authToken ?? '';
+        const deviceId   = d.deviceId   ?? '';
+        const deviceType = d.deviceType ?? 'web';
 
-      const data = doc.data() as Partial<UserStockityCredentials>;
+        if (authToken && deviceId) {
+          this.logger.debug(`[${userId}] Loaded credentials from sessions collection`);
+          return {
+            authToken,
+            deviceId,
+            deviceType,
+            timezone: d.userTimezone ?? d.timezone ?? 'Asia/Jakarta',
+          };
+        }
+
+        this.logger.warn(`[${userId}] Session doc exists but missing token/deviceId fields`);
+      }
+
+      // ── Fallback: user_credentials collection ──────────────────────────────
+      const credDoc = await this.firebaseService.db
+        .collection('user_credentials')
+        .doc(userId)
+        .get();
+
+      if (!credDoc.exists) {
+        this.logger.warn(`[${userId}] No credentials found in sessions or user_credentials`);
+        return null;
+      }
+
+      const data = credDoc.data() as Partial<UserStockityCredentials>;
       if (!data.authToken || !data.deviceId || !data.deviceType) {
-        this.logger.warn(`[${userId}] Incomplete Stockity credentials in Firestore`);
+        this.logger.warn(`[${userId}] Incomplete Stockity credentials in user_credentials`);
         return null;
       }
 

@@ -12,6 +12,20 @@ import { curlGet } from '../common/http-utils';
 const JAKARTA_OFFSET_MS = 7 * 60 * 60 * 1000;
 const BASE_URL = 'https://api.stockity.id';
 
+/**
+ * Debounce interval untuk saveOrders (onOrdersUpdate callback).
+ *
+ * onOrdersUpdate dipanggil dari tick() executor setiap kali ada perubahan order.
+ * Tanpa debounce ini, Firestore akan di-write setiap kali order di-skip/execute
+ * (bisa puluhan kali per detik saat banyak order). Dengan debounce 5s,
+ * write hanya terjadi paling cepat sekali per 5 detik.
+ *
+ * Data yang "ketinggalan" tidak masalah karena:
+ * - State aktual selalu ada di memory (executor)
+ * - Firestore hanya untuk restore session saat crash/restart
+ */
+const SAVE_ORDERS_DEBOUNCE_MS = 5000;
+
 // Type mapping sesuai Kotlin AssetManager
 const TYPE_NAME_MAPPING: Record<number, string> = {
   1: 'Forex',
@@ -50,6 +64,15 @@ export class ScheduleService implements OnModuleInit, OnModuleDestroy {
   private logs = new Map<string, ExecutionLog[]>();
   private configs = new Map<string, ScheduleConfig>();
 
+  /**
+   * Debounce timer untuk saveOrders per userId.
+   * Menyimpan latest orders + timer handle.
+   */
+  private pendingOrdersSave = new Map<string, {
+    orders: ScheduledOrder[];
+    timer: NodeJS.Timeout;
+  }>();
+
   constructor(
     private readonly firebaseService: FirebaseService,
     private readonly authService: AuthService,
@@ -62,6 +85,13 @@ export class ScheduleService implements OnModuleInit, OnModuleDestroy {
   }
 
   async onModuleDestroy() {
+    // Flush semua pending saves sebelum shutdown
+    for (const [userId, pending] of this.pendingOrdersSave) {
+      clearTimeout(pending.timer);
+      await this.saveOrders(userId, pending.orders).catch(() => {});
+    }
+    this.pendingOrdersSave.clear();
+
     for (const [, exec] of this.executors) exec.stop();
     for (const [, ws] of this.wsClients) ws.disconnect();
   }
@@ -94,20 +124,43 @@ export class ScheduleService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
+  // ── Debounced Save Orders ─────────────────────
+
+  /**
+   * Debounced version dari saveOrders.
+   * Hanya tulis ke Firestore setelah SAVE_ORDERS_DEBOUNCE_MS berlalu sejak
+   * panggilan terakhir. Ini mencegah flood write saat banyak order berubah
+   * secara bersamaan (e.g., banyak order expire/skip di awal sesi).
+   */
+  private scheduleSaveOrders(userId: string, orders: ScheduledOrder[]) {
+    const existing = this.pendingOrdersSave.get(userId);
+    if (existing) {
+      clearTimeout(existing.timer);
+    }
+    const timer = setTimeout(async () => {
+      this.pendingOrdersSave.delete(userId);
+      await this.saveOrders(userId, orders).catch(() => {});
+    }, SAVE_ORDERS_DEBOUNCE_MS);
+
+    this.pendingOrdersSave.set(userId, { orders, timer });
+  }
+
+  /**
+   * Flush pending save immediately (dipanggil saat bot stop/pause).
+   */
+  private async flushPendingOrdersSave(userId: string): Promise<void> {
+    const pending = this.pendingOrdersSave.get(userId);
+    if (!pending) return;
+    clearTimeout(pending.timer);
+    this.pendingOrdersSave.delete(userId);
+    await this.saveOrders(userId, pending.orders).catch(() => {});
+  }
+
   // ── Asset Auto-fetch (sesuai Kotlin AssetManager) ─────────────────
 
   /**
    * Fetch daftar asset yang tersedia dari Stockity API menggunakan session user.
    * Identik dengan Kotlin AssetManager.fetchAssetsFromApi() + processAssets().
-   *
-   * Logika profit rate (sama persis dengan Kotlin):
-   *  1. Cari di personal_user_payment_rates dengan trading_type === 'turbo'
-   *  2. Fallback ke trading_tools_settings.ftt.user_statuses.vip.payment_rate_turbo
-   *  3. Fallback ke trading_tools_settings.bo.payment_rate_turbo
-   *  4. Fallback ke trading_tools_settings.payment_rate_turbo
-   *  5. Jika semua null → aset tidak ditampilkan
-   *
-   * Result diurutkan descending berdasarkan profitRate.
    */
   async getAvailableAssets(userId: string): Promise<StockityAsset[]> {
     const session = await this.authService.getSession(userId);
@@ -119,7 +172,7 @@ export class ScheduleService implements OnModuleInit, OnModuleDestroy {
       const resp = await curlGet(
         `${BASE_URL}/bo-assets/v6/assets?locale=id`,
         headers,
-        15, // timeout 15s
+        15,
       );
 
       const rawAssets: any[] = resp.data?.data?.assets || [];
@@ -131,12 +184,10 @@ export class ScheduleService implements OnModuleInit, OnModuleDestroy {
         const assetType: number = asset.type;
         const typeName = TYPE_NAME_MAPPING[assetType] ?? `Type-${assetType}`;
         let iconUrl: string | null = asset.icon?.url ?? null;
-        // Ensure icon URL is absolute
         if (iconUrl && !iconUrl.startsWith('http')) {
           iconUrl = `https://stockity.id${iconUrl.startsWith('/') ? '' : '/'}${iconUrl}`;
         }
 
-        // Cari profit rate — identik dengan Kotlin processAssets()
         let profitRate: number | null = null;
 
         const personalRates: any[] = asset.personal_user_payment_rates || [];
@@ -156,13 +207,11 @@ export class ScheduleService implements OnModuleInit, OnModuleDestroy {
             null;
         }
 
-        // Hanya tambahkan asset yang punya profit rate (sama dengan Kotlin)
         if (profitRate !== null) {
           processed.push({ ric, name, type: assetType, typeName, profitRate, iconUrl });
         }
       }
 
-      // Urutkan descending berdasarkan profitRate (sama dengan Kotlin sortedByDescending)
       processed.sort((a, b) => b.profitRate - a.profitRate);
 
       this.logger.log(`[${userId}] Fetched ${processed.length} assets from Stockity`);
@@ -224,10 +273,7 @@ export class ScheduleService implements OnModuleInit, OnModuleDestroy {
     };
     this.configs.set(userId, cfg);
 
-    // ✅ FIX: Strip class prototype (dari @Type() class-transformer) sebelum simpan ke Firestore.
-    // Firestore menolak object dengan custom prototype (instance class seperti AssetConfigDto).
     const plainCfg = JSON.parse(JSON.stringify(cfg));
-
     await this.firebaseService.db.collection('schedule_configs').doc(userId).set(
       { ...plainCfg, updatedAt: this.firebaseService.FieldValue.serverTimestamp() },
       { merge: true },
@@ -255,7 +301,7 @@ export class ScheduleService implements OnModuleInit, OnModuleDestroy {
     const exec = this.executors.get(userId);
     if (exec) {
       const added = exec.addOrders(orders);
-      await this.saveOrders(userId, exec.getOrders());
+      await this.saveOrders(userId, exec.getOrders()); // immediate save for manual add
       return { added: added.length, errors, message: `${added.length} jadwal ditambahkan` };
     }
 
@@ -271,7 +317,7 @@ export class ScheduleService implements OnModuleInit, OnModuleDestroy {
     const exec = this.executors.get(userId);
     if (exec) {
       exec.removeOrder(orderId);
-      await this.saveOrders(userId, exec.getOrders());
+      await this.saveOrders(userId, exec.getOrders()); // immediate save for manual remove
     } else {
       const orders = (await this.getOrders(userId)).filter(o => o.id !== orderId);
       await this.saveOrders(userId, orders);
@@ -303,14 +349,11 @@ export class ScheduleService implements OnModuleInit, OnModuleDestroy {
 
     const session = await this.authService.getSession(userId);
     if (!session) throw new Error('Session tidak ditemukan. Silakan login ulang.');
-
     if (!session.stockityToken) {
       throw new Error('Token Stockity tidak ditemukan di session. Silakan login ulang.');
     }
 
     const config = await this.getConfig(userId);
-
-    // Validasi: asset harus sudah dikonfigurasi
     if (!config.asset?.ric) {
       throw new Error(
         'Asset belum dikonfigurasi. ' +
@@ -321,10 +364,7 @@ export class ScheduleService implements OnModuleInit, OnModuleDestroy {
 
     const orders = await this.getOrders(userId);
 
-    // Archive tracking sebelumnya jika ada
     await this.trackingService.archiveTracking(userId).catch(() => {});
-
-    // Initialize tracking untuk session baru
     await this.trackingService.initializeTracking(userId, orders);
 
     const ws = new StockityWebSocketClient(
@@ -348,16 +388,17 @@ export class ScheduleService implements OnModuleInit, OnModuleDestroy {
     }
 
     this.wsClients.set(userId, ws);
-
     if (!this.logs.has(userId)) this.logs.set(userId, []);
 
     const callbacks: ExecutorCallbacks = {
-      onOrdersUpdate: async (o) => { await this.saveOrders(userId, o).catch(() => {}); },
+      /**
+       * OPTIMASI: Gunakan debounced save daripada langsung write ke Firestore.
+       * onOrdersUpdate bisa dipanggil berkali-kali per detik dari tick() executor.
+       * Dengan debounce 5s, Firestore hanya di-write setelah 5s idle.
+       */
+      onOrdersUpdate: (o) => { this.scheduleSaveOrders(userId, o); },
       onLog: async (log) => {
         const arr = this.logs.get(userId) || [];
-        // FIX: upsert by id — jika entry dengan ID yang sama sudah ada (execution log),
-        // timpa dengan entry baru (result log). Mencegah duplikasi di in-memory saat
-        // getLogs() dipanggil ketika bot sedang running.
         const existingIdx = arr.findIndex(l => l.id === log.id);
         if (existingIdx !== -1) {
           arr[existingIdx] = log;
@@ -374,24 +415,20 @@ export class ScheduleService implements OnModuleInit, OnModuleDestroy {
         const status = exec?.getStatus() as any;
         const sessionPnL = status?.sessionPnL ?? 0;
         try {
-          // Update status to STOPPED first before cleanup
+          // Flush pending saves dulu sebelum update status STOPPED
+          await this.flushPendingOrdersSave(userId);
           await this.updateStatus(userId, 'STOPPED', sessionPnL);
           await this.trackingService.updateBotState(userId, 'STOPPED');
           this.logger.log(`[${userId}] Status updated to STOPPED`);
-          // Small delay to ensure Firestore propagation before cleanup
           await new Promise(r => setTimeout(r, 500));
         } catch (err: any) {
           this.logger.error(`[${userId}] Failed to update status: ${err.message}`);
         }
-        // Cleanup after status update is confirmed
         this.cleanup(userId);
       },
       onStatusChange: (s) => this.logger.debug(`[${userId}] ${s}`),
-      // Tracking callbacks
       onOrderExecuted: async (orderId, dealId, amount, estimatedCompletionTime) => {
-        await this.trackingService.markOrderAsExecuted(
-          userId, orderId, dealId, amount, estimatedCompletionTime,
-        );
+        await this.trackingService.markOrderAsExecuted(userId, orderId, dealId, amount, estimatedCompletionTime);
       },
       onMartingaleStep: async (orderId, step, amount, dealId) => {
         await this.trackingService.updateMartingaleStep(userId, orderId, step, amount, dealId);
@@ -424,10 +461,11 @@ export class ScheduleService implements OnModuleInit, OnModuleDestroy {
     const exec = this.executors.get(userId);
     if (!exec) return { message: 'Schedule tidak berjalan' };
     exec.stop();
+    // Flush pending saves sebelum save final
+    await this.flushPendingOrdersSave(userId);
     await this.saveOrders(userId, exec.getOrders());
     await this.updateStatus(userId, 'STOPPED');
     await this.trackingService.updateBotState(userId, 'STOPPED');
-    // Small delay to ensure Firestore propagation before cleanup
     await new Promise(r => setTimeout(r, 300));
     this.cleanup(userId);
     return { message: 'Schedule dihentikan' };
@@ -483,8 +521,6 @@ export class ScheduleService implements OnModuleInit, OnModuleDestroy {
       .collection('schedule_logs').doc(userId)
       .collection('entries')
       .orderBy('executedAt', 'desc').limit(limit).get();
-    // FIX: Firestore mengembalikan executedAt sebagai Timestamp object, bukan number.
-    // Konversi ke millis agar frontend tidak menghasilkan "Invalid Date".
     return snap.docs.map(d => {
       const data = d.data() as any;
       return {
@@ -518,7 +554,10 @@ export class ScheduleService implements OnModuleInit, OnModuleDestroy {
         trend: trend as any,
         timeInMillis,
         isExecuted: false, isSkipped: false,
-        martingaleState: { isActive: false, currentStep: 0, maxSteps: 10, isCompleted: false, totalLoss: 0, totalRecovered: 0 },
+        martingaleState: {
+          isActive: false, currentStep: 0, maxSteps: 10,
+          isCompleted: false, totalLoss: 0, totalRecovered: 0,
+        },
       });
     }
     orders.sort((a, b) => a.timeInMillis - b.timeInMillis);
@@ -557,6 +596,12 @@ export class ScheduleService implements OnModuleInit, OnModuleDestroy {
   }
 
   private cleanup(userId: string) {
+    // Bersihkan pending saves timer
+    const pending = this.pendingOrdersSave.get(userId);
+    if (pending) {
+      clearTimeout(pending.timer);
+      this.pendingOrdersSave.delete(userId);
+    }
     this.wsClients.get(userId)?.disconnect();
     this.wsClients.delete(userId);
     this.executors.delete(userId);

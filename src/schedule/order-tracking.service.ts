@@ -12,17 +12,117 @@ import {
 
 /**
  * Service untuk tracking dan monitoring order mode signal.
- * Menyimpan history order lengkap dengan status tracking di Firestore.
+ *
+ * OPTIMASI QUOTA FIRESTORE:
+ * - Semua state tracking disimpan di in-memory cache terlebih dahulu
+ * - Flush ke Firestore dilakukan secara throttled (max sekali per FLUSH_INTERVAL_MS)
+ * - Terminal events (WIN/LOSE/DRAW/FAILED/SKIPPED) langsung flush tanpa delay
+ * - Mencegah RESOURCE_EXHAUSTED akibat terlalu banyak write per detik
  */
 @Injectable()
 export class OrderTrackingService {
   private readonly logger = new Logger(OrderTrackingService.name);
 
+  /**
+   * In-memory cache untuk tracking data.
+   * Key = userId, Value = { data, dirty, lastFlush }
+   */
+  private cache = new Map<string, {
+    data: any;
+    dirty: boolean;
+    lastFlush: number;
+  }>();
+
+  /**
+   * Throttle: flush ke Firestore paling cepat sekali per interval ini
+   * untuk event non-terminal (MONITORING, MARTINGALE_STEP_X).
+   */
+  private readonly FLUSH_INTERVAL_MS = 4000;
+
+  /**
+   * Event dengan status terminal → langsung flush tanpa throttle.
+   */
+  private readonly TERMINAL_STATUSES = new Set(['WIN', 'LOSE', 'DRAW', 'FAILED', 'SKIPPED']);
+
   constructor(private readonly firebaseService: FirebaseService) {}
+
+  // ── Private Cache Helpers ──────────────────────────────────────────
+
+  /**
+   * Load data dari Firestore ke cache jika belum ada.
+   */
+  private async loadCache(userId: string): Promise<any | null> {
+    if (this.cache.has(userId)) {
+      return this.cache.get(userId)!.data;
+    }
+    const doc = await this.firebaseService.db.collection('order_tracking').doc(userId).get();
+    if (!doc.exists) return null;
+    const data = doc.data();
+    this.cache.set(userId, { data, dirty: false, lastFlush: Date.now() });
+    return data;
+  }
+
+  /**
+   * Set cache entry dan tandai sebagai dirty.
+   */
+  private setCache(userId: string, data: any) {
+    const existing = this.cache.get(userId);
+    this.cache.set(userId, {
+      data,
+      dirty: true,
+      lastFlush: existing?.lastFlush ?? 0,
+    });
+  }
+
+  /**
+   * Flush cache ke Firestore.
+   * @param force - Jika true, flush tanpa cek throttle interval (untuk terminal events)
+   */
+  private async flushCache(userId: string, force = false): Promise<void> {
+    const entry = this.cache.get(userId);
+    if (!entry || !entry.dirty) return;
+
+    const now = Date.now();
+    const timeSinceLastFlush = now - entry.lastFlush;
+
+    // Throttle: skip flush jika interval belum cukup dan bukan force
+    if (!force && timeSinceLastFlush < this.FLUSH_INTERVAL_MS) {
+      return;
+    }
+
+    try {
+      // Strip FieldValue sentinels dari data cache sebelum disimpan
+      const dataToSave = this.stripCacheForFirestore(entry.data);
+
+      await this.firebaseService.db
+        .collection('order_tracking')
+        .doc(userId)
+        .set({
+          ...dataToSave,
+          updatedAt: this.firebaseService.FieldValue.serverTimestamp(),
+        });
+
+      entry.dirty = false;
+      entry.lastFlush = now;
+    } catch (error: any) {
+      this.logger.error(`[${userId}] Flush cache failed: ${error.message}`);
+    }
+  }
+
+  /**
+   * Hapus field yang tidak bisa di-serialize ke Firestore dari cache data.
+   */
+  private stripCacheForFirestore(data: any): any {
+    if (!data) return data;
+    const { updatedAt, startedAt, stoppedAt, archivedAt, ...rest } = data;
+    return rest;
+  }
+
+  // ── Public Methods ─────────────────────────────────────────────────
 
   /**
    * Inisialisasi tracking untuk session baru.
-   * Dipanggil saat schedule dimulai.
+   * Selalu flush langsung karena ini adalah event kritis.
    */
   async initializeTracking(userId: string, orders: ScheduledOrder[]): Promise<void> {
     const trackedOrders: TrackedOrder[] = orders.map(order => ({
@@ -36,20 +136,29 @@ export class OrderTrackingService {
       botState: 'RUNNING' as BotState,
       orders: trackedOrders,
       sessionPnL: 0,
-      startedAt: this.firebaseService.FieldValue.serverTimestamp(),
-      updatedAt: this.firebaseService.FieldValue.serverTimestamp(),
     };
 
+    // Simpan ke cache dan langsung flush (init selalu force)
+    this.setCache(userId, trackingData);
     await this.firebaseService.db
       .collection('order_tracking')
       .doc(userId)
-      .set(trackingData);
+      .set({
+        ...trackingData,
+        startedAt: this.firebaseService.FieldValue.serverTimestamp(),
+        updatedAt: this.firebaseService.FieldValue.serverTimestamp(),
+      });
+
+    // Update cache lastFlush
+    const entry = this.cache.get(userId);
+    if (entry) { entry.dirty = false; entry.lastFlush = Date.now(); }
 
     this.logger.log(`[${userId}] Tracking initialized with ${orders.length} orders`);
   }
 
   /**
    * Update status order saat dieksekusi.
+   * Non-terminal → throttled flush.
    */
   async markOrderAsExecuted(
     userId: string,
@@ -58,36 +167,28 @@ export class OrderTrackingService {
     amount: number,
     estimatedCompletionTime: number,
   ): Promise<void> {
-    const docRef = this.firebaseService.db.collection('order_tracking').doc(userId);
-
     try {
-      await this.firebaseService.db.runTransaction(async (transaction) => {
-        const doc = await transaction.get(docRef);
-        if (!doc.exists) return;
+      let data = await this.loadCache(userId);
+      if (!data) return;
 
-        const data = doc.data();
-        const orders: TrackedOrder[] = data?.orders || [];
-        const orderIndex = orders.findIndex(o => o.id === orderId);
+      const orders: TrackedOrder[] = [...(data.orders || [])];
+      const orderIndex = orders.findIndex(o => o.id === orderId);
+      if (orderIndex === -1) return;
 
-        if (orderIndex === -1) return;
+      orders[orderIndex] = {
+        ...orders[orderIndex],
+        isExecuted: true,
+        trackingStatus: 'MONITORING',
+        activeDealId: dealId,
+        dealId: dealId,
+        amount: amount,
+        executedAt: Date.now(),
+        estimatedCompletionTime: estimatedCompletionTime,
+        currentMartingaleStep: 0,
+      };
 
-        orders[orderIndex] = {
-          ...orders[orderIndex],
-          isExecuted: true,
-          trackingStatus: 'MONITORING',
-          activeDealId: dealId,
-          dealId: dealId,
-          amount: amount,
-          executedAt: Date.now(),
-          estimatedCompletionTime: estimatedCompletionTime,
-          currentMartingaleStep: 0,
-        };
-
-        transaction.update(docRef, {
-          orders,
-          updatedAt: this.firebaseService.FieldValue.serverTimestamp(),
-        });
-      });
+      this.setCache(userId, { ...data, orders });
+      await this.flushCache(userId, false); // throttled
 
       this.logger.log(`[${userId}] Order ${orderId} marked as MONITORING`);
     } catch (error: any) {
@@ -97,6 +198,7 @@ export class OrderTrackingService {
 
   /**
    * Update status order saat martingale step berubah.
+   * Non-terminal → throttled flush.
    */
   async updateMartingaleStep(
     userId: string,
@@ -105,8 +207,6 @@ export class OrderTrackingService {
     amount: number,
     dealId?: string,
   ): Promise<void> {
-    const docRef = this.firebaseService.db.collection('order_tracking').doc(userId);
-
     const martingaleStatusMap: Record<number, OrderTrackingStatus> = {
       1: 'MARTINGALE_STEP_1',
       2: 'MARTINGALE_STEP_2',
@@ -114,41 +214,23 @@ export class OrderTrackingService {
       4: 'MARTINGALE_STEP_4',
       5: 'MARTINGALE_STEP_5',
     };
-
     const trackingStatus = martingaleStatusMap[step] || `MARTINGALE_STEP_${Math.min(step, 5)}` as OrderTrackingStatus;
 
     try {
-      await this.firebaseService.db.runTransaction(async (transaction) => {
-        const doc = await transaction.get(docRef);
-        if (!doc.exists) return;
+      let data = await this.loadCache(userId);
+      if (!data) return;
 
-        const data = doc.data();
-        const orders: TrackedOrder[] = data?.orders || [];
-        const orderIndex = orders.findIndex(o => o.id === orderId);
+      const orders: TrackedOrder[] = [...(data.orders || [])];
+      const orderIndex = orders.findIndex(o => o.id === orderId);
+      if (orderIndex === -1) return;
 
-        if (orderIndex === -1) return;
+      const update: Partial<TrackedOrder> = { trackingStatus, currentMartingaleStep: step, amount };
+      if (dealId) { update.dealId = dealId; update.activeDealId = dealId; }
 
-        const update: Partial<TrackedOrder> = {
-          trackingStatus,
-          currentMartingaleStep: step,
-          amount: amount,
-        };
+      orders[orderIndex] = { ...orders[orderIndex], ...update };
 
-        if (dealId) {
-          update.dealId = dealId;
-          update.activeDealId = dealId;
-        }
-
-        orders[orderIndex] = {
-          ...orders[orderIndex],
-          ...update,
-        };
-
-        transaction.update(docRef, {
-          orders,
-          updatedAt: this.firebaseService.FieldValue.serverTimestamp(),
-        });
-      });
+      this.setCache(userId, { ...data, orders });
+      await this.flushCache(userId, false); // throttled
 
       this.logger.log(`[${userId}] Order ${orderId} martingale step ${step}`);
     } catch (error: any) {
@@ -158,6 +240,7 @@ export class OrderTrackingService {
 
   /**
    * Complete order dengan hasil WIN, LOSE, atau DRAW.
+   * Terminal event → langsung flush.
    */
   async completeOrder(
     userId: string,
@@ -166,44 +249,33 @@ export class OrderTrackingService {
     profit: number,
     sessionPnL: number,
   ): Promise<void> {
-    const docRef = this.firebaseService.db.collection('order_tracking').doc(userId);
-
     const statusMap: Record<string, OrderTrackingStatus> = {
-      WIN: 'WIN',
-      LOSE: 'LOSE',
-      DRAW: 'DRAW',
+      WIN: 'WIN', LOSE: 'LOSE', DRAW: 'DRAW',
     };
 
     try {
-      await this.firebaseService.db.runTransaction(async (transaction) => {
-        const doc = await transaction.get(docRef);
-        if (!doc.exists) return;
+      let data = await this.loadCache(userId);
+      if (!data) return;
 
-        const data = doc.data();
-        const orders: TrackedOrder[] = data?.orders || [];
-        const orderIndex = orders.findIndex(o => o.id === orderId);
+      const orders: TrackedOrder[] = [...(data.orders || [])];
+      const orderIndex = orders.findIndex(o => o.id === orderId);
+      if (orderIndex === -1) return;
 
-        if (orderIndex === -1) return;
+      orders[orderIndex] = {
+        ...orders[orderIndex],
+        trackingStatus: statusMap[result],
+        result: result,
+        profit: profit,
+        completedAt: Date.now(),
+        martingaleState: {
+          ...orders[orderIndex].martingaleState,
+          isCompleted: true,
+          finalResult: result,
+        },
+      };
 
-        orders[orderIndex] = {
-          ...orders[orderIndex],
-          trackingStatus: statusMap[result],
-          result: result,
-          profit: profit,
-          completedAt: Date.now(),
-          martingaleState: {
-            ...orders[orderIndex].martingaleState,
-            isCompleted: true,
-            finalResult: result,
-          },
-        };
-
-        transaction.update(docRef, {
-          orders,
-          sessionPnL,
-          updatedAt: this.firebaseService.FieldValue.serverTimestamp(),
-        });
-      });
+      this.setCache(userId, { ...data, orders, sessionPnL });
+      await this.flushCache(userId, true); // force flush — terminal event
 
       this.logger.log(`[${userId}] Order ${orderId} completed: ${result} (profit: ${profit})`);
     } catch (error: any) {
@@ -213,38 +285,27 @@ export class OrderTrackingService {
 
   /**
    * Mark order sebagai FAILED.
+   * Terminal event → langsung flush.
    */
-  async markOrderAsFailed(
-    userId: string,
-    orderId: string,
-    reason: string,
-  ): Promise<void> {
-    const docRef = this.firebaseService.db.collection('order_tracking').doc(userId);
-
+  async markOrderAsFailed(userId: string, orderId: string, reason: string): Promise<void> {
     try {
-      await this.firebaseService.db.runTransaction(async (transaction) => {
-        const doc = await transaction.get(docRef);
-        if (!doc.exists) return;
+      let data = await this.loadCache(userId);
+      if (!data) return;
 
-        const data = doc.data();
-        const orders: TrackedOrder[] = data?.orders || [];
-        const orderIndex = orders.findIndex(o => o.id === orderId);
+      const orders: TrackedOrder[] = [...(data.orders || [])];
+      const orderIndex = orders.findIndex(o => o.id === orderId);
+      if (orderIndex === -1) return;
 
-        if (orderIndex === -1) return;
+      orders[orderIndex] = {
+        ...orders[orderIndex],
+        trackingStatus: 'FAILED',
+        result: 'FAILED',
+        completedAt: Date.now(),
+        skipReason: reason,
+      };
 
-        orders[orderIndex] = {
-          ...orders[orderIndex],
-          trackingStatus: 'FAILED',
-          result: 'FAILED',
-          completedAt: Date.now(),
-          skipReason: reason,
-        };
-
-        transaction.update(docRef, {
-          orders,
-          updatedAt: this.firebaseService.FieldValue.serverTimestamp(),
-        });
-      });
+      this.setCache(userId, { ...data, orders });
+      await this.flushCache(userId, true); // force flush — terminal event
 
       this.logger.log(`[${userId}] Order ${orderId} marked as FAILED: ${reason}`);
     } catch (error: any) {
@@ -254,39 +315,28 @@ export class OrderTrackingService {
 
   /**
    * Mark order sebagai SKIPPED.
+   * Terminal event → langsung flush.
    */
-  async markOrderAsSkipped(
-    userId: string,
-    orderId: string,
-    reason: string,
-  ): Promise<void> {
-    const docRef = this.firebaseService.db.collection('order_tracking').doc(userId);
-
+  async markOrderAsSkipped(userId: string, orderId: string, reason: string): Promise<void> {
     try {
-      await this.firebaseService.db.runTransaction(async (transaction) => {
-        const doc = await transaction.get(docRef);
-        if (!doc.exists) return;
+      let data = await this.loadCache(userId);
+      if (!data) return;
 
-        const data = doc.data();
-        const orders: TrackedOrder[] = data?.orders || [];
-        const orderIndex = orders.findIndex(o => o.id === orderId);
+      const orders: TrackedOrder[] = [...(data.orders || [])];
+      const orderIndex = orders.findIndex(o => o.id === orderId);
+      if (orderIndex === -1) return;
 
-        if (orderIndex === -1) return;
+      orders[orderIndex] = {
+        ...orders[orderIndex],
+        isSkipped: true,
+        trackingStatus: 'SKIPPED',
+        result: 'SKIPPED',
+        completedAt: Date.now(),
+        skipReason: reason,
+      };
 
-        orders[orderIndex] = {
-          ...orders[orderIndex],
-          isSkipped: true,
-          trackingStatus: 'SKIPPED',
-          result: 'SKIPPED',
-          completedAt: Date.now(),
-          skipReason: reason,
-        };
-
-        transaction.update(docRef, {
-          orders,
-          updatedAt: this.firebaseService.FieldValue.serverTimestamp(),
-        });
-      });
+      this.setCache(userId, { ...data, orders });
+      await this.flushCache(userId, true); // force flush — terminal event
 
       this.logger.log(`[${userId}] Order ${orderId} marked as SKIPPED: ${reason}`);
     } catch (error: any) {
@@ -296,21 +346,22 @@ export class OrderTrackingService {
 
   /**
    * Update bot state.
+   * State change → langsung flush (kritis untuk restore session).
    */
   async updateBotState(userId: string, botState: BotState): Promise<void> {
-    const docRef = this.firebaseService.db.collection('order_tracking').doc(userId);
-
-    const update: any = {
-      botState,
-      updatedAt: this.firebaseService.FieldValue.serverTimestamp(),
-    };
-
-    if (botState === 'STOPPED') {
-      update.stoppedAt = this.firebaseService.FieldValue.serverTimestamp();
-    }
-
     try {
-      await docRef.set(update, { merge: true });
+      let data = await this.loadCache(userId);
+      const updatedData = data
+        ? { ...data, botState }
+        : { userId, botState, orders: [], sessionPnL: 0 };
+
+      this.setCache(userId, updatedData);
+      await this.flushCache(userId, true); // force flush — state change kritis
+
+      // Hapus cache saat STOPPED agar tidak stale di memory
+      if (botState === 'STOPPED') {
+        this.cache.delete(userId);
+      }
     } catch (error: any) {
       this.logger.error(`[${userId}] Failed to update bot state: ${error.message}`);
     }
@@ -318,6 +369,7 @@ export class OrderTrackingService {
 
   /**
    * Update active martingale info.
+   * Throttled — bisa sering dipanggil dari executor.
    */
   async updateActiveMartingale(
     userId: string,
@@ -330,16 +382,12 @@ export class OrderTrackingService {
       startedAt: number;
     } | null,
   ): Promise<void> {
-    const docRef = this.firebaseService.db.collection('order_tracking').doc(userId);
-
     try {
-      await docRef.set(
-        {
-          activeMartingale: martingaleInfo,
-          updatedAt: this.firebaseService.FieldValue.serverTimestamp(),
-        },
-        { merge: true },
-      );
+      let data = await this.loadCache(userId);
+      if (!data) return;
+
+      this.setCache(userId, { ...data, activeMartingale: martingaleInfo });
+      await this.flushCache(userId, false); // throttled
     } catch (error: any) {
       this.logger.error(`[${userId}] Failed to update active martingale: ${error.message}`);
     }
@@ -347,18 +395,16 @@ export class OrderTrackingService {
 
   /**
    * Get tracking data dengan filter.
+   * Selalu baca dari cache jika ada (tidak perlu hit Firestore).
    */
   async getTracking(
     userId: string,
     filter?: OrderTrackingFilter,
   ): Promise<OrderTrackingResponse | null> {
-    const doc = await this.firebaseService.db.collection('order_tracking').doc(userId).get();
+    // Coba ambil dari cache dulu, fallback ke Firestore
+    let data = await this.loadCache(userId);
+    if (!data) return null;
 
-    if (!doc.exists) {
-      return null;
-    }
-
-    const data = doc.data();
     let orders: TrackedOrder[] = data?.orders || [];
     const now = Date.now();
 
@@ -378,20 +424,20 @@ export class OrderTrackingService {
       if (filter.status && filter.status.length > 0) {
         orders = orders.filter(o => filter.status!.includes(o.trackingStatus));
       }
-
       if (filter.fromTime) {
         orders = orders.filter(o => o.timeInMillis >= filter.fromTime!);
       }
-
       if (filter.toTime) {
         orders = orders.filter(o => o.timeInMillis <= filter.toTime!);
       }
-
       if (filter.onlyActive) {
-        const activeStatuses: OrderTrackingStatus[] = ['PENDING', 'MONITORING', 'MARTINGALE_STEP_1', 'MARTINGALE_STEP_2', 'MARTINGALE_STEP_3', 'MARTINGALE_STEP_4', 'MARTINGALE_STEP_5'];
+        const activeStatuses: OrderTrackingStatus[] = [
+          'PENDING', 'MONITORING',
+          'MARTINGALE_STEP_1', 'MARTINGALE_STEP_2', 'MARTINGALE_STEP_3',
+          'MARTINGALE_STEP_4', 'MARTINGALE_STEP_5',
+        ];
         orders = orders.filter(o => activeStatuses.includes(o.trackingStatus));
       }
-
       if (filter.limit && filter.limit > 0) {
         orders = orders.slice(0, filter.limit);
       }
@@ -400,17 +446,12 @@ export class OrderTrackingService {
     // Sort by time
     orders.sort((a, b) => a.timeInMillis - b.timeInMillis);
 
-    // Calculate summary
     const summary = {
       total: orders.length,
       pending: orders.filter(o => o.trackingStatus === 'PENDING').length,
       monitoring: orders.filter(o => o.trackingStatus === 'MONITORING').length,
-      martingaleActive: orders.filter(o =>
-        o.trackingStatus.startsWith('MARTINGALE_STEP'),
-      ).length,
-      completed: orders.filter(o =>
-        ['WIN', 'LOSE', 'DRAW'].includes(o.trackingStatus),
-      ).length,
+      martingaleActive: orders.filter(o => o.trackingStatus.startsWith('MARTINGALE_STEP')).length,
+      completed: orders.filter(o => ['WIN', 'LOSE', 'DRAW'].includes(o.trackingStatus)).length,
       win: orders.filter(o => o.trackingStatus === 'WIN').length,
       lose: orders.filter(o => o.trackingStatus === 'LOSE').length,
       draw: orders.filter(o => o.trackingStatus === 'DRAW').length,
@@ -438,14 +479,11 @@ export class OrderTrackingService {
     const startOfDay = new Date(jakartaNow);
     startOfDay.setHours(0, 0, 0, 0);
     const startOfDayUtc = startOfDay.getTime() - JAKARTA_OFFSET_MS;
-
-    return this.getTracking(userId, {
-      fromTime: startOfDayUtc,
-    });
+    return this.getTracking(userId, { fromTime: startOfDayUtc });
   }
 
   /**
-   * Get only active orders (yang masih berjalan).
+   * Get only active orders.
    */
   async getActiveOrders(userId: string): Promise<TrackedOrder[]> {
     const tracking = await this.getTracking(userId, { onlyActive: true });
@@ -453,28 +491,30 @@ export class OrderTrackingService {
   }
 
   /**
-   * Clear tracking data (dipanggil saat session baru dimulai).
+   * Clear tracking data dan cache.
    */
   async clearTracking(userId: string): Promise<void> {
+    this.cache.delete(userId);
     await this.firebaseService.db.collection('order_tracking').doc(userId).delete();
     this.logger.log(`[${userId}] Tracking cleared`);
   }
 
   /**
    * Archive tracking data ke history collection.
+   * Flush cache terlebih dahulu sebelum archive.
    */
   async archiveTracking(userId: string): Promise<void> {
-    const doc = await this.firebaseService.db.collection('order_tracking').doc(userId).get();
+    // Flush cache dulu agar data di Firestore up-to-date
+    await this.flushCache(userId, true);
+    this.cache.delete(userId);
 
+    const doc = await this.firebaseService.db.collection('order_tracking').doc(userId).get();
     if (!doc.exists) return;
 
-    const data = doc.data();
     const archiveData = {
-      ...data,
+      ...doc.data(),
       archivedAt: this.firebaseService.FieldValue.serverTimestamp(),
     };
-
-    // Simpan ke history dengan timestamp sebagai ID
     const historyId = `${userId}_${Date.now()}`;
     await this.firebaseService.db
       .collection('order_tracking_history')

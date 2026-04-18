@@ -48,9 +48,26 @@ interface MergedTrade {
 
 // ─── Service ──────────────────────────────────────────────────────────────────
 
+/** Cached Stockity API result per user */
+interface StockityCache {
+  deals: StockityDeal[];
+  hadErrors: boolean;
+  fetchedAt: number;
+  accountType: string;
+  dateStr: string;
+}
+
 @Injectable()
 export class TodayProfitService {
   private readonly logger = new Logger(TodayProfitService.name);
+
+  /**
+   * In-memory per-user cache for Stockity API results.
+   * TTL: 25s — avoids hammering Stockity on every /realtime poll.
+   * Cache invalidated when day changes or accountType changes.
+   */
+  private readonly stockityCache = new Map<string, StockityCache>();
+  private readonly STOCKITY_CACHE_TTL_MS = 25_000;
 
   /**
    * Trading modes tracked via Firebase mode logs.
@@ -133,9 +150,51 @@ export class TodayProfitService {
     return results;
   }
 
-  /** Real-time proxy — delegates to getTodayProfit for now. */
+  /**
+   * Realtime proxy — uses CACHED Stockity data + fresh Firebase data.
+   * This is fast (~200ms) because it skips the slow Stockity API fetch.
+   * Cache is populated/refreshed by getTodayProfit() every 25s or on demand.
+   */
   async getRealtimeProfit(userId: string): Promise<Partial<TodayProfitSummary>> {
-    return this.getTodayProfit(userId);
+    const targetDate = this.getTodayDateString();
+    const { startOfDay, endOfDay } = this.getDayBoundaries(targetDate);
+
+    const { firebaseTrades, knownUuids, knownNumericIds } =
+      await this.collectFirebaseTrades(userId, startOfDay, endOfDay);
+
+    // Use cached Stockity data if available — skip live API call
+    const cached = this.stockityCache.get(userId);
+    const cacheValid = cached &&
+      cached.dateStr === targetDate &&
+      (Date.now() - cached.fetchedAt) < this.STOCKITY_CACHE_TTL_MS;
+
+    let stockityTrades: MergedTrade[] = [];
+    if (cacheValid && cached) {
+      this.logger.debug(`[${userId}] /realtime using cached Stockity data (age=${Math.round((Date.now()-cached.fetchedAt)/1000)}s)`);
+      for (const deal of cached.deals) {
+        if (knownUuids.has(deal.uuid) || knownNumericIds.has(String(deal.id))) continue;
+        knownUuids.add(deal.uuid);
+        knownNumericIds.add(String(deal.id));
+        stockityTrades.push({
+          source: 'stockity',
+          result: StockityHistoryService.mapStatus(deal),
+          profit: StockityHistoryService.netProfit(deal),
+          ric: deal.asset_ric,
+          assetName: deal.asset_name,
+          mode: `stockity_real`,
+          dealUuid: deal.uuid,
+          dealNumericId: String(deal.id),
+        });
+      }
+    }
+
+    const allTrades: MergedTrade[] = [...firebaseTrades, ...stockityTrades];
+    return this.buildSummary(targetDate, allTrades, {
+      firebaseTrades: firebaseTrades.length,
+      stockityOnlyTrades: stockityTrades.length,
+      stockityCredentialsFound: !!cached,
+      stockityApiError: cached?.hadErrors ?? false,
+    });
   }
 
   // ── Firebase collection ─────────────────────────────────────────────────────
@@ -247,6 +306,7 @@ export class TodayProfitService {
       accountType === 'both' ? ['real', 'demo'] : [accountType];
 
     const stockityTrades: MergedTrade[] = [];
+    const rawDealsForCache: StockityDeal[] = [];
     let hadErrors = false;
 
     for (const type of types) {
@@ -258,6 +318,9 @@ export class TodayProfitService {
       );
 
       if (result.hadErrors) hadErrors = true;
+
+      // ── Save raw deals to cache (all deals, before dedup filter) ───────────
+      rawDealsForCache.push(...result.deals);
 
       for (const deal of result.deals) {
         // ── Deduplication ───────────────────────────────────────────────────
@@ -285,6 +348,17 @@ export class TodayProfitService {
         });
       }
     }
+
+    // ── Update per-user cache with fresh Stockity data ─────────────────────
+    const dateStr = new Date(startOfDay).toISOString().split('T')[0];
+    this.stockityCache.set(userId, {
+      deals: rawDealsForCache,
+      hadErrors,
+      fetchedAt: Date.now(),
+      accountType,
+      dateStr,
+    });
+    this.logger.debug(`[${userId}] Stockity cache updated: ${rawDealsForCache.length} deals, date=${dateStr}`);
 
     return {
       stockityTrades,
@@ -382,55 +456,26 @@ export class TodayProfitService {
   /**
    * Load Stockity credentials from Firestore.
    *
-   * Primary source : `sessions/{userId}` (written by auth.service.ts on login)
-   *   Fields: stockityToken, deviceId, deviceType, userTimezone?
+   * Expected document: `user_credentials/{userId}`
+   * Fields: authToken, deviceId, deviceType, timezone?
    *
-   * Fallback source: `user_credentials/{userId}` (legacy / manual config)
-   *   Fields: authToken, deviceId, deviceType, timezone?
+   * The bot should write these when the user configures their Stockity account.
+   * Adjust the collection path if your schema differs.
    */
   private async loadStockityCredentials(
     userId: string,
   ): Promise<UserStockityCredentials | null> {
     try {
-      // ── Primary: sessions collection (populated on every login) ────────────
-      const sessionDoc = await this.firebaseService.db
-        .collection('sessions')
+      const doc = await this.firebaseService.db
+        .collection(this.CREDENTIALS_COLLECTION)
         .doc(userId)
         .get();
 
-      if (sessionDoc.exists) {
-        const d = sessionDoc.data() as Record<string, any>;
-        const authToken  = d.stockityToken ?? d.authToken ?? '';
-        const deviceId   = d.deviceId   ?? '';
-        const deviceType = d.deviceType ?? 'web';
+      if (!doc.exists) return null;
 
-        if (authToken && deviceId) {
-          this.logger.debug(`[${userId}] Loaded credentials from sessions collection`);
-          return {
-            authToken,
-            deviceId,
-            deviceType,
-            timezone: d.userTimezone ?? d.timezone ?? 'Asia/Jakarta',
-          };
-        }
-
-        this.logger.warn(`[${userId}] Session doc exists but missing token/deviceId fields`);
-      }
-
-      // ── Fallback: user_credentials collection ──────────────────────────────
-      const credDoc = await this.firebaseService.db
-        .collection('user_credentials')
-        .doc(userId)
-        .get();
-
-      if (!credDoc.exists) {
-        this.logger.warn(`[${userId}] No credentials found in sessions or user_credentials`);
-        return null;
-      }
-
-      const data = credDoc.data() as Partial<UserStockityCredentials>;
+      const data = doc.data() as Partial<UserStockityCredentials>;
       if (!data.authToken || !data.deviceId || !data.deviceType) {
-        this.logger.warn(`[${userId}] Incomplete Stockity credentials in user_credentials`);
+        this.logger.warn(`[${userId}] Incomplete Stockity credentials in Firestore`);
         return null;
       }
 

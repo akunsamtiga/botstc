@@ -933,7 +933,10 @@ export class MomentumService implements OnModuleDestroy {
             this.logger.log(`[${userId}] ✅ Always Signal WIN at step ${step}`);
             mode.alwaysSignalLossState = null;
           } else {
-            mode.totalLosses++;
+            // Count loss only when this is the final step (sequence failed)
+            if (step >= config.martingale.maxSteps) {
+              mode.totalLosses++;
+            }
             const nextStep = step + 1;
             if (nextStep > config.martingale.maxSteps) {
               this.logger.log(`[${userId}] Always Signal: Max steps reached`);
@@ -981,8 +984,23 @@ export class MomentumService implements OnModuleDestroy {
       : isDraw ? 0 : -matchedLog.amount;
 
     mode.sessionPnL += profit;
-    if (isWin) mode.totalWins++;
-    else if (!isDraw) mode.totalLosses++;
+
+    const config = await this.getConfig(userId);
+
+    // Martingale-aware stats counter (sequence-level wins/losses):
+    //   - WIN anywhere              → totalWins+1
+    //   - LOSE mid-sequence         → skip (step < maxSteps, sequence continues)
+    //   - LOSE at last step         → totalLosses+1 (sequence failed)
+    //   - No martingale             → same as before
+    {
+      const _m = config.martingale;
+      const _mEnabled = _m.isEnabled && _m.maxSteps > 0;
+      const _midSeqLoss = _mEnabled && !isWin && !isDraw && matchedLog.martingaleStep < _m.maxSteps;
+      if (!_midSeqLoss) {
+        if (isWin) mode.totalWins++;
+        else if (!isDraw) mode.totalLosses++;
+      }
+    }
 
     this.updateLog(userId, matchedLog.orderId, {
       result: isWin ? 'WIN' : isDraw ? 'DRAW' : 'LOSE',
@@ -1002,8 +1020,6 @@ export class MomentumService implements OnModuleDestroy {
       `[${userId}] WS deal result: dealId=${payload.numericId ?? payload.uuid ?? payload.id} ` +
       `result=${isWin ? 'WIN' : isDraw ? 'DRAW' : 'LOSE'} profit=${profit}`,
     );
-
-    const config = await this.getConfig(userId);
 
     // Handle Martingale for STANDARD mode (non Always Signal) - via WebSocket
     if (!isWin && !isDraw && config.martingale.isEnabled && !config.martingale.isAlwaysSignal && matchedLog.martingaleStep === 0) {
@@ -1115,7 +1131,12 @@ export class MomentumService implements OnModuleDestroy {
         mode.totalWins++;
       } else {
         order.martingaleState.totalLoss = config.martingale.baseAmount;
-        mode.totalLosses++;
+        // Step 0 LOSE with martingale enabled: sequence continues → skip counter.
+        // totalLosses will be counted at the final step in monitorMartingaleResult.
+        const _htMEnabled = config.martingale.isEnabled && config.martingale.maxSteps > 0;
+        if (!_htMEnabled) {
+          mode.totalLosses++;
+        }
       }
     }
 
@@ -1269,7 +1290,10 @@ export class MomentumService implements OnModuleDestroy {
             mode.activeMomentumOrders.delete(momentumType);
             this.logger.log(`[${userId}] ${momentumType} martingale WIN at step ${step}`);
           } else {
-            mode.totalLosses++;
+            // Count loss only when this is the final step (sequence failed)
+            if (step >= config.martingale.maxSteps) {
+              mode.totalLosses++;
+            }
             await this.startMartingale(userId, config, session, parentOrderId, momentumType, step + 1);
           }
         }

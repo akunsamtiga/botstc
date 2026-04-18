@@ -1059,7 +1059,15 @@ export class IndicatorService implements OnModuleDestroy {
     } else {
       mode.consecutiveLosses++;
       mode.consecutiveWins = 0;
-      mode.totalLosses++;
+      // Martingale-aware stats: count loss only at sequence end.
+      //   - Mid-sequence LOSE (step < maxSteps) → skip (sequence continues)
+      //   - Final step LOSE (step >= maxSteps)  → totalLosses+1
+      //   - No martingale                       → totalLosses+1 (same as before)
+      const _iM = config.martingale;
+      const _iMEnabled = _iM.isEnabled && _iM.maxSteps > 0;
+      if (!_iMEnabled || step >= _iM.maxSteps) {
+        mode.totalLosses++;
+      }
 
       if (config.martingale.isEnabled) {
         if (config.martingale.isAlwaysSignal) {

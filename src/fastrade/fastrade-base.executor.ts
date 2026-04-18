@@ -399,9 +399,26 @@ export abstract class FastradeBaseExecutor {
     else if (!isDraw) tradePnL = -active.amount;
     this.sessionPnL += tradePnL;
 
-    this.totalTrades++;
-    if (isWin) this.totalWins++;
-    else if (!isDraw) this.totalLosses++;
+    // ── Martingale-aware stats counter ────────────────────────────────────
+    // Saat martingale aktif:
+    //   - LOSE di tengah sequence (step < maxSteps) → skip (tidak dihitung)
+    //   - WIN di mana saja               → totalTrades+1, totalWins+1
+    //   - LOSE di step terakhir (maxSteps)→ totalTrades+1, totalLosses+1
+    // Saat martingale tidak aktif → perilaku sama seperti sebelumnya.
+    const _m = this.config.martingale;
+    const _isMartingaleEnabled = _m.isEnabled && _m.maxSteps > 0;
+    const _isInMartingaleSequence = _isMartingaleEnabled && active.isMartingale;
+    const _isMidSequenceLoss =
+      _isInMartingaleSequence &&
+      !isWin &&
+      !isDraw &&
+      active.martingaleStep < _m.maxSteps;
+
+    if (!_isMidSequenceLoss) {
+      this.totalTrades++;
+      if (isWin) this.totalWins++;
+      else if (!isDraw) this.totalLosses++;
+    }
 
     this.logger.log(
       `[${this.userId}] ✅ ${result} | amount=${active.amount} step=${active.martingaleStep} ` +

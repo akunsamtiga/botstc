@@ -612,15 +612,42 @@ export class AISignalService implements OnModuleDestroy {
       order.status = result.isWin ? AISignalOrderStatus.WIN : AISignalOrderStatus.LOSE;
     }
 
-    // Update stats
-    mode.stats.totalTrades++;
-    if (result.isWin) {
-      mode.stats.wins++;
-      const profit = Math.floor((order?.amount || mode.config.baseAmount) * 0.85);
-      mode.stats.sessionPnL += profit;
-    } else {
-      mode.stats.losses++;
-      mode.stats.sessionPnL -= order?.amount || mode.config.baseAmount;
+    // ── Martingale-aware stats counter ────────────────────────────────────
+    // sessionPnL selalu diupdate (real money), tapi wins/losses/totalTrades
+    // hanya dihitung pada akhir sequence:
+    //   - WIN di mana pun                              → wins+1, totalTrades+1
+    //   - LOSE base order (step=0) + martingale enabled → skip (sequence berlanjut)
+    //   - LOSE mid-sequence (step < maxSteps)           → skip (sequence berlanjut)
+    //   - LOSE step terakhir (step >= maxSteps)         → losses+1, totalTrades+1
+    //   - LOSE tanpa martingale                         → losses+1, totalTrades+1
+    {
+      const _m = mode.config.martingale;
+      const _mEnabled = _m.isEnabled && _m.maxSteps > 0;
+      const _isMidSeqLoss =
+        !result.isWin && (
+          // Base order (step 0) LOSE dengan martingale aktif → sequence akan berlanjut
+          (!result.isMartingale && _mEnabled) ||
+          // Martingale order LOSE sebelum step terakhir → sequence masih berjalan
+          (result.isMartingale && result.martingaleStep < _m.maxSteps)
+        );
+
+      // PnL selalu dihitung
+      if (result.isWin) {
+        const profit = Math.floor((order?.amount || mode.config.baseAmount) * 0.85);
+        mode.stats.sessionPnL += profit;
+      } else {
+        mode.stats.sessionPnL -= order?.amount || mode.config.baseAmount;
+      }
+
+      // Wins/losses/totalTrades hanya dihitung di akhir sequence
+      if (!_isMidSeqLoss) {
+        mode.stats.totalTrades++;
+        if (result.isWin) {
+          mode.stats.wins++;
+        } else {
+          mode.stats.losses++;
+        }
+      }
     }
 
     this.logger.log(

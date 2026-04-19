@@ -401,15 +401,17 @@ export abstract class FastradeBaseExecutor {
 
     // ── Martingale-aware stats counter ────────────────────────────────────
     // Saat martingale aktif:
-    //   - LOSE di tengah sequence (step < maxSteps) → skip (tidak dihitung)
-    //   - WIN di mana saja               → totalTrades+1, totalWins+1
-    //   - LOSE di step terakhir (maxSteps)→ totalTrades+1, totalLosses+1
-    // Saat martingale tidak aktif → perilaku sama seperti sebelumnya.
+    //   - LOSE di step mana pun SELAMA step < maxSteps → skip (tidak dihitung)
+    //     Ini TERMASUK step 0 (base trade) karena martingale akan lanjut.
+    //   - WIN di mana saja                → totalTrades+1, totalWins+1
+    //   - LOSE di step terakhir (maxSteps) → totalTrades+1, totalLosses+1
+    // Saat martingale tidak aktif → setiap loss langsung dihitung.
     const _m = this.config.martingale;
     const _isMartingaleEnabled = _m.isEnabled && _m.maxSteps > 0;
-    const _isInMartingaleSequence = _isMartingaleEnabled && active.isMartingale;
+    // FIX: tidak pakai active.isMartingale (yang false di step 0) — step 0 pun
+    // harus di-skip jika martingale aktif, karena sequence belum selesai.
     const _isMidSequenceLoss =
-      _isInMartingaleSequence &&
+      _isMartingaleEnabled &&
       !isWin &&
       !isDraw &&
       active.martingaleStep < _m.maxSteps;

@@ -977,6 +977,14 @@ export class MomentumService implements OnModuleDestroy {
 
     if (!matchedLog) return;
 
+    // Guard: cegah double-processing dengan HTTP polling (processedOrderIds pakai compound key)
+    const processKey = `${matchedLog.orderId}_s${matchedLog.martingaleStep}`;
+    if (mode.processedOrderIds.has(processKey)) {
+      this.logger.debug(`[${userId}] WS: skip already-processed ${processKey}`);
+      return;
+    }
+    mode.processedOrderIds.add(processKey);
+
     const isWin = statusStr === 'won' || statusStr === 'win';
     const isDraw = statusStr === 'stand' || statusStr === 'draw' || statusStr === 'tie';
     const profit = isWin
@@ -1115,8 +1123,13 @@ export class MomentumService implements OnModuleDestroy {
     const mode = this.activeModes.get(userId);
     if (!mode) return;
 
-    if (mode.processedOrderIds.has(orderId)) return;
-    mode.processedOrderIds.add(orderId);
+    // Guard: compound key agar sinkron dengan WS handler (step 0 = initial trade)
+    const processKey = `${orderId}_s0`;
+    if (mode.processedOrderIds.has(processKey)) {
+      this.logger.debug(`[${userId}] HTTP fallback: skip already-processed ${processKey}`);
+      return;
+    }
+    mode.processedOrderIds.add(processKey);
 
     const isWin = result.status?.toLowerCase() === 'won';
     const profit = isWin ? (result.win || result.payment || 0) : -config.martingale.baseAmount;
@@ -1244,7 +1257,7 @@ export class MomentumService implements OnModuleDestroy {
       ? config.martingale.multiplierValue
       : 1 + config.martingale.multiplierValue / 100;
 
-    return Math.floor(config.martingale.baseAmount * Math.pow(multiplier, step - 1));
+    return Math.floor(config.martingale.baseAmount * Math.pow(multiplier, step)); // step 1=×multiplier, step 2=×multiplier², dst
   }
 
   private async monitorMartingaleResult(
@@ -1268,9 +1281,20 @@ export class MomentumService implements OnModuleDestroy {
       }
 
       try {
+        // Guard: cek dulu apakah WS sudah handle step ini (compound key)
+        const processKey = `${parentOrderId}_s${step}`;
+        if (mode.processedOrderIds.has(processKey)) {
+          clearInterval(checkInterval);
+          return;
+        }
+
         const result = await this.fetchTradeResult(session, config);
         if (result) {
           clearInterval(checkInterval);
+
+          // Double-check setelah dapat result (WS bisa saja baru saja fire)
+          if (mode.processedOrderIds.has(processKey)) return;
+          mode.processedOrderIds.add(processKey);
 
           const isWin = result.status?.toLowerCase() === 'won';
           const martingaleAmount = this.calculateMartingaleAmount(config, step);
@@ -1365,16 +1389,20 @@ export class MomentumService implements OnModuleDestroy {
 
   private buildTradePayload(session: any, config: MomentumConfig, amount: number, trend: string): any {
     const nowMs = Date.now();
-    const createdAtSec = Math.floor(nowMs / 1000) + 1;
+    const createdAtSec = Math.floor(nowMs / 1000);
+
+    // Hitung detik yang tersisa hingga batas menit berikutnya
     const secondsInMinute = createdAtSec % 60;
-    const remaining = 60 - secondsInMinute;
-    const expireAt = remaining >= 45
-      ? createdAtSec + remaining
-      : createdAtSec + remaining + 60;
+    const remainingToNextMinute = 60 - secondsInMinute;
+
+    // Expiry selalu ke batas menit berikutnya; jika sisa < 5 detik, skip ke menit setelahnya
+    const expireAt = remainingToNextMinute >= 5
+      ? createdAtSec + remainingToNextMinute
+      : createdAtSec + remainingToNextMinute + 60;
 
     return {
       amount,
-      createdAt: createdAtSec * 1000,
+      createdAt: (createdAtSec + 1) * 1000,
       dealType: config.isDemoAccount ? 'demo' : 'real',
       expireAt,
       iso: session.currencyIso || config.currency || 'IDR',

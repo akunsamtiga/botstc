@@ -353,32 +353,52 @@ export class IndicatorService implements OnModuleDestroy {
 
     try {
       mode.cycleNumber++;
-      this.logger.log(`[${userId}] === PHASE 1: Waiting for minute boundary ===`);
-      await this.waitForMinuteBoundary();
 
-      if (!mode.isActive) return;
+      // ── FASE 1-3: Lakukan SEBELUM batas menit ──────────────────────────────
+      // Fetch candle + analisis dikerjakan selagi candle SEKARANG masih berjalan,
+      // sehingga saat batas menit tiba kita bisa langsung entry tanpa delay.
 
-      this.logger.log(`[${userId}] === PHASE 2: Collecting candle data ===`);
+      this.logger.log(`[${userId}] === PHASE 1: Collecting candle data (pre-boundary) ===`);
       const candles = await this.collectAndAggregateCandles(config.asset!.ric, session);
       if (!candles || candles.length === 0) {
         throw new Error('Failed to collect candle data');
       }
       mode.historicalCandles = candles;
 
-      this.logger.log(`[${userId}] === PHASE 3: Analyzing data with ${config.settings.type} ===`);
+      if (!mode.isActive) return;
+
+      this.logger.log(`[${userId}] === PHASE 2: Analyzing data with ${config.settings.type} ===`);
       const analysis = this.analyzeData(candles, config.settings);
       mode.analysisResult = analysis;
-
       this.logger.log(`[${userId}] Analysis Result: ${analysis.trend} (Strength: ${analysis.strength})`);
 
-      this.logger.log(`[${userId}] === PHASE 4: Generating price predictions ===`);
+      this.logger.log(`[${userId}] === PHASE 3: Generating price predictions ===`);
       const predictions = this.generatePricePredictions(analysis, config.settings, candles);
       mode.pricePredictions = predictions;
-
       this.logger.log(`[${userId}] Generated ${predictions.length} predictions`);
 
-      this.logger.log(`[${userId}] === PHASE 5: Starting price monitoring ===`);
-      this.startPriceMonitoring(userId, config, session);
+      if (!mode.isActive) return;
+
+      // ── FASE 4: Tunggu TEPAT di batas menit ────────────────────────────────
+      this.logger.log(`[${userId}] === PHASE 4: Waiting for minute boundary ===`);
+      await this.waitForMinuteBoundary();
+
+      if (!mode.isActive) return;
+
+      // ── FASE 5: Eksekusi LANGSUNG saat perpindahan candle ──────────────────
+      // Tidak lagi memakai price monitoring / polling harga — entry dilakukan
+      // persis di candle boundary menggunakan prediction dengan confidence tertinggi.
+      this.logger.log(`[${userId}] === PHASE 5: Executing trade at candle boundary ===`);
+
+      const bestPrediction = predictions[0]; // sudah diurutkan descending by confidence
+      if (!bestPrediction) {
+        throw new Error('No predictions available');
+      }
+
+      bestPrediction.isTriggered = true;
+      bestPrediction.triggeredAt = Date.now();
+
+      await this.executeTrade(userId, config, session, bestPrediction);
 
     } catch (error: any) {
       this.logger.error(`[${userId}] Error in indicator cycle: ${error.message}`);
@@ -447,13 +467,18 @@ export class IndicatorService implements OnModuleDestroy {
 
   private async waitForMinuteBoundary(): Promise<void> {
     const now = Date.now();
-    const seconds = Math.floor((now / 1000) % 60);
-    const millis = now % 1000;
-    const waitTime = (60 - seconds) * 1000 - millis;
+    const ms = now % 60000; // milidetik dalam menit ini (0–59999)
 
-    if (waitTime > 0) {
-      await this.sleep(waitTime + MINUTE_BOUNDARY_OFFSET_MS);
+    // Jika sudah sangat dekat dengan batas menit (<= 500ms sisanya), tunggu
+    // offset kecil saja agar tidak lompat ke menit berikutnya.
+    // Jika baru saja melewati batas (< 1000ms setelah batas), langsung lanjut.
+    if (ms < 1000) {
+      // Sudah berada dalam 1 detik pertama candle baru — tidak perlu tunggu
+      return;
     }
+
+    const waitTime = 60000 - ms; // ms hingga batas menit berikutnya
+    await this.sleep(waitTime + MINUTE_BOUNDARY_OFFSET_MS);
   }
 
   private async collectAndAggregateCandles(symbol: string, session: any): Promise<Candle[]> {
@@ -1366,16 +1391,21 @@ export class IndicatorService implements OnModuleDestroy {
 
   private buildTradePayload(session: any, config: IndicatorConfig, amount: number, trend: string): any {
     const nowMs = Date.now();
-    const createdAtSec = Math.floor(nowMs / 1000) + 1;
+    const createdAtSec = Math.floor(nowMs / 1000);
+
+    // Hitung detik yang tersisa hingga batas menit berikutnya
     const secondsInMinute = createdAtSec % 60;
-    const remaining = 60 - secondsInMinute;
-    const expireAt = remaining >= 45
-      ? createdAtSec + remaining
-      : createdAtSec + remaining + 60;
+    const remainingToNextMinute = 60 - secondsInMinute;
+
+    // Expiry SELALU di batas menit berikutnya (1 candle penuh).
+    // Jika sisa < 5 detik (terlalu mepet), skip ke menit setelahnya.
+    const expireAt = remainingToNextMinute >= 5
+      ? createdAtSec + remainingToNextMinute
+      : createdAtSec + remainingToNextMinute + 60;
 
     return {
       amount,
-      createdAt: createdAtSec * 1000,
+      createdAt: (createdAtSec + 1) * 1000,  // +1 detik agar tidak reject oleh server
       dealType: config.isDemoAccount ? 'demo' : 'real',
       expireAt,
       iso: session.currencyIso || config.currency || 'IDR',

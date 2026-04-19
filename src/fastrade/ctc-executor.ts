@@ -3,12 +3,17 @@ import { StockityWebSocketClient } from '../schedule/websocket-client';
 import { FastradeBaseExecutor, FastradeExecutorCallbacks, SessionInfo } from './fastrade-base.executor';
 import { FastradeConfig, FastradeOrder, TrendType } from './fastrade-types';
 
-const FIRST_FETCH_OFFSET_MS    = 300;
-const SECOND_FETCH_OFFSET_MS   = 300;
+// Offset minimal agar candle sudah settle di server Stockity (~50ms cukup)
+const FIRST_FETCH_OFFSET_MS    = 50;
+const SECOND_FETCH_OFFSET_MS   = 50;
 const CYCLE_RESTART_DELAY_MS   = 2_000;
 const RESULT_TIMEOUT_MS        = 180_000;
 const BOUNDARY_INTERVAL_SECS   = 5;
-const EXECUTION_MIN_ADVANCE_MS = 5_000;
+// Toleransi minimum sebelum akhir menit — dikurangi dari 5000 ke 1000ms
+// agar tidak mudah skip ke menit berikutnya
+const EXECUTION_MIN_ADVANCE_MS = 1_000;
+// Jika jarak ke boundary berikutnya < nilai ini, eksekusi langsung sekarang
+const INSTANT_EXEC_THRESHOLD_MS = 200;
 
 type CtcPhase =
   | 'IDLE'
@@ -85,6 +90,7 @@ export class CtcExecutor extends FastradeBaseExecutor {
     if (waitToFirst > 0) await this.sleep(waitToFirst);
     if (!this.isRunning) return;
 
+    // Offset minimal — hanya cukup untuk candle settle di server
     await this.sleep(FIRST_FETCH_OFFSET_MS);
     if (!this.isRunning) return;
 
@@ -104,12 +110,14 @@ export class CtcExecutor extends FastradeBaseExecutor {
     this.phase = 'WAITING_MINUTE_2';
     this.callbacks.onStatusChange(`CTC CYCLE ${this.cycleNumber}: Menunggu menit kedua (Price1=${price1})...`);
 
+    // Tunggu tepat ke batas menit kedua (dari firstBoundary, bukan dari Date.now())
     const secondBoundary = firstBoundary + 60_000;
     const waitToSecond = secondBoundary - Date.now();
 
     if (waitToSecond > 0) await this.sleep(waitToSecond);
     if (!this.isRunning) return;
 
+    // Offset minimal — sama seperti fetch pertama
     await this.sleep(SECOND_FETCH_OFFSET_MS);
     if (!this.isRunning) return;
 
@@ -155,6 +163,10 @@ export class CtcExecutor extends FastradeBaseExecutor {
         `Syncing to 5s boundary, wait ${waitForExec}ms`,
       );
       await this.sleep(waitForExec);
+    } else {
+      this.logger.log(
+        `[${this.userId}] CTC CYCLE ${this.cycleNumber}: Already at boundary — execute instantly`,
+      );
     }
 
     if (!this.isRunning) return;
@@ -166,18 +178,46 @@ export class CtcExecutor extends FastradeBaseExecutor {
     await this.executeWithTrend(trend, 0);
   }
 
+  /**
+   * Hitung waktu eksekusi optimal yang paling dekat dengan boundary 5 detik.
+   *
+   * Logika:
+   * 1. Hitung sisa ms ke boundary 5s berikutnya
+   * 2. Jika sisa < INSTANT_EXEC_THRESHOLD_MS (200ms) → eksekusi sekarang (skip wait)
+   * 3. Jika candidate boundary < EXECUTION_MIN_ADVANCE_MS (1s) sebelum akhir menit
+   *    → pakai boundary 5s pertama di menit berikutnya (bukan +60s penuh)
+   * 4. Selainnya → pakai candidate boundary tersebut
+   */
   private calculateOptimalExecutionTime(): number {
     const now = Date.now();
+    const msIntoCurrentSec = now % 1000;
     const currentSec = Math.floor(now / 1000);
     const secInMinute = currentSec % 60;
-    const secUntilNextBoundary = BOUNDARY_INTERVAL_SECS - (secInMinute % BOUNDARY_INTERVAL_SECS);
+    const secsUntilNextBoundary = BOUNDARY_INTERVAL_SECS - (secInMinute % BOUNDARY_INTERVAL_SECS);
+    const msToBoundary = secsUntilNextBoundary * 1000 - msIntoCurrentSec;
 
-    const candidateMs = now + secUntilNextBoundary * 1000;
+    // Sudah sangat dekat boundary → eksekusi sekarang tanpa tunggu
+    if (msToBoundary <= INSTANT_EXEC_THRESHOLD_MS) {
+      this.logger.log(
+        `[${this.userId}] CTC: Already at boundary (${msToBoundary}ms away) — instant execute`,
+      );
+      return now;
+    }
+
+    const candidateMs = now + msToBoundary;
     const candidateSec = Math.floor(candidateMs / 1000);
-    const secUntilMinuteEnd = 60 - (candidateSec % 60);
+    const msUntilMinuteEnd = (60 - (candidateSec % 60)) * 1000;
 
-    if (secUntilMinuteEnd * 1000 < EXECUTION_MIN_ADVANCE_MS) {
-      return candidateMs + 60_000;
+    // Candidate terlalu dekat akhir menit → cari boundary 5s pertama di menit berikutnya
+    if (msUntilMinuteEnd < EXECUTION_MIN_ADVANCE_MS) {
+      // Maju ke awal menit berikutnya, lalu ambil boundary 5s pertama (detik ke-5)
+      const nextMinuteStartMs = candidateMs + msUntilMinuteEnd;
+      const nextBoundaryMs = nextMinuteStartMs + BOUNDARY_INTERVAL_SECS * 1000;
+      this.logger.log(
+        `[${this.userId}] CTC: Candidate too close to minute end (${msUntilMinuteEnd}ms) ` +
+        `— defer to next minute boundary (+${Math.round(nextBoundaryMs - now)}ms)`,
+      );
+      return nextBoundaryMs;
     }
 
     return candidateMs;

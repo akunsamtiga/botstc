@@ -1019,7 +1019,12 @@ export class MomentumService implements OnModuleDestroy {
     for (const [type, activeOrder] of mode.activeMomentumOrders.entries()) {
       if (activeOrder.orderId === matchedLog.orderId && !activeOrder.isSettled) {
         activeOrder.isSettled = true;
-        if (isWin || isDraw) mode.activeMomentumOrders.delete(type);
+        if (isWin || isDraw) {
+          mode.activeMomentumOrders.delete(type);
+        } else if (!config.martingale.isEnabled) {
+          // FIX BUG 3 (WS path): martingale disabled → tidak ada yang akan clear slot ini
+          mode.activeMomentumOrders.delete(type);
+        }
         break;
       }
     }
@@ -1035,6 +1040,23 @@ export class MomentumService implements OnModuleDestroy {
       if (session) {
         this.logger.log(`[${userId}] WS triggered standard martingale for ${matchedLog.momentumType}`);
         await this.startMartingale(userId, config, session, matchedLog.orderId, matchedLog.momentumType || MomentumType.CANDLE_SABIT);
+      }
+    }
+
+    // FIX BUG 2: WS handle martingale step > 0 LOSE tapi tidak memicu step berikutnya.
+    // Polling monitorMartingaleResult melihat processedOrderIds sudah ada → clearInterval tanpa lanjut.
+    // Akibatnya rantai martingale putus di tengah. Fix: WS harus juga memicu step berikutnya.
+    if (!isWin && !isDraw && config.martingale.isEnabled && !config.martingale.isAlwaysSignal && matchedLog.martingaleStep > 0) {
+      const session = await this.authService.getSession(userId);
+      if (session) {
+        const nextStep = matchedLog.martingaleStep + 1;
+        this.logger.log(`[${userId}] WS triggered martingale step ${nextStep} for ${matchedLog.momentumType}`);
+        await this.startMartingale(
+          userId, config, session,
+          matchedLog.orderId,
+          matchedLog.momentumType || MomentumType.CANDLE_SABIT,
+          nextStep,
+        );
       }
     }
 
@@ -1188,7 +1210,10 @@ export class MomentumService implements OnModuleDestroy {
       } else {
         await this.startMartingale(userId, config, session, orderId, momentumType);
       }
-    } else if (isWin) {
+    } else {
+      // FIX BUG 3: Hapus activeMomentumOrders untuk WIN dan LOSE tanpa martingale.
+      // Sebelumnya hanya WIN yang menghapus → jika LOSE + martingale disabled,
+      // slot momentumType stuck "occupied" (isSettled=true tapi tidak pernah deleted).
       mode.activeMomentumOrders.delete(momentumType);
     }
   }
@@ -1206,6 +1231,10 @@ export class MomentumService implements OnModuleDestroy {
 
     if (step > config.martingale.maxSteps) {
       this.logger.log(`[${userId}] Max martingale steps reached for ${momentumType}`);
+      // FIX BUG 1: Hapus activeMartingaleOrders agar sinyal berikutnya tidak terblokir
+      // sebelumnya hanya activeMomentumOrders yang dihapus, sehingga cek di
+      // executeMomentumOrder (activeMartingaleOrders.size > 0) always true → signals diblock selamanya
+      mode.activeMartingaleOrders.delete(parentOrderId);
       mode.activeMomentumOrders.delete(momentumType);
       return;
     }

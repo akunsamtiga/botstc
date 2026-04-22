@@ -591,6 +591,7 @@ export class AISignalService implements OnModuleDestroy {
     userId: string,
     result: {
       parentOrderId: string;
+      monitoringOrderId: string;
       isWin: boolean;
       isMartingale: boolean;
       martingaleStep: number;
@@ -600,11 +601,18 @@ export class AISignalService implements OnModuleDestroy {
     const mode = this.activeModes.get(userId);
     if (!mode) return;
 
-    if (mode.processedOrderIds.has(result.parentOrderId)) return;
-    mode.processedOrderIds.add(result.parentOrderId);
+    // FIX: Gunakan monitoringOrderId (unik per step) bukan parentOrderId.
+    // parentOrderId sama untuk semua step martingale (= originalOrderId),
+    // sehingga step 1 dst langsung di-skip karena originalId sudah ada di set.
+    if (mode.processedOrderIds.has(result.monitoringOrderId)) return;
+    mode.processedOrderIds.add(result.monitoringOrderId);
 
+    // FIX: Cari order yang tepat — martingale order tersimpan dengan key monitoringOrderId
+    // (format: "${parentOrderId}_martingale_${step}"), bukan parentOrderId.
     const order =
+      mode.executedOrdersMap.get(result.monitoringOrderId) ||
       mode.executedOrdersMap.get(result.parentOrderId) ||
+      mode.pendingOrders.find((o) => o.id === result.monitoringOrderId) ||
       mode.pendingOrders.find((o) => o.id === result.parentOrderId);
 
     if (order) {
@@ -664,7 +672,9 @@ export class AISignalService implements OnModuleDestroy {
     }
 
     setTimeout(() => {
-      const idx = mode.pendingOrders.findIndex((o) => o.id === result.parentOrderId);
+      // FIX: Update order yang benar — martingale order ada di pendingOrders dengan id = monitoringOrderId
+      const targetId = result.isMartingale ? result.monitoringOrderId : result.parentOrderId;
+      const idx = mode.pendingOrders.findIndex((o) => o.id === targetId);
       if (idx !== -1) {
         mode.pendingOrders[idx] = {
           ...mode.pendingOrders[idx],

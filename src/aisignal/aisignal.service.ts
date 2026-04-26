@@ -658,6 +658,11 @@ export class AISignalService implements OnModuleDestroy {
       }
     }
 
+    // ── Tulis ke Firestore aisignal_logs ─────────────────────────────────────
+    // today-profit.service.ts membaca koleksi ini untuk mode 'aisignal'.
+    // Tanpa ini profit tidak akan muncul di /today-profit.
+    await this.saveAISignalLog(userId, result, order, mode);
+
     this.logger.log(
       `[${userId}] AI Signal result (from monitor): ${result.isWin ? 'WIN' : 'LOSE'} - Martingale: ${result.isMartingale}`,
     );
@@ -891,6 +896,72 @@ export class AISignalService implements OnModuleDestroy {
       ric: config.asset!.ric,
       trend,
     };
+  }
+
+  /**
+   * Simpan hasil trade ke Firestore `aisignal_logs/{userId}/entries`.
+   *
+   * Struktur ini identik dengan yang dibaca oleh TodayProfitService
+   * di koleksi `aisignal_logs` (lihat MODES array di today-profit.service.ts).
+   *
+   * Field wajib yang dibaca TodayProfitService:
+   *   - result        : 'WIN' | 'LOSE' | 'DRAW'
+   *   - profit        : angka profit/loss aktual
+   *   - executedAt    : Firestore Timestamp (untuk filter hari ini)
+   *   - isDemoAccount : untuk filter real vs demo
+   *   - martingaleStep: untuk dedup martingale (hanya count step terakhir)
+   *   - dealId        : UUID Stockity (untuk dedup dengan Stockity API)
+   *   - ric/assetRic  : untuk agregasi byAsset
+   */
+  private async saveAISignalLog(
+    userId: string,
+    result: {
+      parentOrderId: string;
+      monitoringOrderId: string;
+      isWin: boolean;
+      isMartingale: boolean;
+      martingaleStep: number;
+      details: Map<string, any>;
+    },
+    order: any,
+    mode: ActiveMode,
+  ): Promise<void> {
+    try {
+      const tradeResult: 'WIN' | 'LOSE' | 'DRAW' = result.isWin ? 'WIN' : 'LOSE';
+      const amount = order?.amount || mode.config.baseAmount;
+      const profit = result.isWin ? Math.floor(amount * 0.85) : -amount;
+
+      const logEntry = {
+        id: result.monitoringOrderId,
+        orderId: result.parentOrderId,
+        trend: order?.trend || 'call',
+        amount,
+        martingaleStep: result.martingaleStep,
+        dealId: result.details.get('trade_id') || undefined,
+        result: tradeResult,
+        profit,
+        sessionPnL: mode.stats.sessionPnL,
+        executedAt: this.firebaseService.Timestamp.fromMillis(Date.now()),
+        isDemoAccount: mode.config.isDemoAccount,
+        ric: order?.assetRic || mode.config.asset?.ric || 'unknown',
+        assetRic: order?.assetRic || mode.config.asset?.ric || 'unknown',
+        assetName: order?.assetName || mode.config.asset?.name || 'unknown',
+        mode: 'aisignal',
+      };
+
+      await this.firebaseService.db
+        .collection('aisignal_logs')
+        .doc(userId)
+        .collection('entries')
+        .doc(logEntry.id)
+        .set(logEntry);
+
+      this.logger.log(
+        `[${userId}] 📝 AI Signal log saved: ${tradeResult} ${amount} profit=${profit} step=${result.martingaleStep}`,
+      );
+    } catch (err: any) {
+      this.logger.error(`[${userId}] Failed to save AI signal log: ${err?.message || err}`);
+    }
   }
 
   private async updateStatus(userId: string, botState: string) {

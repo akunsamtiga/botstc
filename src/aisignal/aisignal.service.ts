@@ -1,4 +1,4 @@
-import { Injectable, Logger, OnModuleDestroy } from '@nestjs/common';
+import { Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import * as admin from 'firebase-admin';
 import { FirebaseService } from '../firebase/firebase.service';
 import { AuthService } from '../auth/auth.service';
@@ -42,7 +42,7 @@ interface ActiveMode {
 }
 
 @Injectable()
-export class AISignalService implements OnModuleDestroy {
+export class AISignalService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(AISignalService.name);
   private configs = new Map<string, AISignalConfig>();
   private activeModes = new Map<string, ActiveMode>();
@@ -54,6 +54,38 @@ export class AISignalService implements OnModuleDestroy {
     private readonly aiSignalMonitor: AISignalMonitorService,
     private readonly telegramSignalService: TelegramSignalService,
   ) {}
+
+  /**
+   * Saat server startup: bersihkan semua stale botState='RUNNING' di Firestore.
+   * State ini tertinggal jika server sebelumnya mati/restart tanpa sempat cleanup.
+   * activeModes (in-memory) selalu kosong saat startup — jadi RUNNING di Firestore = stale.
+   */
+  async onModuleInit() {
+    try {
+      const staleDocs = await this.firebaseService.db
+        .collection('aisignal_status')
+        .where('botState', '==', 'RUNNING')
+        .get();
+
+      if (!staleDocs.empty) {
+        this.logger.warn(
+          `[Startup] Found ${staleDocs.size} stale RUNNING AI Signal status(es) — resetting to STOPPED`,
+        );
+        const batch = this.firebaseService.db.batch();
+        for (const doc of staleDocs.docs) {
+          batch.set(
+            doc.ref,
+            { botState: 'STOPPED', updatedAt: this.firebaseService.FieldValue.serverTimestamp() },
+            { merge: true },
+          );
+        }
+        await batch.commit();
+        this.logger.log(`[Startup] Stale AI Signal statuses cleared`);
+      }
+    } catch (err: any) {
+      this.logger.error(`[Startup] Failed to clear stale AI Signal statuses: ${err?.message}`);
+    }
+  }
 
   onModuleDestroy() {
     for (const [userId] of this.activeModes) {
@@ -204,6 +236,10 @@ export class AISignalService implements OnModuleDestroy {
   async stopAISignalMode(userId: string): Promise<{ message: string }> {
     const mode = this.activeModes.get(userId);
     if (!mode?.isActive) {
+      // Tetap reset Firestore supaya stale RUNNING dari server restart terhapus.
+      // Tanpa ini, status 'RUNNING' di Firestore tidak pernah bersih setelah restart.
+      await this.updateStatus(userId, 'STOPPED');
+      this.logger.log(`[${userId}] AI Signal tidak aktif di memory — Firestore status di-reset ke STOPPED`);
       return { message: 'AI Signal mode tidak berjalan' };
     }
 
@@ -255,10 +291,17 @@ export class AISignalService implements OnModuleDestroy {
       };
     }
 
+    // Bot tidak ada di activeModes (in-memory) → pasti STOPPED di proses ini.
+    // Jangan percaya Firestore — bisa saja masih 'RUNNING' dari sesi server sebelumnya (stale).
+    // Sekalian bersihkan jika Firestore masih menyimpan RUNNING.
     const statusDoc = await this.firebaseService.db.collection('aisignal_status').doc(userId).get();
+    if (statusDoc.exists && statusDoc.data()?.botState === 'RUNNING') {
+      await this.updateStatus(userId, 'STOPPED');
+      this.logger.warn(`[${userId}] Stale RUNNING status detected, auto-reset to STOPPED`);
+    }
     return {
       isActive: false,
-      botState: statusDoc.exists ? (statusDoc.data()?.botState ?? 'STOPPED') : 'STOPPED',
+      botState: 'STOPPED',
       config,
     };
   }

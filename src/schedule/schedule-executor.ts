@@ -81,6 +81,12 @@ export class ScheduleExecutor {
   private completionTimer?: NodeJS.Timeout;
   private lastCompletionCheck = 0;
 
+  /**
+   * Salinan order asli (sebelum dieksekusi) untuk restore saat stop().
+   * Diupdate setiap kali addOrders() / removeOrder() / clearOrders() dipanggil.
+   */
+  private originalOrders: ScheduledOrder[] = [];
+
   /** Map orderId → ExecutionInfo untuk fallback matching */
   private executionInfoMap = new Map<string, ExecutionInfo>();
 
@@ -108,6 +114,7 @@ export class ScheduleExecutor {
     initialConfig: ScheduleConfig,
   ) {
     this.orders = [...initialOrders];
+    this.originalOrders = initialOrders.map(o => ({ ...o }));
     this.config = { ...initialConfig };
     this.wsClient.setOnDealResult((p) => this.handleDealResult(p));
   }
@@ -143,9 +150,26 @@ export class ScheduleExecutor {
     this.botState = 'STOPPED';
     this.stopMonitoringLoop();
     this.stopCompletionCheck();
-    // Hapus semua order yang sudah dieksekusi (menunggu hasil atau stuck martingale)
-    // Firestore hanya menyimpan order yang benar-benar belum jalan
-    this.orders = this.orders.filter(o => !o.isExecuted);
+
+    // ✅ FIX: Restore ke order asli (reset state eksekusi) agar schedule
+    // tidak hilang setelah sesi selesai. Sebelumnya filter(!isExecuted)
+    // menyebabkan semua order terhapus jika sudah semua dieksekusi.
+    this.orders = this.originalOrders.map(o => ({
+      ...o,
+      isExecuted:   false,
+      isSkipped:    false,
+      skipReason:   undefined,
+      activeDealId: undefined,
+      result:       undefined,
+      martingaleState: {
+        isActive:       false,
+        currentStep:    0,
+        maxSteps:       o.martingaleState.maxSteps,
+        isCompleted:    false,
+        totalLoss:      0,
+        totalRecovered: 0,
+      },
+    }));
     this.activeMartingaleOrderId = undefined;
     this.martingaleStartTime = undefined;
     this.alwaysSignalLossState = undefined;
@@ -172,6 +196,12 @@ export class ScheduleExecutor {
     });
     this.orders.push(...valid);
     this.orders.sort((a, b) => a.timeInMillis - b.timeInMillis);
+    // ✅ FIX: Sync ke originalOrders agar order baru ikut tersimpan saat stop()
+    this.originalOrders = this.orders.map(o => ({ ...o,
+      isExecuted: false, isSkipped: false, skipReason: undefined,
+      activeDealId: undefined, result: undefined,
+      martingaleState: { isActive: false, currentStep: 0, maxSteps: o.martingaleState.maxSteps, isCompleted: false, totalLoss: 0, totalRecovered: 0 },
+    }));
     this.callbacks.onOrdersUpdate(this.orders);
     return valid;
   }
@@ -179,6 +209,8 @@ export class ScheduleExecutor {
   removeOrder(orderId: string) {
     const before = this.orders.length;
     this.orders = this.orders.filter(o => o.id !== orderId);
+    // ✅ FIX: Sync originalOrders
+    this.originalOrders = this.originalOrders.filter(o => o.id !== orderId);
     this.executionInfoMap.delete(orderId);
     if (this.activeMartingaleOrderId === orderId) {
       this.activeMartingaleOrderId = undefined;
@@ -193,6 +225,7 @@ export class ScheduleExecutor {
 
   clearOrders() {
     this.orders = [];
+    this.originalOrders = []; // ✅ FIX: Sync originalOrders
     this.activeMartingaleOrderId = undefined;
     this.alwaysSignalLossState = undefined;
     this.executionInfoMap.clear();

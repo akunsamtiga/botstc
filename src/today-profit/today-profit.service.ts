@@ -139,11 +139,13 @@ export class TodayProfitService {
     endDate: string,
   ): Promise<TodayProfitSummary[]> {
     const results: TodayProfitSummary[] = [];
-    const start = new Date(startDate);
-    const end = new Date(endDate);
+    // FIX: Parse dates as WIB (+07:00) agar iterasi hari sesuai tanggal lokal WIB
+    const start = new Date(`${startDate}T00:00:00.000+07:00`);
+    const end   = new Date(`${endDate}T00:00:00.000+07:00`);
 
-    for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
-      const dateStr = d.toISOString().split('T')[0];
+    for (let d = new Date(start); d <= end; d.setUTCDate(d.getUTCDate() + 1)) {
+      // Format YYYY-MM-DD dari UTC date (d sudah diset ke WIB midnight dalam UTC)
+      const dateStr = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Jakarta' }).format(d);
       const daily = await this.getTodayProfit(userId, dateStr);
       if (daily.totalTrades > 0) results.push(daily);
     }
@@ -350,7 +352,8 @@ export class TodayProfitService {
     }
 
     // ── Update per-user cache with fresh Stockity data ─────────────────────
-    const dateStr = new Date(startOfDay).toISOString().split('T')[0];
+    // FIX: Gunakan WIB timezone untuk cache key agar match dengan targetDate dari getTodayDateString()
+    const dateStr = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Jakarta' }).format(new Date(startOfDay));
     this.stockityCache.set(userId, {
       deals: rawDealsForCache,
       hadErrors,
@@ -505,14 +508,20 @@ export class TodayProfitService {
   }
 
   private getTodayDateString(): string {
-    return new Date().toISOString().split('T')[0];
+    // FIX: Gunakan timezone WIB (Asia/Jakarta, UTC+7), BUKAN UTC.
+    // toISOString() mengembalikan UTC date -- di WIB midnight (00:00 WIB = 17:00 UTC)
+    // toISOString() masih return tanggal kemarin, reset baru terjadi jam 07:00 WIB.
+    // en-CA locale -> format YYYY-MM-DD yang dibutuhkan.
+    return new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Jakarta' }).format(new Date());
   }
 
   private getDayBoundaries(dateStr: string): { startOfDay: number; endOfDay: number } {
-    const d = new Date(dateStr);
-    return {
-      startOfDay: new Date(d.getFullYear(), d.getMonth(), d.getDate(),  0,  0,  0,   0).getTime(),
-      endOfDay:   new Date(d.getFullYear(), d.getMonth(), d.getDate(), 23, 59, 59, 999).getTime(),
-    };
+    // FIX: Parse tanggal sebagai WIB dengan explicit offset +07:00.
+    // new Date('YYYY-MM-DD') tanpa offset -> di-parse sebagai UTC midnight (ECMAScript spec),
+    // bukan WIB midnight. Batas hari geser 7 jam sehingga reset terjadi jam 07:00 WIB.
+    // Dengan suffix '+07:00', JavaScript menginterpretasi sebagai WIB midnight yang benar.
+    const startOfDay = new Date(`${dateStr}T00:00:00.000+07:00`).getTime();
+    const endOfDay   = new Date(`${dateStr}T23:59:59.999+07:00`).getTime();
+    return { startOfDay, endOfDay };
   }
 }

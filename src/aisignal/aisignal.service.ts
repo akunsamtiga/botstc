@@ -180,7 +180,6 @@ export class AISignalService implements OnModuleInit, OnModuleDestroy {
       throw new Error(`Gagal koneksi WebSocket: ${err?.message || err}`);
     }
 
-    // Initialize stats
     const stats: SessionStats = {
       totalTrades: 0,
       wins: 0,
@@ -201,30 +200,22 @@ export class AISignalService implements OnModuleInit, OnModuleDestroy {
       stats,
     });
 
-    // Setup per-user signal callback untuk menerima sinyal dari TelegramSignalService
     this.telegramSignalService.setSignalCallback(userId, (uid, signal) => {
       this.handleIncomingSignal(uid, signal);
     });
 
-    // Start listening untuk sinyal dari Telegram/FCM
     await this.telegramSignalService.startListening(userId);
 
-    // Set user session for monitor service
     this.aiSignalMonitor.setUserSession(userId, session);
 
-    // AISignalMonitorService.startMonitoring calls ws.setOnDealResult internally.
-    // Do NOT call ws.setOnDealResult here — it would be overwritten immediately.
-    // Deal results flow: WS → monitor.onDealResult → handleMonitorTradeResult callback.
     ws.setOnStatusChange((connected, reason) => {
       this.logger.log(`[${userId}] WebSocket status: ${connected ? 'connected' : 'disconnected'} - ${reason || ''}`);
     });
 
-    // Start monitoring service
     this.aiSignalMonitor.startMonitoring(userId, ws, (result) => {
       this.handleMonitorTradeResult(userId, result);
     });
 
-    // Start execution monitoring
     this.startExecutionMonitoring(userId);
 
     await this.updateStatus(userId, 'RUNNING');
@@ -236,8 +227,6 @@ export class AISignalService implements OnModuleInit, OnModuleDestroy {
   async stopAISignalMode(userId: string): Promise<{ message: string }> {
     const mode = this.activeModes.get(userId);
     if (!mode?.isActive) {
-      // Tetap reset Firestore supaya stale RUNNING dari server restart terhapus.
-      // Tanpa ini, status 'RUNNING' di Firestore tidak pernah bersih setelah restart.
       await this.updateStatus(userId, 'STOPPED');
       this.logger.log(`[${userId}] AI Signal tidak aktif di memory — Firestore status di-reset ke STOPPED`);
       return { message: 'AI Signal mode tidak berjalan' };
@@ -248,12 +237,8 @@ export class AISignalService implements OnModuleInit, OnModuleDestroy {
       clearInterval(mode.executionInterval);
     }
 
-    // Stop listening untuk sinyal
     this.telegramSignalService.stopListening(userId);
-
-    // Stop monitoring
     this.aiSignalMonitor.stopMonitoring(userId);
-
     mode.wsClient.disconnect();
     this.activeModes.delete(userId);
 
@@ -291,9 +276,6 @@ export class AISignalService implements OnModuleInit, OnModuleDestroy {
       };
     }
 
-    // Bot tidak ada di activeModes (in-memory) → pasti STOPPED di proses ini.
-    // Jangan percaya Firestore — bisa saja masih 'RUNNING' dari sesi server sebelumnya (stale).
-    // Sekalian bersihkan jika Firestore masih menyimpan RUNNING.
     const statusDoc = await this.firebaseService.db.collection('aisignal_status').doc(userId).get();
     if (statusDoc.exists && statusDoc.data()?.botState === 'RUNNING') {
       await this.updateStatus(userId, 'STOPPED');
@@ -327,9 +309,6 @@ export class AISignalService implements OnModuleInit, OnModuleDestroy {
 
   // ==================== SIGNAL HANDLING ====================
 
-  /**
-   * Handle sinyal yang masuk dari TelegramSignalService
-   */
   private async handleIncomingSignal(userId: string, signal: TelegramSignal): Promise<void> {
     try {
       this.logger.log(
@@ -369,10 +348,20 @@ export class AISignalService implements OnModuleInit, OnModuleDestroy {
       originalMessage: signalData.originalMessage || `AI Signal: ${signalData.trend}`,
     };
 
-    // Check for active martingale (standard mode)
-    if (mode.activeMartingaleOrders.size > 0 && !config.martingale.isAlwaysSignal) {
-      this.logger.log(`[${userId}] Signal skipped - Standard Martingale active`);
-      return { message: 'Signal skipped - Martingale in progress' };
+    // ── FIX BUG 3: Block new signals while any order is executing or being monitored ──
+    // Previously only checked activeMartingaleOrders.size > 0, which is only set AFTER
+    // a loss result is received — leaving a gap where new signals could sneak in.
+    if (!config.martingale.isAlwaysSignal) {
+      const hasActiveOrder = mode.pendingOrders.some(
+        (o) =>
+          o.isExecuted &&
+          (o.status === AISignalOrderStatus.EXECUTING ||
+            o.status === AISignalOrderStatus.MONITORING),
+      );
+      if (hasActiveOrder || mode.activeMartingaleOrders.size > 0) {
+        this.logger.log(`[${userId}] Signal skipped — order is executing/monitoring or martingale active`);
+        return { message: 'Signal skipped - Order in progress' };
+      }
     }
 
     // Handle Always Signal mode with outstanding loss
@@ -403,7 +392,6 @@ export class AISignalService implements OnModuleInit, OnModuleDestroy {
       `[${userId}] New AI Signal received: ${signal.trend} at ${new Date(signal.executionTime).toISOString()}`,
     );
 
-    // Send to user-specific FCM topic
     await this.sendSignalToFCM(userId, signal, order);
 
     return { message: `Signal received: ${signal.trend.toUpperCase()}` };
@@ -420,7 +408,6 @@ export class AISignalService implements OnModuleInit, OnModuleDestroy {
       const minute = executionDate.getMinutes();
       const second = executionDate.getSeconds();
 
-      // Use user-specific topic
       const topic = `trading_signals_${userId}`;
 
       const message: admin.messaging.Message = {
@@ -454,7 +441,6 @@ export class AISignalService implements OnModuleInit, OnModuleDestroy {
       await this.firebaseMessaging.send(message);
       this.logger.log(`[${userId}] Signal sent to FCM topic '${topic}'`);
     } catch (err: any) {
-      // FCM send opsional - Python bridge yang handle FCM ke mobile
       this.logger.debug(`[${userId}] FCM send skipped: ${err?.message || err}`);
     }
   }
@@ -476,6 +462,7 @@ export class AISignalService implements OnModuleInit, OnModuleDestroy {
       return { message: 'Max steps reached - Resetting' };
     }
 
+    // ── FIX BUG 1 (also applies here): use calculateMartingaleAmount with correct formula ──
     const nextAmount = this.calculateMartingaleAmount(config, nextStep);
 
     const order: AISignalOrder = {
@@ -488,8 +475,13 @@ export class AISignalService implements OnModuleInit, OnModuleDestroy {
       receivedAt: Date.now(),
       originalMessage: `Martingale Step ${nextStep}`,
       isExecuted: false,
+      // ── FIX BUG 5: Always-signal martingale orders must have martingaleStep = 0 so
+      //    monitor treats them as "initial orders", not standard martingale.
+      //    Standard martingale uses activeMartingaleOrders map (not set for always-signal).
+      //    If martingaleStep > 0, monitor emits isMartingale=true and the result is silently
+      //    ignored because activeMartingaleOrders has no entry for this order's UUID.
       status: AISignalOrderStatus.MARTINGALE_STEP,
-      martingaleStep: nextStep,
+      martingaleStep: 0,           // treat as initial order for monitor result routing
       maxMartingaleSteps: config.martingale.maxSteps,
     };
 
@@ -560,7 +552,6 @@ export class AISignalService implements OnModuleInit, OnModuleDestroy {
 
     this.logger.log(`[${userId}] Executing AI Signal order: ${order.trend} - ${order.amount}`);
 
-    // ✅ Tunggu hasil dengan await
     try {
       const isScheduled = order.martingaleStep === 0;
       const result = await mode.wsClient.placeTrade(
@@ -578,7 +569,6 @@ export class AISignalService implements OnModuleInit, OnModuleDestroy {
         this.logger.log(`[${userId}] Trade placed successfully: ${result.dealId}`);
       } else {
         this.logger.error(`[${userId}] Trade failed: ${result.error}`);
-        // Reset order status untuk retry
         const idx = mode.pendingOrders.findIndex((o) => o.id === order.id);
         if (idx !== -1) {
           mode.pendingOrders[idx] = {
@@ -587,11 +577,10 @@ export class AISignalService implements OnModuleInit, OnModuleDestroy {
             isExecuted: false,
           };
         }
-        return; // Jangan lanjut monitoring jika gagal
+        return;
       }
     } catch (error) {
       this.logger.error(`[${userId}] Error placing trade: ${(error as Error).message}`);
-      // Reset order status
       const idx = mode.pendingOrders.findIndex((o) => o.id === order.id);
       if (idx !== -1) {
         mode.pendingOrders[idx] = {
@@ -603,7 +592,6 @@ export class AISignalService implements OnModuleInit, OnModuleDestroy {
       return;
     }
 
-    // Start monitoring this order
     this.aiSignalMonitor.startMonitoringOrder(
       userId,
       order.id,
@@ -615,7 +603,6 @@ export class AISignalService implements OnModuleInit, OnModuleDestroy {
       order.martingaleStep,
     );
 
-    // Update status to monitoring setelah 2 detik
     setTimeout(() => {
       const idx = mode.pendingOrders.findIndex((o) => o.id === order.id);
       if (idx !== -1 && mode.pendingOrders[idx].status === AISignalOrderStatus.EXECUTING) {
@@ -644,14 +631,9 @@ export class AISignalService implements OnModuleInit, OnModuleDestroy {
     const mode = this.activeModes.get(userId);
     if (!mode) return;
 
-    // FIX: Gunakan monitoringOrderId (unik per step) bukan parentOrderId.
-    // parentOrderId sama untuk semua step martingale (= originalOrderId),
-    // sehingga step 1 dst langsung di-skip karena originalId sudah ada di set.
     if (mode.processedOrderIds.has(result.monitoringOrderId)) return;
     mode.processedOrderIds.add(result.monitoringOrderId);
 
-    // FIX: Cari order yang tepat — martingale order tersimpan dengan key monitoringOrderId
-    // (format: "${parentOrderId}_martingale_${step}"), bukan parentOrderId.
     const order =
       mode.executedOrdersMap.get(result.monitoringOrderId) ||
       mode.executedOrdersMap.get(result.parentOrderId) ||
@@ -664,25 +646,14 @@ export class AISignalService implements OnModuleInit, OnModuleDestroy {
     }
 
     // ── Martingale-aware stats counter ────────────────────────────────────
-    // sessionPnL selalu diupdate (real money), tapi wins/losses/totalTrades
-    // hanya dihitung pada akhir sequence:
-    //   - WIN di mana pun                              → wins+1, totalTrades+1
-    //   - LOSE base order (step=0) + martingale enabled → skip (sequence berlanjut)
-    //   - LOSE mid-sequence (step < maxSteps)           → skip (sequence berlanjut)
-    //   - LOSE step terakhir (step >= maxSteps)         → losses+1, totalTrades+1
-    //   - LOSE tanpa martingale                         → losses+1, totalTrades+1
     {
       const _m = mode.config.martingale;
       const _mEnabled = _m.isEnabled && _m.maxSteps > 0;
       const _isMidSeqLoss =
-        !result.isWin && (
-          // Base order (step 0) LOSE dengan martingale aktif → sequence akan berlanjut
-          (!result.isMartingale && _mEnabled) ||
-          // Martingale order LOSE sebelum step terakhir → sequence masih berjalan
-          (result.isMartingale && result.martingaleStep < _m.maxSteps)
-        );
+        !result.isWin &&
+        ((!result.isMartingale && _mEnabled) ||
+          (result.isMartingale && result.martingaleStep < _m.maxSteps));
 
-      // PnL selalu dihitung
       if (result.isWin) {
         const profit = Math.floor((order?.amount || mode.config.baseAmount) * 0.85);
         mode.stats.sessionPnL += profit;
@@ -690,7 +661,6 @@ export class AISignalService implements OnModuleInit, OnModuleDestroy {
         mode.stats.sessionPnL -= order?.amount || mode.config.baseAmount;
       }
 
-      // Wins/losses/totalTrades hanya dihitung di akhir sequence
       if (!_isMidSeqLoss) {
         mode.stats.totalTrades++;
         if (result.isWin) {
@@ -701,9 +671,6 @@ export class AISignalService implements OnModuleInit, OnModuleDestroy {
       }
     }
 
-    // ── Tulis ke Firestore aisignal_logs ─────────────────────────────────────
-    // today-profit.service.ts membaca koleksi ini untuk mode 'aisignal'.
-    // Tanpa ini profit tidak akan muncul di /today-profit.
     await this.saveAISignalLog(userId, result, order, mode);
 
     this.logger.log(
@@ -713,20 +680,30 @@ export class AISignalService implements OnModuleInit, OnModuleDestroy {
     if (result.isMartingale) {
       const martingaleInfo = mode.activeMartingaleOrders.get(result.parentOrderId);
       if (martingaleInfo) {
+        // Standard martingale result
         await this.handleMartingaleResult(userId, result.parentOrderId, martingaleInfo, result.isWin);
+      } else {
+        // ── FIX BUG 5: isMartingale=true but no activeMartingaleOrders entry ──
+        // This happens for always-signal martingale orders (martingaleStep was set > 0
+        // in the old code, but now those orders have martingaleStep=0, so this branch
+        // should only fire if there's a stale order from a previous code version).
+        // Treat it as an initial trade result so the chain doesn't silently break.
+        this.logger.warn(
+          `[${userId}] isMartingale=true but no activeMartingaleOrders entry for ${result.parentOrderId} — routing to handleInitialTradeResult`,
+        );
+        await this.handleInitialTradeResult(userId, result.parentOrderId, result.isWin);
       }
     } else {
       await this.handleInitialTradeResult(userId, result.parentOrderId, result.isWin);
     }
 
     setTimeout(() => {
-      // FIX: Update order yang benar — martingale order ada di pendingOrders dengan id = monitoringOrderId
       const targetId = result.isMartingale ? result.monitoringOrderId : result.parentOrderId;
       const idx = mode.pendingOrders.findIndex((o) => o.id === targetId);
       if (idx !== -1) {
         mode.pendingOrders[idx] = {
           ...mode.pendingOrders[idx],
-          status: AISignalOrderStatus.WAITING,
+          status: result.isWin ? AISignalOrderStatus.WIN : AISignalOrderStatus.LOSE,
         };
       }
     }, 3000);
@@ -740,18 +717,24 @@ export class AISignalService implements OnModuleInit, OnModuleDestroy {
       mode.executedOrdersMap.get(orderId) || mode.pendingOrders.find((o) => o.id === orderId);
 
     if (isWin) {
+      // ── FIX BUG 4 (partial): reset alwaysSignalLossTracking on WIN ──
+      // Covers the case where an always-signal martingale order (now martingaleStep=0)
+      // comes back WIN — the outstanding loss is cleared.
       mode.alwaysSignalLossTracking = null;
       this.logger.log(`[${userId}] Initial trade WIN`);
     } else {
       if (mode.config.martingale.isEnabled) {
         if (mode.config.martingale.isAlwaysSignal) {
-          mode.alwaysSignalLossTracking = {
-            hasOutstandingLoss: true,
-            currentMartingaleStep: 0,
-            originalOrderId: orderId,
-            totalLoss: order?.amount || mode.config.baseAmount,
-            currentTrend: order?.trend || 'call',
-          };
+          // Only set if not already tracking (avoid overwriting step progress)
+          if (!mode.alwaysSignalLossTracking?.hasOutstandingLoss) {
+            mode.alwaysSignalLossTracking = {
+              hasOutstandingLoss: true,
+              currentMartingaleStep: 0,
+              originalOrderId: orderId,
+              totalLoss: order?.amount || mode.config.baseAmount,
+              currentTrend: order?.trend || 'call',
+            };
+          }
           this.logger.log(`[${userId}] Always Signal: Will continue on next signal`);
         } else {
           await this.startMartingale(userId, orderId, order?.trend || 'call');
@@ -771,12 +754,18 @@ export class AISignalService implements OnModuleInit, OnModuleDestroy {
 
     if (isWin) {
       mode.activeMartingaleOrders.delete(parentOrderId);
+      // ── FIX BUG 4: reset alwaysSignalLossTracking on martingale WIN ──
+      // Previously this was never cleared here, causing always-signal to keep
+      // triggering martingale steps even after a win.
+      mode.alwaysSignalLossTracking = null;
       this.logger.log(`[${userId}] Martingale WIN at step ${martingaleInfo.currentStep}`);
     } else {
       const nextStep = martingaleInfo.currentStep + 1;
 
       if (nextStep > mode.config.martingale.maxSteps) {
         mode.activeMartingaleOrders.delete(parentOrderId);
+        // Max steps exhausted — also clear any stale alwaysSignal tracking
+        mode.alwaysSignalLossTracking = null;
         this.logger.log(`[${userId}] Martingale failed - Max steps reached`);
       } else {
         const currentStepAmount = this.calculateMartingaleAmount(mode.config, martingaleInfo.currentStep);
@@ -803,6 +792,7 @@ export class AISignalService implements OnModuleInit, OnModuleDestroy {
     if (!mode) return;
 
     const nextStep = 1;
+    // ── FIX BUG 1: calculateMartingaleAmount now uses correct formula (step, not step-1) ──
     const nextAmount = this.calculateMartingaleAmount(mode.config, nextStep);
 
     mode.activeMartingaleOrders.set(parentOrderId, {
@@ -815,16 +805,19 @@ export class AISignalService implements OnModuleInit, OnModuleDestroy {
       lastExecutionTime: Date.now(),
     });
 
-    this.executeMartingaleTrade(userId, parentOrderId, trend, nextAmount, nextStep);
+    await this.executeMartingaleTrade(userId, parentOrderId, trend, nextAmount, nextStep);
   }
 
-  private executeMartingaleTrade(
+  // ── FIX BUG 2: make async so we can await placeTrade and confirm placement ──
+  // Previously this was a sync fire-and-forget (.then()), which meant monitoring
+  // started even if placeTrade failed, breaking the martingale chain silently.
+  private async executeMartingaleTrade(
     userId: string,
     parentOrderId: string,
     trend: string,
     amount: number,
     step: number,
-  ) {
+  ): Promise<void> {
     const mode = this.activeModes.get(userId);
     if (!mode) return;
 
@@ -851,20 +844,48 @@ export class AISignalService implements OnModuleInit, OnModuleDestroy {
 
     this.logger.log(`[${userId}] Executing martingale step ${step}: ${amount}`);
 
-    // ✅ Tunggu hasil dengan await
-    mode.wsClient
-      .placeTrade(this.buildTradePayload(mode.session, mode.config, amount, trend))
-      .then((result) => {
-        if (result && result.dealId) {
-          this.logger.log(`[${userId}] Martingale trade placed: ${result.dealId}`);
-        } else if (result) {
-          this.logger.error(`[${userId}] Martingale trade failed: ${result.error}`);
-        }
-      })
-      .catch((error: unknown) => {
-        this.logger.error(`[${userId}] Error placing martingale trade: ${(error as Error).message}`);
-      });
+    // ── FIX BUG 2: await the trade result; only start monitoring on success ──
+    let placedDealId: string | null = null;
+    try {
+      const result = await mode.wsClient.placeTrade(
+        this.buildTradePayload(mode.session, mode.config, amount, trend),
+      );
 
+      if (result?.dealId) {
+        placedDealId = result.dealId;
+        this.logger.log(`[${userId}] Martingale trade placed: ${result.dealId}`);
+      } else {
+        this.logger.error(`[${userId}] Martingale trade failed: ${result?.error}`);
+
+        // Mark order as failed so the UI reflects it
+        const idx = mode.pendingOrders.findIndex((o) => o.id === martingaleOrderId);
+        if (idx !== -1) {
+          mode.pendingOrders[idx] = {
+            ...mode.pendingOrders[idx],
+            status: AISignalOrderStatus.WAITING,
+            isExecuted: false,
+          };
+        }
+        // Remove from activeMartingaleOrders so future signals aren't blocked forever
+        mode.activeMartingaleOrders.delete(parentOrderId);
+        return; // Don't start monitoring — no trade was placed
+      }
+    } catch (error: unknown) {
+      this.logger.error(`[${userId}] Error placing martingale trade: ${(error as Error).message}`);
+
+      const idx = mode.pendingOrders.findIndex((o) => o.id === martingaleOrderId);
+      if (idx !== -1) {
+        mode.pendingOrders[idx] = {
+          ...mode.pendingOrders[idx],
+          status: AISignalOrderStatus.WAITING,
+          isExecuted: false,
+        };
+      }
+      mode.activeMartingaleOrders.delete(parentOrderId);
+      return;
+    }
+
+    // Trade confirmed — now start monitoring
     this.aiSignalMonitor.startMonitoringOrder(
       userId,
       parentOrderId,
@@ -872,24 +893,49 @@ export class AISignalService implements OnModuleInit, OnModuleDestroy {
       amount,
       mode.config.asset!.ric,
       mode.config.isDemoAccount,
-      true,
+      true,  // isMartingale
       step,
     );
+
+    // Update order status to MONITORING after 2s
+    setTimeout(() => {
+      const idx = mode.pendingOrders.findIndex((o) => o.id === martingaleOrderId);
+      if (idx !== -1 && mode.pendingOrders[idx].status === AISignalOrderStatus.EXECUTING) {
+        mode.pendingOrders[idx] = {
+          ...mode.pendingOrders[idx],
+          status: AISignalOrderStatus.MONITORING,
+        };
+        mode.executedOrdersMap.set(martingaleOrderId, mode.pendingOrders[idx]);
+      }
+    }, 2000);
   }
 
+  /**
+   * Calculate martingale amount for a given step.
+   *
+   * ── FIX BUG 1 ──
+   * Old formula: baseAmount * Math.pow(multiplier, step - 1)
+   *   → step=1: baseAmount * 1 = baseAmount  (no increase — WRONG)
+   *   → step=2: baseAmount * multiplier
+   *
+   * Correct formula: baseAmount * Math.pow(multiplier, step)
+   *   → step=1: baseAmount * multiplier      (first increase — CORRECT)
+   *   → step=2: baseAmount * multiplier²
+   *
+   * The base order already uses baseAmount (step=0), so every martingale step
+   * must multiply by at least one factor of multiplier.
+   */
   private calculateMartingaleAmount(config: AISignalConfig, step: number): number {
     const multiplier =
       config.martingale.multiplierType === 'FIXED'
         ? config.martingale.multiplierValue
         : 1 + config.martingale.multiplierValue / 100;
 
-    return Math.floor(config.baseAmount * Math.pow(multiplier, step - 1));
+    return Math.floor(config.baseAmount * Math.pow(multiplier, step)); // was: step - 1
   }
 
   /**
    * Build trade payload — identik dengan ScheduleExecutor.buildTradeOrder().
-   * isScheduled=true  → order dijadwalkan, pakai executionTimeMs sebagai base
-   * isScheduled=false → martingale/instant, pakai Date.now()
    */
   private buildTradePayload(
     session: any,
@@ -899,14 +945,13 @@ export class AISignalService implements OnModuleInit, OnModuleDestroy {
     isScheduled = true,
     executionTimeMs?: number,
   ): any {
-    const baseMs           = isScheduled && executionTimeMs ? executionTimeMs : Date.now();
+    const baseMs = isScheduled && executionTimeMs ? executionTimeMs : Date.now();
     const createdAtSeconds = Math.floor(baseMs / 1000);
-    const secondsInMinute  = createdAtSeconds % 60;
+    const secondsInMinute = createdAtSeconds % 60;
 
     let finalExpireAt: number;
 
     if (isScheduled) {
-      // Scheduled: expire di boundary menit jadwal
       let expireAtSeconds: number;
       if (secondsInMinute <= 10) {
         expireAtSeconds = createdAtSeconds + (60 - secondsInMinute);
@@ -914,16 +959,15 @@ export class AISignalService implements OnModuleInit, OnModuleDestroy {
         expireAtSeconds = createdAtSeconds + (120 - secondsInMinute);
       }
       const duration = expireAtSeconds - createdAtSeconds;
-      finalExpireAt = (duration < 55 || duration > 120) ? createdAtSeconds + 60 : expireAtSeconds;
+      finalExpireAt = duration < 55 || duration > 120 ? createdAtSeconds + 60 : expireAtSeconds;
     } else {
-      // Martingale/instant: nearest minute boundary, min 45s
       const remainingInMinute = 60 - secondsInMinute;
-      finalExpireAt = remainingInMinute >= 45
-        ? createdAtSeconds + remainingInMinute
-        : createdAtSeconds + remainingInMinute + 60;
+      finalExpireAt =
+        remainingInMinute >= 45
+          ? createdAtSeconds + remainingInMinute
+          : createdAtSeconds + remainingInMinute + 60;
     }
 
-    // Safety fallback
     const duration = finalExpireAt - createdAtSeconds;
     if (duration < 45 || duration > 125) {
       finalExpireAt = createdAtSeconds + 60;
@@ -941,21 +985,6 @@ export class AISignalService implements OnModuleInit, OnModuleDestroy {
     };
   }
 
-  /**
-   * Simpan hasil trade ke Firestore `aisignal_logs/{userId}/entries`.
-   *
-   * Struktur ini identik dengan yang dibaca oleh TodayProfitService
-   * di koleksi `aisignal_logs` (lihat MODES array di today-profit.service.ts).
-   *
-   * Field wajib yang dibaca TodayProfitService:
-   *   - result        : 'WIN' | 'LOSE' | 'DRAW'
-   *   - profit        : angka profit/loss aktual
-   *   - executedAt    : Firestore Timestamp (untuk filter hari ini)
-   *   - isDemoAccount : untuk filter real vs demo
-   *   - martingaleStep: untuk dedup martingale (hanya count step terakhir)
-   *   - dealId        : UUID Stockity (untuk dedup dengan Stockity API)
-   *   - ric/assetRic  : untuk agregasi byAsset
-   */
   private async saveAISignalLog(
     userId: string,
     result: {
@@ -1026,9 +1055,6 @@ export class AISignalService implements OnModuleInit, OnModuleDestroy {
     return mode ? mode.pendingOrders.filter((o) => o.isExecuted) : [];
   }
 
-  /**
-   * Inject test signal untuk testing
-   */
   async injectTestSignal(userId: string, trend: string, delayMs?: number): Promise<{ message: string }> {
     await this.telegramSignalService.injectTestSignal(userId, trend, delayMs);
     return { message: `Test signal injected: ${trend}` };

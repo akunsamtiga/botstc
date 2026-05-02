@@ -57,6 +57,15 @@ interface StockityCache {
   dateStr: string;
 }
 
+/** Cached Firebase trades per user per day */
+interface FirebaseTradesCache {
+  firebaseTrades: MergedTrade[];
+  knownUuids: Set<string>;
+  knownNumericIds: Set<string>;
+  fetchedAt: number;
+  dateStr: string;
+}
+
 @Injectable()
 export class TodayProfitService {
   private readonly logger = new Logger(TodayProfitService.name);
@@ -68,6 +77,21 @@ export class TodayProfitService {
    */
   private readonly stockityCache = new Map<string, StockityCache>();
   private readonly STOCKITY_CACHE_TTL_MS = 25_000;
+
+  /**
+   * In-memory per-user-per-day cache for Firebase mode logs.
+   * TTL: 10s — drastically reduces Firestore reads when frontend polls /realtime.
+   * Each day has separate cache key so day changes auto-miss.
+   */
+  private readonly firebaseTradesCache = new Map<string, FirebaseTradesCache>();
+  private readonly FIREBASE_CACHE_TTL_MS = 10_000;
+
+  /**
+   * In-memory cache for Stockity credentials (sessions/{userId}).
+   * TTL: 60s — session data rarely changes.
+   */
+  private readonly credentialsCache = new Map<string, { data: UserStockityCredentials | null; expiresAt: number }>();
+  private readonly CREDENTIALS_CACHE_TTL_MS = 60_000;
 
   /**
    * Trading modes tracked via Firebase mode logs.
@@ -110,7 +134,7 @@ export class TodayProfitService {
 
     // ── Step 1: collect Firebase log trades ──────────────────────────────────
     const { firebaseTrades, knownUuids, knownNumericIds } =
-      await this.collectFirebaseTrades(userId, startOfDay, endOfDay);
+      await this.collectFirebaseTrades(userId, startOfDay, endOfDay, targetDate);
 
     // ── Step 2: collect Stockity API trades (skip already-known deals) ───────
     const { stockityTrades, meta } = await this.collectStockityTrades(
@@ -143,11 +167,52 @@ export class TodayProfitService {
     const start = new Date(`${startDate}T00:00:00.000+07:00`);
     const end   = new Date(`${endDate}T00:00:00.000+07:00`);
 
+    // OPTIMASI: Jangan gunakan getTodayProfit() per hari karena itu = 5 Firestore query per hari.
+    // Sebaliknya, fetch semua logs untuk seluruh rentang dalam satu batch per mode,
+    // lalu group by date di memory.
+    const rangeStartMs = start.getTime();
+    const rangeEndMs   = end.getTime() + 86400000 - 1; // akhir hari endDate
+
+    const allFirebaseTrades = await this.collectFirebaseTradesForRange(
+      userId, rangeStartMs, rangeEndMs,
+    );
+
+    // Group trades by date (WIB)
+    const tradesByDate = new Map<string, MergedTrade[]>();
+    for (const trade of allFirebaseTrades) {
+      const d = this.formatDateWIB(trade.executedAtMs || Date.now());
+      if (!tradesByDate.has(d)) tradesByDate.set(d, []);
+      tradesByDate.get(d)!.push(trade);
+    }
+
+    // Untuk setiap hari dalam rentang, cek apakah ada data Firebase atau skip
     for (let d = new Date(start); d <= end; d.setUTCDate(d.getUTCDate() + 1)) {
-      // Format YYYY-MM-DD dari UTC date (d sudah diset ke WIB midnight dalam UTC)
       const dateStr = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Jakarta' }).format(d);
-      const daily = await this.getTodayProfit(userId, dateStr);
-      if (daily.totalTrades > 0) results.push(daily);
+      const dayTrades = tradesByDate.get(dateStr) || [];
+
+      // Jika tidak ada data Firebase untuk hari ini, skip (hemat Stockity API call)
+      if (dayTrades.length === 0) {
+        this.logger.debug(`[${userId}] Skipping ${dateStr} — no Firebase data`);
+        continue;
+      }
+
+      // Reuse known UUIDs dari cache jika ada, atau rebuild
+      const { startOfDay, endOfDay } = this.getDayBoundaries(dateStr);
+      const { knownUuids, knownNumericIds } =
+        await this.collectFirebaseTrades(userId, startOfDay, endOfDay, dateStr);
+
+      const { stockityTrades, meta } = await this.collectStockityTrades(
+        userId, 'real', startOfDay, endOfDay, knownUuids, knownNumericIds,
+      );
+
+      const allTrades: MergedTrade[] = [...dayTrades, ...stockityTrades];
+      if (allTrades.length > 0) {
+        results.push(this.buildSummary(dateStr, allTrades, {
+          ...meta,
+          firebaseTrades: dayTrades.length,
+          stockityOnlyTrades: stockityTrades.length,
+        }));
+      }
     }
     return results;
   }
@@ -162,7 +227,7 @@ export class TodayProfitService {
     const { startOfDay, endOfDay } = this.getDayBoundaries(targetDate);
 
     const { firebaseTrades, knownUuids, knownNumericIds } =
-      await this.collectFirebaseTrades(userId, startOfDay, endOfDay);
+      await this.collectFirebaseTrades(userId, startOfDay, endOfDay, targetDate);
 
     // Use cached Stockity data if available — skip live API call
     const cached = this.stockityCache.get(userId);
@@ -204,16 +269,30 @@ export class TodayProfitService {
   /**
    * Pull all mode logs from Firebase for the given day,
    * returning normalized MergedTrade entries plus dedup key sets.
+   *
+   * OPTIMASI: Gunakan in-memory cache 10s agar polling /realtime tidak menghantam Firestore.
    */
   private async collectFirebaseTrades(
     userId: string,
     startOfDay: number,
     endOfDay: number,
+    dateStr: string,
   ): Promise<{
     firebaseTrades: MergedTrade[];
     knownUuids: Set<string>;
     knownNumericIds: Set<string>;
   }> {
+    const cacheKey = `${userId}_${dateStr}`;
+    const cached = this.firebaseTradesCache.get(cacheKey);
+    if (cached && (Date.now() - cached.fetchedAt) < this.FIREBASE_CACHE_TTL_MS) {
+      this.logger.debug(`[${userId}] Using cached Firebase trades for ${dateStr} (age=${Date.now() - cached.fetchedAt}ms)`);
+      return {
+        firebaseTrades: cached.firebaseTrades,
+        knownUuids: new Set(cached.knownUuids),
+        knownNumericIds: new Set(cached.knownNumericIds),
+      };
+    }
+
     const firebaseTrades: MergedTrade[] = [];
     const knownUuids = new Set<string>();
     const knownNumericIds = new Set<string>();
@@ -269,7 +348,76 @@ export class TodayProfitService {
       }
     }
 
+    // Simpan ke cache
+    this.firebaseTradesCache.set(cacheKey, {
+      firebaseTrades,
+      knownUuids: new Set(knownUuids),
+      knownNumericIds: new Set(knownNumericIds),
+      fetchedAt: Date.now(),
+      dateStr,
+    });
+
     return { firebaseTrades, knownUuids, knownNumericIds };
+  }
+
+  /**
+   * Fetch ALL Firebase mode logs untuk suatu rentang waktu (multi-day).
+   * Digunakan oleh getProfitHistory() agar tidak N+1 query per hari.
+   */
+  private async collectFirebaseTradesForRange(
+    userId: string,
+    startTime: number,
+    endTime: number,
+  ): Promise<Array<MergedTrade & { executedAtMs: number }>> {
+    const allTrades: Array<MergedTrade & { executedAtMs: number }> = [];
+
+    for (const mode of this.MODES) {
+      const logs = await this.fetchLogsFromFirebase(userId, mode, startTime, endTime);
+      const processedKeys = new Set<string>();
+
+      for (const log of logs) {
+        const executedAt = this.getTimestampMillis(log.executedAt);
+        if (executedAt < startTime || executedAt > endTime) continue;
+
+        if (log.martingaleStep !== undefined && log.martingaleStep > 0) {
+          const orderId = this.extractOrderId(log);
+          const isFinal = !logs.some(
+            l =>
+              this.extractOrderId(l) === orderId &&
+              (l.martingaleStep || 0) > (log.martingaleStep || 0),
+          );
+          if (!isFinal) continue;
+        }
+
+        const uniqueKey = `${this.extractOrderId(log)}_${log.martingaleStep || 0}`;
+        if (processedKeys.has(uniqueKey)) continue;
+        processedKeys.add(uniqueKey);
+
+        if (log.result !== 'WIN' && log.result !== 'LOSE' && log.result !== 'DRAW') continue;
+
+        const profit =
+          log.profit ??
+          (log.result === 'WIN'
+            ? 0
+            : log.result === 'LOSE'
+            ? -(log.amount || 0)
+            : 0);
+
+        allTrades.push({
+          source: 'firebase',
+          result: log.result as 'WIN' | 'LOSE' | 'DRAW',
+          profit,
+          ric: log.ric || log.assetRic || 'unknown',
+          assetName: log.assetName || log.ric || log.assetRic || 'unknown',
+          mode,
+          dealUuid: log.dealId,
+          dealNumericId: log.numericDealId,
+          executedAtMs: executedAt,
+        });
+      }
+    }
+
+    return allTrades;
   }
 
   // ── Stockity API collection ─────────────────────────────────────────────────
@@ -294,7 +442,7 @@ export class TodayProfitService {
       stockityApiError: false,
     };
 
-    // Load user credentials from Firestore
+    // Load user credentials from Firestore (with cache)
     const creds = await this.loadStockityCredentials(userId);
     if (!creds) {
       this.logger.warn(`[${userId}] No Stockity credentials found — skipping API fetch`);
@@ -464,30 +612,44 @@ export class TodayProfitService {
    *
    * The bot should write these when the user configures their Stockity account.
    * Adjust the collection path if your schema differs.
+   *
+   * OPTIMASI: Cache credentials selama 60 detik untuk mengurangi read sessions.
    */
   private async loadStockityCredentials(
     userId: string,
   ): Promise<UserStockityCredentials | null> {
+    const cached = this.credentialsCache.get(userId);
+    if (cached && Date.now() < cached.expiresAt) {
+      return cached.data;
+    }
+
     try {
       const doc = await this.firebaseService.db
         .collection(this.CREDENTIALS_COLLECTION)
         .doc(userId)
         .get();
 
-      if (!doc.exists) return null;
+      if (!doc.exists) {
+        this.credentialsCache.set(userId, { data: null, expiresAt: Date.now() + this.CREDENTIALS_CACHE_TTL_MS });
+        return null;
+      }
 
       const data = doc.data() as Partial<UserStockityCredentials>;
       if (!data.authToken || !data.deviceId || !data.deviceType) {
         this.logger.warn(`[${userId}] Incomplete Stockity credentials in Firestore`);
+        this.credentialsCache.set(userId, { data: null, expiresAt: Date.now() + this.CREDENTIALS_CACHE_TTL_MS });
         return null;
       }
 
-      return {
+      const result = {
         authToken:  data.authToken,
         deviceId:   data.deviceId,
         deviceType: data.deviceType,
         timezone:   data.timezone || 'Asia/Jakarta',
       };
+
+      this.credentialsCache.set(userId, { data: result, expiresAt: Date.now() + this.CREDENTIALS_CACHE_TTL_MS });
+      return result;
     } catch (err: any) {
       this.logger.warn(`[${userId}] Error loading Stockity credentials: ${err.message}`);
       return null;
@@ -523,5 +685,9 @@ export class TodayProfitService {
     const startOfDay = new Date(`${dateStr}T00:00:00.000+07:00`).getTime();
     const endOfDay   = new Date(`${dateStr}T23:59:59.999+07:00`).getTime();
     return { startOfDay, endOfDay };
+  }
+
+  private formatDateWIB(timestampMs: number): string {
+    return new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Jakarta' }).format(new Date(timestampMs));
   }
 }

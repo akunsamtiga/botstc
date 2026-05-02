@@ -8,12 +8,29 @@ const BASE_URL = 'https://api.stockity.id';
 export class ProfileService {
   private readonly logger = new Logger(ProfileService.name);
 
+  /**
+   * In-memory cache untuk session data agar tidak read Firestore berkali-kali.
+   * TTL: 30 detik — selaras dengan AuthService session cache.
+   */
+  private sessionCache = new Map<string, { data: any; expiresAt: number }>();
+  private readonly SESSION_CACHE_TTL_MS = 30_000;
+
   constructor(private firebaseService: FirebaseService) {}
 
   private async getSession(userId: string) {
+    const cached = this.sessionCache.get(userId);
+    if (cached && Date.now() < cached.expiresAt) {
+      return cached.data;
+    }
+
     const doc = await this.firebaseService.db.collection('sessions').doc(userId).get();
     if (!doc.exists) throw new Error('Session tidak ditemukan');
-    return doc.data();
+    const data = doc.data();
+    this.sessionCache.set(userId, {
+      data,
+      expiresAt: Date.now() + this.SESSION_CACHE_TTL_MS,
+    });
+    return data;
   }
 
   private buildHeaders(session: any): Record<string, string> {
@@ -113,6 +130,8 @@ export class ProfileService {
   }
 
   async updateCurrency(userId: string, currencyIso: string) {
+    // Invalidate cache agar read berikutnya fresh
+    this.sessionCache.delete(userId);
     await this.firebaseService.db.collection('sessions').doc(userId).update({
       currency: currencyIso,
       currencyIso,

@@ -19,12 +19,41 @@ const DEFAULT_TIMEZONE = 'Asia/Bangkok';
 export class AuthService {
   private readonly logger = new Logger(AuthService.name);
 
+  /**
+   * In-memory session cache untuk mengurangi read Firestore.
+   * TTL: 30 detik — cukup untuk burst request dari frontend polling,
+   * tapi tidak terlalu lama agar session updates tetap terbaca.
+   */
+  private sessionCache = new Map<string, { data: any; expiresAt: number }>();
+  private readonly SESSION_CACHE_TTL_MS = 30_000;
+
   constructor(
     private jwtService: JwtService,
     private firebaseService: FirebaseService,
   ) {}
 
-  // ── curlPost ─────────────────────────────────────────────────────────────────
+  // ── Cache helpers ─────────────────────────────────────────────────────────
+
+  private getCachedSession(userId: string): any | null {
+    const cached = this.sessionCache.get(userId);
+    if (cached && Date.now() < cached.expiresAt) {
+      return cached.data;
+    }
+    return null;
+  }
+
+  private setCachedSession(userId: string, data: any) {
+    this.sessionCache.set(userId, {
+      data,
+      expiresAt: Date.now() + this.SESSION_CACHE_TTL_MS,
+    });
+  }
+
+  private invalidateSessionCache(userId: string) {
+    this.sessionCache.delete(userId);
+  }
+
+  // ── curlPost ──────────────────────────────────────────────────────────────
   // Gunakan curl binary (bukan axios) untuk bypass Cloudflare JA3/JA4 fingerprint
   // blocking. Node.js/axios memiliki TLS fingerprint berbeda dari browser/curl,
   // sehingga Cloudflare silently hang koneksinya (ETIMEDOUT, no response).
@@ -184,6 +213,9 @@ export class AuthService {
         { merge: true },
       );
 
+    // Invalidate cache setelah write
+    this.invalidateSessionCache(stockityUserId);
+
     const jwt = this.jwtService.sign({ sub: stockityUserId, email });
     this.logger.log(`✅ Login berhasil: ${email} (userId: ${stockityUserId})`);
 
@@ -199,13 +231,26 @@ export class AuthService {
     await this.firebaseService.db.collection('sessions').doc(userId).update({
       loggedOutAt: this.firebaseService.FieldValue.serverTimestamp(),
     });
+    this.invalidateSessionCache(userId);
     return { message: 'Logout berhasil' };
   }
 
   async getMe(userId: string) {
+    const cached = this.getCachedSession(userId);
+    if (cached) {
+      return {
+        userId:      cached.userId,
+        email:       cached.email,
+        deviceId:    cached.deviceId,
+        currency:    cached.currency,
+        currencyIso: cached.currencyIso,
+      };
+    }
+
     const docSnap = await this.firebaseService.db.collection('sessions').doc(userId).get();
     if (!docSnap.exists) throw new UnauthorizedException('Session tidak ditemukan');
     const data = docSnap.data();
+    this.setCachedSession(userId, data);
     return {
       userId:      data.userId,
       email:       data.email,
@@ -216,8 +261,15 @@ export class AuthService {
   }
 
   async getSession(userId: string) {
+    const cached = this.getCachedSession(userId);
+    if (cached) {
+      return cached;
+    }
+
     const docSnap = await this.firebaseService.db.collection('sessions').doc(userId).get();
     if (!docSnap.exists) return null;
-    return docSnap.data();
+    const data = docSnap.data();
+    this.setCachedSession(userId, data);
+    return data;
   }
 }

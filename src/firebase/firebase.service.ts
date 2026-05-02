@@ -56,4 +56,46 @@ export class FirebaseService implements OnModuleInit {
   get Timestamp() {
     return admin.firestore.Timestamp;
   }
+
+  /**
+   * Utility: jalankan Firestore operation dengan exponential backoff.
+   * Berguna ketika RESOURCE_EXHAUSTED (quota exceeded) terjadi —
+   * akan retry dengan delay yang meningkat hingga maxAttempts.
+   *
+   * @param operation - async function yang mengembalikan Promise<T>
+   * @param maxAttempts - maksimum retry (default 3)
+   * @param baseDelayMs - delay awal dalam ms (default 500)
+   */
+  async withBackoff<T>(
+    operation: () => Promise<T>,
+    maxAttempts = 3,
+    baseDelayMs = 500,
+  ): Promise<T> {
+    let lastError: any;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        return await operation();
+      } catch (error: any) {
+        lastError = error;
+        const code = error?.code || error?.message || '';
+        const isResourceExhausted =
+          code === 8 ||
+          code === 'RESOURCE_EXHAUSTED' ||
+          (typeof code === 'string' && code.includes('RESOURCE_EXHAUSTED')) ||
+          (typeof error?.message === 'string' && error.message.includes('Quota exceeded'));
+
+        if (!isResourceExhausted || attempt === maxAttempts) {
+          throw error;
+        }
+
+        const delay = baseDelayMs * Math.pow(2, attempt - 1);
+        this.logger.warn(
+          `Firestore RESOURCE_EXHAUSTED (attempt ${attempt}/${maxAttempts}), ` +
+          `retrying in ${delay}ms...`
+        );
+        await new Promise(r => setTimeout(r, delay));
+      }
+    }
+    throw lastError;
+  }
 }

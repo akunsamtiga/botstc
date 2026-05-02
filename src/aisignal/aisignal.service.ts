@@ -62,10 +62,12 @@ export class AISignalService implements OnModuleInit, OnModuleDestroy {
    */
   async onModuleInit() {
     try {
-      const staleDocs = await this.firebaseService.db
-        .collection('aisignal_status')
-        .where('botState', '==', 'RUNNING')
-        .get();
+      const staleDocs = await this.firebaseService.withBackoff(() =>
+        this.firebaseService.db
+          .collection('aisignal_status')
+          .where('botState', '==', 'RUNNING')
+          .get(),
+      );
 
       if (!staleDocs.empty) {
         this.logger.warn(
@@ -79,7 +81,7 @@ export class AISignalService implements OnModuleInit, OnModuleDestroy {
             { merge: true },
           );
         }
-        await batch.commit();
+        await this.firebaseService.withBackoff(() => batch.commit());
         this.logger.log(`[Startup] Stale AI Signal statuses cleared`);
       }
     } catch (err: any) {

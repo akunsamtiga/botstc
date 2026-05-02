@@ -100,11 +100,14 @@ export class ScheduleService implements OnModuleInit, OnModuleDestroy {
 
   private async restoreActiveSessions() {
     try {
-      const snap = await this.firebaseService.db
-        .collection('schedule_status')
-        .where('botState', 'in', ['RUNNING', 'PAUSED'])
-        .get();
-      for (const doc of snap.docs) {
+      const snap = await this.firebaseService.withBackoff(() =>
+        this.firebaseService.db
+          .collection('schedule_status')
+          .where('botState', 'in', ['RUNNING', 'PAUSED'])
+          .get(),
+      );
+      for (let i = 0; i < snap.docs.length; i++) {
+        const doc = snap.docs[i];
         const userId = doc.id;
         const wasState = doc.data().botState;
         this.logger.log(`Restoring ${userId} (was ${wasState})`);
@@ -117,6 +120,10 @@ export class ScheduleService implements OnModuleInit, OnModuleDestroy {
         } catch (err: any) {
           this.logger.error(`Restore failed for ${userId}: ${err.message}`);
           await this.updateStatus(userId, 'STOPPED').catch(() => {});
+        }
+        // Stagger session restores to avoid Firestore quota burst
+        if (i < snap.docs.length - 1) {
+          await new Promise((r) => setTimeout(r, 1000));
         }
       }
     } catch (err: any) {

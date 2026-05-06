@@ -1,6 +1,7 @@
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
+import WebSocket from 'ws';
 
 @Injectable()
 export class SupabaseService implements OnModuleInit {
@@ -21,6 +22,7 @@ export class SupabaseService implements OnModuleInit {
 
     this._client = createClient(url, serviceKey, {
       auth: { persistSession: false, autoRefreshToken: false },
+      realtime: { transport: WebSocket as any },
     });
 
     this.logger.log('✅ Supabase PostgreSQL terhubung');

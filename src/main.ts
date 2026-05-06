@@ -1,23 +1,20 @@
 import { NestFactory } from '@nestjs/core';
 import { ValidationPipe, Logger } from '@nestjs/common';
 import { AppModule } from './app.module';
-import * as fs from 'fs';
-import * as path from 'path';
 
 async function bootstrap() {
   const logger = new Logger('Bootstrap');
-  
-  // Check Firebase Service Account
-  const serviceAccountPath = process.env.FIREBASE_SERVICE_ACCOUNT_PATH || './firebase-service-account.json';
-  const resolvedPath = path.resolve(process.cwd(), serviceAccountPath);
-  
-  if (fs.existsSync(resolvedPath)) {
-    logger.log(`✅ Firebase Service Account found: ${serviceAccountPath}`);
+
+  // Check Supabase config
+  const supabaseUrl = process.env.SUPABASE_URL;
+  const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+  if (supabaseUrl && supabaseKey) {
+    logger.log(`✅ Supabase config found (URL: ${supabaseUrl.slice(0, 20)}...)`);
   } else {
-    logger.warn(`⚠️ Firebase Service Account NOT found at: ${resolvedPath}`);
-    logger.warn(`   Make sure to set FIREBASE_SERVICE_ACCOUNT_PATH in .env`);
+    logger.warn(`⚠️ Supabase config missing. Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY in .env`);
   }
-  
+
   const app = await NestFactory.create(AppModule);
 
   app.enableCors({
@@ -50,7 +47,7 @@ async function bootstrap() {
   logger.log(`🚀 Stockity Schedule VPS running on port ${port}`);
   logger.log(`📡 API: http://localhost:${port}/api/v1`);
   logger.log(`✅ CORS enabled for: v2.stcautotrade.id`);
-  
+
   // AI Signal Mode Info
   logger.log(`🤖 AI Signal Mode: ENABLED`);
   logger.log(`📱 FCM Topic: trading_signals`);

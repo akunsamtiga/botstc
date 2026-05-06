@@ -3,11 +3,11 @@ import { Module } from '@nestjs/common';
 import { TodayProfitService } from './today-profit.service';
 import { TodayProfitController } from './today-profit.controller';
 import { StockityHistoryService } from './stockity-history.service';
-import { FirebaseModule } from '../firebase/firebase.module';
+import { SupabaseModule } from '../supabase/supabase.module';
 import { AuthModule } from '../auth/auth.module';
 
 @Module({
-  imports: [FirebaseModule, AuthModule],
+  imports: [SupabaseModule, AuthModule],
   providers: [TodayProfitService, StockityHistoryService],
   controllers: [TodayProfitController],
   exports: [TodayProfitService],

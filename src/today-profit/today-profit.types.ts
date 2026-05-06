@@ -31,9 +31,9 @@ export interface AssetProfitSummary {
 }
 
 export interface DataSourceMeta {
-  /** Trades pulled from Firebase mode logs (schedule, fastrade, etc.) */
-  firebaseTrades: number;
-  /** Trades pulled directly from Stockity API not present in Firebase */
+  /** Trades pulled from Supabase mode logs (schedule, fastrade, etc.) */
+  supabaseTrades: number;
+  /** Trades pulled directly from Stockity API not present in Supabase */
   stockityOnlyTrades: number;
   /** Whether Stockity API fetch had errors (partial data) */
   stockityApiError: boolean;
@@ -46,7 +46,7 @@ export interface TodayProfitQuery {
   userId: string;
   /**
    * When true, also fetch directly from Stockity API and merge.
-   * Trades already tracked in Firebase are deduplicated via UUID.
+   * Trades already tracked in Supabase are deduplicated via UUID.
    * Default: true
    */
   includeStockityApi?: boolean;
@@ -63,7 +63,7 @@ export interface TodayProfitResponse {
   error?: string;
 }
 
-/** Stockity credentials stored per user in Firestore */
+/** Stockity credentials stored per user in Supabase */
 export interface UserStockityCredentials {
   authToken: string;
   deviceId: string;

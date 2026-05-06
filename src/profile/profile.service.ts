@@ -1,5 +1,5 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { FirebaseService } from '../firebase/firebase.service';
+import { SupabaseService } from '../supabase/supabase.service';
 import { curlGet } from '../common/http-utils';
 
 const BASE_URL = 'https://api.stockity.id';
@@ -15,7 +15,7 @@ export class ProfileService {
   private sessionCache = new Map<string, { data: any; expiresAt: number }>();
   private readonly SESSION_CACHE_TTL_MS = 30_000;
 
-  constructor(private firebaseService: FirebaseService) {}
+  constructor(private supabaseService: SupabaseService) {}
 
   private async getSession(userId: string) {
     const cached = this.sessionCache.get(userId);
@@ -23,9 +23,14 @@ export class ProfileService {
       return cached.data;
     }
 
-    const doc = await this.firebaseService.db.collection('sessions').doc(userId).get();
-    if (!doc.exists) throw new Error('Session tidak ditemukan');
-    const data = doc.data();
+    const { data, error } = await this.supabaseService.client
+      .from('sessions')
+      .select('*')
+      .eq('user_id', userId)
+      .single();
+
+    if (error || !data) throw new Error('Session tidak ditemukan');
+
     this.sessionCache.set(userId, {
       data,
       expiresAt: Date.now() + this.SESSION_CACHE_TTL_MS,
@@ -35,11 +40,11 @@ export class ProfileService {
 
   private buildHeaders(session: any): Record<string, string> {
     return {
-      'device-id': session.deviceId,
-      'device-type': session.deviceType || 'web',
-      'user-timezone': session.userTimezone || 'Asia/Jakarta',
-      'authorization-token': session.stockityToken,
-      'User-Agent': session.userAgent,
+      'device-id': session.device_id,
+      'device-type': session.device_type || 'web',
+      'user-timezone': session.user_timezone || 'Asia/Jakarta',
+      'authorization-token': session.stockity_token,
+      'User-Agent': session.user_agent,
       'Accept': 'application/json, text/plain, */*',
       'Origin': 'https://stockity.id',
       'Referer': 'https://stockity.id/',
@@ -132,11 +137,14 @@ export class ProfileService {
   async updateCurrency(userId: string, currencyIso: string) {
     // Invalidate cache agar read berikutnya fresh
     this.sessionCache.delete(userId);
-    await this.firebaseService.db.collection('sessions').doc(userId).update({
-      currency: currencyIso,
-      currencyIso,
-      updatedAt: this.firebaseService.FieldValue.serverTimestamp(),
-    });
+    await this.supabaseService.client
+      .from('sessions')
+      .upsert({
+        user_id: userId,
+        currency: currencyIso,
+        currency_iso: currencyIso,
+        updated_at: this.supabaseService.now(),
+      });
     return { currencyIso, message: 'Currency diperbarui' };
   }
 }

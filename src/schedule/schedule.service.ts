@@ -1,5 +1,5 @@
 import { Injectable, Logger, OnModuleInit, OnModuleDestroy } from '@nestjs/common';
-import { FirebaseService } from '../firebase/firebase.service';
+import { SupabaseService } from '../supabase/supabase.service';
 import { AuthService } from '../auth/auth.service';
 import { OrderTrackingService } from './order-tracking.service';
 import { StockityWebSocketClient } from './websocket-client';
@@ -74,7 +74,7 @@ export class ScheduleService implements OnModuleInit, OnModuleDestroy {
   }>();
 
   constructor(
-    private readonly firebaseService: FirebaseService,
+    private readonly supabaseService: SupabaseService,
     private readonly authService: AuthService,
     private readonly trackingService: OrderTrackingService,
   ) {}
@@ -100,16 +100,17 @@ export class ScheduleService implements OnModuleInit, OnModuleDestroy {
 
   private async restoreActiveSessions() {
     try {
-      const snap = await this.firebaseService.withBackoff(() =>
-        this.firebaseService.db
-          .collection('schedule_status')
-          .where('botState', 'in', ['RUNNING', 'PAUSED'])
-          .get(),
+      const { data: statusData, error: statusError } = await this.supabaseService.withBackoff(async () =>
+        this.supabaseService.client
+          .from('schedule_status')
+          .select('*')
+          .in('bot_state', ['RUNNING', 'PAUSED']),
       );
-      for (let i = 0; i < snap.docs.length; i++) {
-        const doc = snap.docs[i];
-        const userId = doc.id;
-        const wasState = doc.data().botState;
+      const docs = statusData || [];
+      for (let i = 0; i < docs.length; i++) {
+        const doc = docs[i];
+        const userId = doc.user_id;
+        const wasState = doc.bot_state;
         this.logger.log(`Restoring ${userId} (was ${wasState})`);
         try {
           await this.startSchedule(userId);
@@ -122,7 +123,7 @@ export class ScheduleService implements OnModuleInit, OnModuleDestroy {
           await this.updateStatus(userId, 'STOPPED').catch(() => {});
         }
         // Stagger session restores to avoid Firestore quota burst
-        if (i < snap.docs.length - 1) {
+        if (i < docs.length - 1) {
           await new Promise((r) => setTimeout(r, 1000));
         }
       }
@@ -247,17 +248,17 @@ export class ScheduleService implements OnModuleInit, OnModuleDestroy {
   async getConfig(userId: string): Promise<ScheduleConfig> {
     if (this.configs.has(userId)) return this.configs.get(userId)!;
 
-    const doc = await this.firebaseService.db.collection('schedule_configs').doc(userId).get();
-    if (doc.exists) {
-      const d = doc.data() as any;
+    const { data: cfgData, error: cfgError } = await this.supabaseService.client.from('schedule_configs').select('*').eq('user_id', userId).single();
+    if (cfgData && !cfgError) {
+      const d = cfgData as any;
       const cfg: ScheduleConfig = {
         asset: d.asset || null,
         martingale: d.martingale || DEFAULT_CONFIG.martingale,
-        isDemoAccount: d.isDemoAccount ?? true,
+        isDemoAccount: d.is_demo_account ?? true,
         currency: d.currency || 'IDR',
-        currencyIso: d.currencyIso || 'IDR',
-        stopLoss: d.stopLoss ?? 0,
-        stopProfit: d.stopProfit ?? 0,
+        currencyIso: d.currency_iso || 'IDR',
+        stopLoss: d.stop_loss ?? 0,
+        stopProfit: d.stop_profit ?? 0,
       };
       this.configs.set(userId, cfg);
       return cfg;
@@ -281,9 +282,8 @@ export class ScheduleService implements OnModuleInit, OnModuleDestroy {
     this.configs.set(userId, cfg);
 
     const plainCfg = JSON.parse(JSON.stringify(cfg));
-    await this.firebaseService.db.collection('schedule_configs').doc(userId).set(
-      { ...plainCfg, updatedAt: this.firebaseService.FieldValue.serverTimestamp() },
-      { merge: true },
+    await this.supabaseService.client.from('schedule_configs').upsert(
+      { user_id: userId, ...plainCfg, updated_at: this.supabaseService.now() },
     );
     this.executors.get(userId)?.updateConfig(cfg);
     return cfg;
@@ -294,8 +294,8 @@ export class ScheduleService implements OnModuleInit, OnModuleDestroy {
   async getOrders(userId: string): Promise<ScheduledOrder[]> {
     const exec = this.executors.get(userId);
     if (exec) return exec.getOrders();
-    const doc = await this.firebaseService.db.collection('schedule_configs').doc(userId).get();
-    if (doc.exists) return (doc.data() as any)?.orders || [];
+    const { data: cfgData, error: cfgError } = await this.supabaseService.client.from('schedule_configs').select('*').eq('user_id', userId).single();
+    if (cfgData && !cfgError) return (cfgData as any)?.orders || [];
     return [];
   }
 
@@ -340,9 +340,8 @@ export class ScheduleService implements OnModuleInit, OnModuleDestroy {
   }
 
   private async saveOrders(userId: string, orders: ScheduledOrder[]) {
-    await this.firebaseService.db.collection('schedule_configs').doc(userId).set(
-      { orders, updatedAt: this.firebaseService.FieldValue.serverTimestamp() },
-      { merge: true },
+    await this.supabaseService.client.from('schedule_configs').upsert(
+      { user_id: userId, orders, updated_at: this.supabaseService.now() },
     );
   }
 
@@ -522,18 +521,18 @@ export class ScheduleService implements OnModuleInit, OnModuleDestroy {
         alwaysSignalLossState: exec.getAlwaysSignalLossState(),
       };
     }
-    const statusDoc = await this.firebaseService.db.collection('schedule_status').doc(userId).get();
+    const { data: statusDoc, error: statusDocError } = await this.supabaseService.client.from('schedule_status').select('*').eq('user_id', userId).single();
     const orders = await this.getOrders(userId);
-    const statusData = statusDoc.exists ? statusDoc.data() : null;
+    const statusData = statusDoc && !statusDocError ? statusDoc : null;
     return {
-      botState: statusData?.botState ?? 'STOPPED',
+      botState: statusData?.bot_state ?? 'STOPPED',
       totalOrders: orders.length,
       pendingOrders: orders.filter(o => !o.isExecuted && !o.isSkipped).length,
       executedOrders: orders.filter(o => o.isExecuted).length,
       skippedOrders: orders.filter(o => o.isSkipped).length,
       activeMartingaleOrderId: null,
       wsConnected: false,
-      sessionPnL: statusData?.sessionPnL ?? 0,
+      sessionPnL: statusData?.session_pnl ?? 0,
       orders,
     };
   }
@@ -541,17 +540,17 @@ export class ScheduleService implements OnModuleInit, OnModuleDestroy {
   async getLogs(userId: string, limit = 100): Promise<ExecutionLog[]> {
     const mem = this.logs.get(userId) || [];
     if (mem.length > 0) return mem.slice(-limit);
-    const snap = await this.firebaseService.db
-      .collection('schedule_logs').doc(userId)
-      .collection('entries')
-      .orderBy('executedAt', 'desc').limit(limit).get();
-    return snap.docs.map(d => {
-      const data = d.data() as any;
-      return {
-        ...data,
-        executedAt: data.executedAt?.toMillis?.() ?? data.executedAt ?? 0,
-      } as ExecutionLog;
-    });
+    const { data: logData, error: logError } = await this.supabaseService.client
+      .from('mode_logs')
+      .select('*')
+      .eq('user_id', userId)
+      .eq('mode', 'schedule')
+      .order('executed_at', { ascending: false })
+      .limit(limit);
+    return (logData || []).map(d => ({
+      ...(d.data as ExecutionLog),
+      executedAt: new Date(d.executed_at).getTime(),
+    }));
   }
 
   // ── Input Parser ──────────────────────────────
@@ -601,22 +600,24 @@ export class ScheduleService implements OnModuleInit, OnModuleDestroy {
 
   private async updateStatus(userId: string, botState: string, sessionPnL?: number) {
     const extra: any = {};
-    if (botState === 'RUNNING') extra.startedAt = this.firebaseService.FieldValue.serverTimestamp();
+    if (botState === 'RUNNING') extra.started_at = this.supabaseService.now();
     if (botState === 'STOPPED') {
-      extra.stoppedAt = this.firebaseService.FieldValue.serverTimestamp();
-      if (sessionPnL !== undefined) extra.sessionPnL = sessionPnL;
+      extra.stopped_at = this.supabaseService.now();
+      if (sessionPnL !== undefined) extra.session_pnl = sessionPnL;
     }
-    await this.firebaseService.db.collection('schedule_status').doc(userId).set(
-      { botState, updatedAt: this.firebaseService.FieldValue.serverTimestamp(), ...extra },
-      { merge: true },
+    await this.supabaseService.client.from('schedule_status').upsert(
+      { user_id: userId, bot_state: botState, updated_at: this.supabaseService.now(), ...extra },
     );
   }
 
   private async appendLog(userId: string, log: ExecutionLog) {
-    await this.firebaseService.db
-      .collection('schedule_logs').doc(userId)
-      .collection('entries').doc(log.id)
-      .set({ ...log, executedAt: this.firebaseService.Timestamp.fromMillis(log.executedAt) });
+    await this.supabaseService.client.from('mode_logs').upsert({
+      id: log.id,
+      user_id: userId,
+      mode: 'schedule',
+      data: log,
+      executed_at: this.supabaseService.timestampFromMillis(log.executedAt),
+    });
   }
 
   private cleanup(userId: string) {

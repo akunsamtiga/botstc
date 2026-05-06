@@ -24,7 +24,7 @@ export class TodayProfitController {
    *   - date:        optional, YYYY-MM-DD (default: today)
    *   - accountType: 'real' | 'demo' | 'both' (default: 'real')
    *                  Controls which Stockity account type is fetched from the API.
-   *                  Firebase mode logs are always fetched regardless of this param.
+   *                  Supabase mode logs are always fetched regardless of this param.
    */
   @Get()
   @HttpCode(200)

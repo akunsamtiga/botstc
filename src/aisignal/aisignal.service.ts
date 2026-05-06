@@ -1,8 +1,7 @@
 import { Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
-import * as admin from 'firebase-admin';
-import { FirebaseService } from '../firebase/firebase.service';
+import { SupabaseService } from '../supabase/supabase.service';
 import { AuthService } from '../auth/auth.service';
-import { FirebaseMessagingService } from '../firebase/firebase-messaging.service';
+import { PushNotificationService, PushMessage } from '../supabase/push-notification.service';
 import { TelegramSignalService } from './telegram-signal.service';
 import { StockityWebSocketClient } from '../schedule/websocket-client';
 import { AISignalMonitorService } from './ai-signal-monitor.service';
@@ -48,9 +47,9 @@ export class AISignalService implements OnModuleInit, OnModuleDestroy {
   private activeModes = new Map<string, ActiveMode>();
 
   constructor(
-    private readonly firebaseService: FirebaseService,
+    private readonly supabaseService: SupabaseService,
     private readonly authService: AuthService,
-    private readonly firebaseMessaging: FirebaseMessagingService,
+    private readonly pushNotification: PushNotificationService,
     private readonly aiSignalMonitor: AISignalMonitorService,
     private readonly telegramSignalService: TelegramSignalService,
   ) {}
@@ -62,26 +61,20 @@ export class AISignalService implements OnModuleInit, OnModuleDestroy {
    */
   async onModuleInit() {
     try {
-      const staleDocs = await this.firebaseService.withBackoff(() =>
-        this.firebaseService.db
-          .collection('aisignal_status')
-          .where('botState', '==', 'RUNNING')
-          .get(),
-      );
+      const { data: staleRows, error } = await this.supabaseService.client
+        .from('aisignal_status')
+        .select('user_id')
+        .eq('bot_state', 'RUNNING');
 
-      if (!staleDocs.empty) {
+      if (!error && staleRows && staleRows.length > 0) {
         this.logger.warn(
-          `[Startup] Found ${staleDocs.size} stale RUNNING AI Signal status(es) — resetting to STOPPED`,
+          `[Startup] Found ${staleRows.length} stale RUNNING AI Signal status(es) — resetting to STOPPED`,
         );
-        const batch = this.firebaseService.db.batch();
-        for (const doc of staleDocs.docs) {
-          batch.set(
-            doc.ref,
-            { botState: 'STOPPED', updatedAt: this.firebaseService.FieldValue.serverTimestamp() },
-            { merge: true },
-          );
-        }
-        await this.firebaseService.withBackoff(() => batch.commit());
+        const userIds = (staleRows as any[]).map((r) => r.user_id);
+        await this.supabaseService.client
+          .from('aisignal_status')
+          .update({ bot_state: 'STOPPED', updated_at: this.supabaseService.now() })
+          .in('user_id', userIds);
         this.logger.log(`[Startup] Stale AI Signal statuses cleared`);
       }
     } catch (err: any) {
@@ -100,9 +93,9 @@ export class AISignalService implements OnModuleInit, OnModuleDestroy {
   async getConfig(userId: string): Promise<AISignalConfig> {
     if (this.configs.has(userId)) return this.configs.get(userId)!;
 
-    const doc = await this.firebaseService.db.collection('aisignal_configs').doc(userId).get();
-    if (doc.exists) {
-      const d = doc.data() as any;
+    const { data: doc, error } = await this.supabaseService.client.from('aisignal_configs').select('*').eq('user_id', userId).single();
+    if (doc && !error) {
+      const d = doc as any;
       const cfg: AISignalConfig = {
         asset: d.asset || null,
         baseAmount: d.baseAmount || 1400000,
@@ -143,9 +136,8 @@ export class AISignalService implements OnModuleInit, OnModuleDestroy {
     this.configs.set(userId, updated);
 
     const plainCfg = JSON.parse(JSON.stringify(updated));
-    await this.firebaseService.db.collection('aisignal_configs').doc(userId).set(
-      { ...plainCfg, updatedAt: this.firebaseService.FieldValue.serverTimestamp() },
-      { merge: true },
+    await this.supabaseService.client.from('aisignal_configs').upsert(
+      { user_id: userId, ...plainCfg, updated_at: this.supabaseService.now() },
     );
 
     return updated;
@@ -278,8 +270,8 @@ export class AISignalService implements OnModuleInit, OnModuleDestroy {
       };
     }
 
-    const statusDoc = await this.firebaseService.db.collection('aisignal_status').doc(userId).get();
-    if (statusDoc.exists && statusDoc.data()?.botState === 'RUNNING') {
+    const { data: statusDoc, error: statusError } = await this.supabaseService.client.from('aisignal_status').select('*').eq('user_id', userId).single();
+    if (!statusError && statusDoc && statusDoc.bot_state === 'RUNNING') {
       await this.updateStatus(userId, 'STOPPED');
       this.logger.warn(`[${userId}] Stale RUNNING status detected, auto-reset to STOPPED`);
     }
@@ -412,7 +404,7 @@ export class AISignalService implements OnModuleInit, OnModuleDestroy {
 
       const topic = `trading_signals_${userId}`;
 
-      const message: admin.messaging.Message = {
+      const message: PushMessage = {
         topic,
         data: {
           type: 'TRADING_SIGNAL',
@@ -440,7 +432,7 @@ export class AISignalService implements OnModuleInit, OnModuleDestroy {
         },
       };
 
-      await this.firebaseMessaging.send(message);
+      await this.pushNotification.send(message);
       this.logger.log(`[${userId}] Signal sent to FCM topic '${topic}'`);
     } catch (err: any) {
       this.logger.debug(`[${userId}] FCM send skipped: ${err?.message || err}`);
@@ -1015,7 +1007,7 @@ export class AISignalService implements OnModuleInit, OnModuleDestroy {
         result: tradeResult,
         profit,
         sessionPnL: mode.stats.sessionPnL,
-        executedAt: this.firebaseService.Timestamp.fromMillis(Date.now()),
+        executedAt: this.supabaseService.timestampFromMillis(Date.now()),
         isDemoAccount: mode.config.isDemoAccount,
         ric: order?.assetRic || mode.config.asset?.ric || 'unknown',
         assetRic: order?.assetRic || mode.config.asset?.ric || 'unknown',
@@ -1023,12 +1015,16 @@ export class AISignalService implements OnModuleInit, OnModuleDestroy {
         mode: 'aisignal',
       };
 
-      await this.firebaseService.db
-        .collection('aisignal_logs')
-        .doc(userId)
-        .collection('entries')
-        .doc(logEntry.id)
-        .set(logEntry);
+      await this.supabaseService.client
+        .from('mode_logs')
+        .insert({
+          id: logEntry.id,
+          user_id: userId,
+          mode: 'aisignal',
+          data: logEntry,
+          executed_at: logEntry.executedAt,
+          created_at: this.supabaseService.now(),
+        });
 
       this.logger.log(
         `[${userId}] 📝 AI Signal log saved: ${tradeResult} ${amount} profit=${profit} step=${result.martingaleStep}`,
@@ -1039,9 +1035,8 @@ export class AISignalService implements OnModuleInit, OnModuleDestroy {
   }
 
   private async updateStatus(userId: string, botState: string) {
-    await this.firebaseService.db.collection('aisignal_status').doc(userId).set(
-      { botState, updatedAt: this.firebaseService.FieldValue.serverTimestamp() },
-      { merge: true },
+    await this.supabaseService.client.from('aisignal_status').upsert(
+      { user_id: userId, bot_state: botState, updated_at: this.supabaseService.now() },
     );
   }
 

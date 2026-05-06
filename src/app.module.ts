@@ -1,8 +1,7 @@
-// src/app.module.ts (update)
 import { Module } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
 import { ScheduleModule } from '@nestjs/schedule';
-import { FirebaseModule } from './firebase/firebase.module';
+import { SupabaseModule } from './supabase/supabase.module';
 import { AuthModule } from './auth/auth.module';
 import { ProfileModule } from './profile/profile.module';
 import { ScheduleModule as ScheduleAppModule } from './schedule/schedule.module';
@@ -10,13 +9,13 @@ import { FastradeModule } from './fastrade/fastrade.module';
 import { IndicatorModule } from './indicator/indicator.module';
 import { MomentumModule } from './momentum/momentum.module';
 import { AISignalModule } from './aisignal/aisignal.module';
-import { TodayProfitModule } from './today-profit/today-profit.module'; 
+import { TodayProfitModule } from './today-profit/today-profit.module';
 
 @Module({
   imports: [
     ConfigModule.forRoot({ isGlobal: true }),
     ScheduleModule.forRoot(),
-    FirebaseModule,
+    SupabaseModule,
     AuthModule,
     ProfileModule,
     ScheduleAppModule,
@@ -24,7 +23,7 @@ import { TodayProfitModule } from './today-profit/today-profit.module';
     IndicatorModule,
     MomentumModule,
     AISignalModule,
-    TodayProfitModule, 
+    TodayProfitModule,
   ],
 })
 export class AppModule {}

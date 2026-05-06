@@ -1,6 +1,6 @@
 // src/today-profit/today-profit.service.ts
 import { Injectable, Logger } from '@nestjs/common';
-import { FirebaseService } from '../firebase/firebase.service';
+import { SupabaseService } from '../supabase/supabase.service';
 import { AuthService } from '../auth/auth.service';
 import {
   TodayProfitSummary,
@@ -34,7 +34,7 @@ interface LogEntry {
 }
 
 interface MergedTrade {
-  source: 'firebase' | 'stockity';
+  source: 'supabase' | 'stockity';
   result: 'WIN' | 'LOSE' | 'DRAW';
   profit: number;
   ric: string;
@@ -57,9 +57,9 @@ interface StockityCache {
   dateStr: string;
 }
 
-/** Cached Firebase trades per user per day */
-interface FirebaseTradesCache {
-  firebaseTrades: MergedTrade[];
+/** Cached Supabase trades per user per day */
+interface SupabaseTradesCache {
+  supabaseTrades: MergedTrade[];
   knownUuids: Set<string>;
   knownNumericIds: Set<string>;
   fetchedAt: number;
@@ -79,12 +79,12 @@ export class TodayProfitService {
   private readonly STOCKITY_CACHE_TTL_MS = 25_000;
 
   /**
-   * In-memory per-user-per-day cache for Firebase mode logs.
-   * TTL: 10s — drastically reduces Firestore reads when frontend polls /realtime.
+   * In-memory per-user-per-day cache for Supabase mode logs.
+   * TTL: 10s — drastically reduces Supabase reads when frontend polls /realtime.
    * Each day has separate cache key so day changes auto-miss.
    */
-  private readonly firebaseTradesCache = new Map<string, FirebaseTradesCache>();
-  private readonly FIREBASE_CACHE_TTL_MS = 10_000;
+  private readonly supabaseTradesCache = new Map<string, SupabaseTradesCache>();
+  private readonly SUPABASE_CACHE_TTL_MS = 10_000;
 
   /**
    * In-memory cache for Stockity credentials (sessions/{userId}).
@@ -94,19 +94,19 @@ export class TodayProfitService {
   private readonly CREDENTIALS_CACHE_TTL_MS = 60_000;
 
   /**
-   * Trading modes tracked via Firebase mode logs.
-   * Each mode writes to `{mode}_logs/{userId}/entries`.
+   * Trading modes tracked via Supabase mode logs.
+   * Each mode writes to `mode_logs` table with user_id and mode columns.
    */
   private readonly MODES = ['schedule', 'fastrade', 'indicator', 'momentum', 'aisignal'];
 
   /**
-   * Firestore path where user sessions/credentials are stored.
-   * Login (auth.service.ts) saves to `sessions/{userId}` with field `stockityToken`.
+   * Supabase table where user sessions/credentials are stored.
+   * Login (auth.service.ts) saves to `sessions` table with user_id and stockity_token columns.
    */
   private readonly CREDENTIALS_COLLECTION = 'sessions';
 
   constructor(
-    private readonly firebaseService: FirebaseService,
+    private readonly supabaseService: SupabaseService,
     private readonly authService: AuthService,
     private readonly stockityHistoryService: StockityHistoryService,
   ) {}
@@ -117,9 +117,9 @@ export class TodayProfitService {
    * Get today's profit summary for a user.
    *
    * Strategy:
-   *  1. Pull all Firebase mode logs for the day → build a Set of known deal UUIDs.
+   *  1. Pull all Supabase mode logs for the day → build a Set of known deal UUIDs.
    *  2. Pull Stockity API history for the day (real + demo as configured).
-   *  3. Any Stockity deal whose UUID is NOT in the Firebase set → add as extra.
+   *  3. Any Stockity deal whose UUID is NOT in the Supabase set → add as extra.
    *  4. Aggregate everything into a single unified summary.
    */
   async getTodayProfit(
@@ -132,9 +132,9 @@ export class TodayProfitService {
 
     this.logger.log(`[${userId}] Calculating profit for ${targetDate}`);
 
-    // ── Step 1: collect Firebase log trades ──────────────────────────────────
-    const { firebaseTrades, knownUuids, knownNumericIds } =
-      await this.collectFirebaseTrades(userId, startOfDay, endOfDay, targetDate);
+    // ── Step 1: collect Supabase log trades ──────────────────────────────────
+    const { supabaseTrades, knownUuids, knownNumericIds } =
+      await this.collectSupabaseTrades(userId, startOfDay, endOfDay, targetDate);
 
     // ── Step 2: collect Stockity API trades (skip already-known deals) ───────
     const { stockityTrades, meta } = await this.collectStockityTrades(
@@ -147,11 +147,11 @@ export class TodayProfitService {
     );
 
     // ── Step 3: merge & aggregate ─────────────────────────────────────────────
-    const allTrades: MergedTrade[] = [...firebaseTrades, ...stockityTrades];
+    const allTrades: MergedTrade[] = [...supabaseTrades, ...stockityTrades];
 
     return this.buildSummary(targetDate, allTrades, {
       ...meta,
-      firebaseTrades: firebaseTrades.length,
+      supabaseTrades: supabaseTrades.length,
       stockityOnlyTrades: stockityTrades.length,
     });
   }
@@ -173,13 +173,13 @@ export class TodayProfitService {
     const rangeStartMs = start.getTime();
     const rangeEndMs   = end.getTime() + 86400000 - 1; // akhir hari endDate
 
-    const allFirebaseTrades = await this.collectFirebaseTradesForRange(
+    const allSupabaseTrades = await this.collectSupabaseTradesForRange(
       userId, rangeStartMs, rangeEndMs,
     );
 
     // Group trades by date (WIB)
     const tradesByDate = new Map<string, MergedTrade[]>();
-    for (const trade of allFirebaseTrades) {
+    for (const trade of allSupabaseTrades) {
       const d = this.formatDateWIB(trade.executedAtMs || Date.now());
       if (!tradesByDate.has(d)) tradesByDate.set(d, []);
       tradesByDate.get(d)!.push(trade);
@@ -192,14 +192,14 @@ export class TodayProfitService {
 
       // Jika tidak ada data Firebase untuk hari ini, skip (hemat Stockity API call)
       if (dayTrades.length === 0) {
-        this.logger.debug(`[${userId}] Skipping ${dateStr} — no Firebase data`);
+        this.logger.debug(`[${userId}] Skipping ${dateStr} — no Supabase data`);
         continue;
       }
 
       // Reuse known UUIDs dari cache jika ada, atau rebuild
       const { startOfDay, endOfDay } = this.getDayBoundaries(dateStr);
       const { knownUuids, knownNumericIds } =
-        await this.collectFirebaseTrades(userId, startOfDay, endOfDay, dateStr);
+        await this.collectSupabaseTrades(userId, startOfDay, endOfDay, dateStr);
 
       const { stockityTrades, meta } = await this.collectStockityTrades(
         userId, 'real', startOfDay, endOfDay, knownUuids, knownNumericIds,
@@ -209,7 +209,7 @@ export class TodayProfitService {
       if (allTrades.length > 0) {
         results.push(this.buildSummary(dateStr, allTrades, {
           ...meta,
-          firebaseTrades: dayTrades.length,
+          supabaseTrades: dayTrades.length,
           stockityOnlyTrades: stockityTrades.length,
         }));
       }
@@ -218,7 +218,7 @@ export class TodayProfitService {
   }
 
   /**
-   * Realtime proxy — uses CACHED Stockity data + fresh Firebase data.
+   * Realtime proxy — uses CACHED Stockity data + fresh Supabase data.
    * This is fast (~200ms) because it skips the slow Stockity API fetch.
    * Cache is populated/refreshed by getTodayProfit() every 25s or on demand.
    */
@@ -226,8 +226,8 @@ export class TodayProfitService {
     const targetDate = this.getTodayDateString();
     const { startOfDay, endOfDay } = this.getDayBoundaries(targetDate);
 
-    const { firebaseTrades, knownUuids, knownNumericIds } =
-      await this.collectFirebaseTrades(userId, startOfDay, endOfDay, targetDate);
+    const { supabaseTrades, knownUuids, knownNumericIds } =
+      await this.collectSupabaseTrades(userId, startOfDay, endOfDay, targetDate);
 
     // Use cached Stockity data if available — skip live API call
     const cached = this.stockityCache.get(userId);
@@ -255,9 +255,9 @@ export class TodayProfitService {
       }
     }
 
-    const allTrades: MergedTrade[] = [...firebaseTrades, ...stockityTrades];
+    const allTrades: MergedTrade[] = [...supabaseTrades, ...stockityTrades];
     return this.buildSummary(targetDate, allTrades, {
-      firebaseTrades: firebaseTrades.length,
+      supabaseTrades: supabaseTrades.length,
       stockityOnlyTrades: stockityTrades.length,
       stockityCredentialsFound: !!cached,
       stockityApiError: cached?.hadErrors ?? false,
@@ -267,38 +267,38 @@ export class TodayProfitService {
   // ── Firebase collection ─────────────────────────────────────────────────────
 
   /**
-   * Pull all mode logs from Firebase for the given day,
+   * Pull all mode logs from Supabase for the given day,
    * returning normalized MergedTrade entries plus dedup key sets.
    *
    * OPTIMASI: Gunakan in-memory cache 10s agar polling /realtime tidak menghantam Firestore.
    */
-  private async collectFirebaseTrades(
+  private async collectSupabaseTrades(
     userId: string,
     startOfDay: number,
     endOfDay: number,
     dateStr: string,
   ): Promise<{
-    firebaseTrades: MergedTrade[];
+    supabaseTrades: MergedTrade[];
     knownUuids: Set<string>;
     knownNumericIds: Set<string>;
   }> {
     const cacheKey = `${userId}_${dateStr}`;
-    const cached = this.firebaseTradesCache.get(cacheKey);
-    if (cached && (Date.now() - cached.fetchedAt) < this.FIREBASE_CACHE_TTL_MS) {
-      this.logger.debug(`[${userId}] Using cached Firebase trades for ${dateStr} (age=${Date.now() - cached.fetchedAt}ms)`);
+    const cached = this.supabaseTradesCache.get(cacheKey);
+    if (cached && (Date.now() - cached.fetchedAt) < this.SUPABASE_CACHE_TTL_MS) {
+      this.logger.debug(`[${userId}] Using cached Supabase trades for ${dateStr} (age=${Date.now() - cached.fetchedAt}ms)`);
       return {
-        firebaseTrades: cached.firebaseTrades,
+        supabaseTrades: cached.supabaseTrades,
         knownUuids: new Set(cached.knownUuids),
         knownNumericIds: new Set(cached.knownNumericIds),
       };
     }
 
-    const firebaseTrades: MergedTrade[] = [];
+    const supabaseTrades: MergedTrade[] = [];
     const knownUuids = new Set<string>();
     const knownNumericIds = new Set<string>();
 
     for (const mode of this.MODES) {
-      const logs = await this.fetchLogsFromFirebase(userId, mode, startOfDay, endOfDay);
+      const logs = await this.fetchLogsFromSupabase(userId, mode, startOfDay, endOfDay);
       const processedKeys = new Set<string>();
 
       for (const log of logs) {
@@ -335,8 +335,8 @@ export class TodayProfitService {
             ? -(log.amount || 0)
             : 0);
 
-        firebaseTrades.push({
-          source: 'firebase',
+        supabaseTrades.push({
+          source: 'supabase',
           result: log.result as 'WIN' | 'LOSE' | 'DRAW',
           profit,
           ric: log.ric || log.assetRic || 'unknown',
@@ -349,22 +349,22 @@ export class TodayProfitService {
     }
 
     // Simpan ke cache
-    this.firebaseTradesCache.set(cacheKey, {
-      firebaseTrades,
+    this.supabaseTradesCache.set(cacheKey, {
+      supabaseTrades,
       knownUuids: new Set(knownUuids),
       knownNumericIds: new Set(knownNumericIds),
       fetchedAt: Date.now(),
       dateStr,
     });
 
-    return { firebaseTrades, knownUuids, knownNumericIds };
+    return { supabaseTrades, knownUuids, knownNumericIds };
   }
 
   /**
-   * Fetch ALL Firebase mode logs untuk suatu rentang waktu (multi-day).
+   * Fetch ALL Supabase mode logs untuk suatu rentang waktu (multi-day).
    * Digunakan oleh getProfitHistory() agar tidak N+1 query per hari.
    */
-  private async collectFirebaseTradesForRange(
+  private async collectSupabaseTradesForRange(
     userId: string,
     startTime: number,
     endTime: number,
@@ -372,7 +372,7 @@ export class TodayProfitService {
     const allTrades: Array<MergedTrade & { executedAtMs: number }> = [];
 
     for (const mode of this.MODES) {
-      const logs = await this.fetchLogsFromFirebase(userId, mode, startTime, endTime);
+      const logs = await this.fetchLogsFromSupabase(userId, mode, startTime, endTime);
       const processedKeys = new Set<string>();
 
       for (const log of logs) {
@@ -404,7 +404,7 @@ export class TodayProfitService {
             : 0);
 
         allTrades.push({
-          source: 'firebase',
+          source: 'supabase',
           result: log.result as 'WIN' | 'LOSE' | 'DRAW',
           profit,
           ric: log.ric || log.assetRic || 'unknown',
@@ -424,10 +424,10 @@ export class TodayProfitService {
 
   /**
    * Fetch trades directly from Stockity API and filter out those already
-   * tracked in Firebase (identified by UUID match).
+   * tracked in Supabase (identified by UUID match).
    *
    * Remaining trades are "orphan" trades — executed via the app/browser
-   * directly or not yet synced to Firebase mode logs.
+   * directly or not yet synced to Supabase mode logs.
    */
   private async collectStockityTrades(
     userId: string,
@@ -436,8 +436,8 @@ export class TodayProfitService {
     endOfDay: number,
     knownUuids: Set<string>,
     knownNumericIds: Set<string>,
-  ): Promise<{ stockityTrades: MergedTrade[]; meta: Omit<DataSourceMeta, 'firebaseTrades' | 'stockityOnlyTrades'> }> {
-    const defaultMeta: Omit<DataSourceMeta, 'firebaseTrades' | 'stockityOnlyTrades'> = {
+  ): Promise<{ stockityTrades: MergedTrade[]; meta: Omit<DataSourceMeta, 'supabaseTrades' | 'stockityOnlyTrades'> }> {
+    const defaultMeta: Omit<DataSourceMeta, 'supabaseTrades' | 'stockityOnlyTrades'> = {
       stockityCredentialsFound: false,
       stockityApiError: false,
     };
@@ -575,29 +575,30 @@ export class TodayProfitService {
     };
   }
 
-  // ── Firebase helpers ────────────────────────────────────────────────────────
+  // ── Supabase helpers ────────────────────────────────────────────────────────
 
-  private async fetchLogsFromFirebase(
+  private async fetchLogsFromSupabase(
     userId: string,
     mode: string,
     startTime: number,
     endTime: number,
   ): Promise<LogEntry[]> {
     try {
-      const startTs = this.firebaseService.Timestamp.fromMillis(startTime);
-      const endTs   = this.firebaseService.Timestamp.fromMillis(endTime);
+      const startTs = this.supabaseService.timestampFromMillis(startTime);
+      const endTs   = this.supabaseService.timestampFromMillis(endTime);
 
-      const snapshot = await this.firebaseService.db
-        .collection(`${mode}_logs`)
-        .doc(userId)
-        .collection('entries')
-        .where('executedAt', '>=', startTs)
-        .where('executedAt', '<=', endTs)
-        .orderBy('executedAt', 'desc')
-        .limit(1000)
-        .get();
+      const { data: snapshot, error } = await this.supabaseService.client
+        .from('mode_logs')
+        .select('*')
+        .eq('user_id', userId)
+        .eq('mode', mode)
+        .gte('executed_at', startTs)
+        .lte('executed_at', endTs)
+        .order('executed_at', { ascending: false })
+        .limit(1000);
 
-      return snapshot.docs.map(doc => ({ ...(doc.data() as LogEntry), mode }));
+      if (error || !snapshot) return [];
+      return snapshot.map(doc => ({ ...((doc.data || doc) as LogEntry), mode }));
     } catch (err: any) {
       this.logger.warn(`[${userId}] Failed to fetch ${mode} logs: ${err.message}`);
       return [];
@@ -624,19 +625,20 @@ export class TodayProfitService {
     }
 
     try {
-      const doc = await this.firebaseService.db
-        .collection(this.CREDENTIALS_COLLECTION)
-        .doc(userId)
-        .get();
+      const { data: doc, error } = await this.supabaseService.client
+        .from('sessions')
+        .select('*')
+        .eq('user_id', userId)
+        .single();
 
-      if (!doc.exists) {
+      if (error || !doc) {
         this.credentialsCache.set(userId, { data: null, expiresAt: Date.now() + this.CREDENTIALS_CACHE_TTL_MS });
         return null;
       }
 
-      const data = doc.data() as Partial<UserStockityCredentials>;
+      const data = doc as Partial<UserStockityCredentials>;
       if (!data.authToken || !data.deviceId || !data.deviceType) {
-        this.logger.warn(`[${userId}] Incomplete Stockity credentials in Firestore`);
+        this.logger.warn(`[${userId}] Incomplete Stockity credentials in Supabase`);
         this.credentialsCache.set(userId, { data: null, expiresAt: Date.now() + this.CREDENTIALS_CACHE_TTL_MS });
         return null;
       }

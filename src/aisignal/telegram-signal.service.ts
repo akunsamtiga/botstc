@@ -1,7 +1,6 @@
 import { Injectable, Logger, OnModuleDestroy } from '@nestjs/common';
-import { FirebaseService } from '../firebase/firebase.service';
+import { SupabaseService } from '../supabase/supabase.service';
 import { TelegramSignal } from './types';
-import * as admin from 'firebase-admin';
 
 interface SignalCallback {
   (userId: string, signal: TelegramSignal): void;
@@ -21,7 +20,7 @@ export class TelegramSignalService implements OnModuleDestroy {
   // (written by Python bridge after receiving from Telegram)
   private globalUnsubscribe: (() => void) | null = null;
 
-  constructor(private readonly firebaseService: FirebaseService) {}
+  constructor(private readonly supabaseService: SupabaseService) {}
 
   onModuleDestroy() {
     this.stopGlobalListener();
@@ -93,38 +92,36 @@ export class TelegramSignalService implements OnModuleDestroy {
    */
   private async startGlobalListener(): Promise<void> {
     try {
-      const collectionRef = this.firebaseService.db.collection('telegram_signals');
-
-      // Only listen to NEW documents (not past ones that may have accumulated)
-      const startTime = admin.firestore.Timestamp.now();
-
-      this.globalUnsubscribe = collectionRef
-        .where('processedAt', '>=', startTime)
-        .onSnapshot(
-          (snapshot) => {
-            snapshot.docChanges().forEach((change) => {
-              if (change.type === 'added') {
-                this.processGlobalSignal(change.doc);
-              }
-            });
+      const channel = this.supabaseService.client
+        .channel('telegram_signals_global')
+        .on(
+          'postgres_changes' as any,
+          { event: 'INSERT', schema: 'public', table: 'telegram_signals' },
+          (payload: any) => {
+            this.processGlobalSignal(payload.new, payload.new.id);
           },
-          (error) => {
-            this.logger.error(`Global Firestore listener error: ${error.message}`);
-            // Restart listener after delay
+        )
+        .subscribe((status: string) => {
+          if (status === 'SUBSCRIBED') {
+            this.logger.log(
+              `✅ Supabase realtime listener started on 'telegram_signals' table`,
+            );
+          } else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') {
+            this.logger.error(`Supabase realtime listener error: ${status}`);
             this.globalUnsubscribe = null;
             setTimeout(() => {
               if (this.activeUserIds.size > 0) {
                 this.startGlobalListener().catch((e) =>
-                  this.logger.error(`Failed to restart global listener: ${e.message}`),
+                  this.logger.error(`Failed to restart global listener: ${(e as Error).message}`),
                 );
               }
             }, 5000);
-          },
-        );
+          }
+        });
 
-      this.logger.log(
-        `✅ Global Firestore listener started on 'telegram_signals' collection`,
-      );
+      this.globalUnsubscribe = () => {
+        this.supabaseService.client.removeChannel(channel);
+      };
     } catch (error) {
       this.logger.error(
         `Failed to start global listener: ${(error as Error).message}`,
@@ -145,11 +142,8 @@ export class TelegramSignalService implements OnModuleDestroy {
    * Process a new signal from the global 'telegram_signals' collection.
    * Broadcasts to ALL active user callbacks.
    */
-  private async processGlobalSignal(
-    doc: admin.firestore.QueryDocumentSnapshot,
-  ): Promise<void> {
+  private async processGlobalSignal(data: any, docId: number): Promise<void> {
     try {
-      const data = doc.data();
 
       this.logger.log(
         `📡 New Telegram signal received: ${JSON.stringify(data)}`,
@@ -157,7 +151,7 @@ export class TelegramSignalService implements OnModuleDestroy {
 
       if (!data.trend) {
         this.logger.warn('Invalid signal: missing trend, deleting');
-        await doc.ref.delete();
+        await this.supabaseService.client.from('telegram_signals').delete().eq('id', docId);
         return;
       }
 
@@ -211,15 +205,15 @@ export class TelegramSignalService implements OnModuleDestroy {
         }
       }
 
-      // Delete processed signal from Firestore
-      await doc.ref.delete();
-      this.logger.debug(`Signal document ${doc.id} deleted after processing`);
+      // Delete processed signal from Supabase
+      await this.supabaseService.client.from('telegram_signals').delete().eq('id', docId);
+      this.logger.debug(`Signal document ${docId} deleted after processing`);
     } catch (error) {
       this.logger.error(
         `Error processing global signal: ${(error as Error).message}`,
       );
       try {
-        await doc.ref.delete();
+        await this.supabaseService.client.from('telegram_signals').delete().eq('id', docId);
       } catch {
         // Ignore
       }
@@ -300,13 +294,13 @@ export class TelegramSignalService implements OnModuleDestroy {
     delayMs = 5000,
   ): Promise<void> {
     const executionTime = Date.now() + delayMs;
-    await this.firebaseService.db.collection('telegram_signals').add({
+    await this.supabaseService.client.from('telegram_signals').insert({
       trend,
-      executionTime,
-      receivedAt: Date.now(),
-      originalMessage: `Test signal: ${trend}`,
+      execution_time: executionTime,
+      received_at: Date.now(),
+      original_message: `Test signal: ${trend}`,
       source: 'test',
-      processedAt: admin.firestore.FieldValue.serverTimestamp(),
+      processed_at: this.supabaseService.now(),
     });
     this.logger.log(`[${userId}] Test signal injected: ${trend} (delay: ${delayMs}ms)`);
   }

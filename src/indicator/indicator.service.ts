@@ -1,5 +1,5 @@
 import { Injectable, Logger, OnModuleDestroy } from '@nestjs/common';
-import { FirebaseService } from '../firebase/firebase.service';
+import { SupabaseService } from '../supabase/supabase.service';
 import { AuthService } from '../auth/auth.service';
 import { StockityWebSocketClient, DealResultPayload } from '../schedule/websocket-client';
 import { curlGet } from '../common/http-utils';
@@ -105,7 +105,7 @@ export class IndicatorService implements OnModuleDestroy {
   private activeModes = new Map<string, ActiveMode>();
 
   constructor(
-    private readonly firebaseService: FirebaseService,
+    private readonly supabaseService: SupabaseService,
     private readonly authService: AuthService,
   ) {}
 
@@ -118,13 +118,12 @@ export class IndicatorService implements OnModuleDestroy {
   async getConfig(userId: string): Promise<IndicatorConfig> {
     if (this.configs.has(userId)) return this.configs.get(userId)!;
 
-    const doc = await this.firebaseService.db.collection('indicator_configs').doc(userId).get();
-    if (doc.exists) {
-      const d = doc.data() as any;
+    const { data: doc, error } = await this.supabaseService.client.from('indicator_configs').select('*').eq('user_id', userId).single();
+    if (doc && !error) {
       const cfg: IndicatorConfig = {
-        asset: d.asset || null,
-        settings: d.settings || DEFAULT_INDICATOR_SETTINGS,
-        martingale: d.martingale || {
+        asset: doc.asset || null,
+        settings: doc.settings || DEFAULT_INDICATOR_SETTINGS,
+        martingale: doc.martingale || {
           isEnabled: true,
           maxSteps: 2,
           baseAmount: 1400000,
@@ -132,8 +131,8 @@ export class IndicatorService implements OnModuleDestroy {
           multiplierType: 'FIXED',
           isAlwaysSignal: false,
         },
-        isDemoAccount: d.isDemoAccount ?? true,
-        currency: d.currency || 'IDR',
+        isDemoAccount: doc.is_demo_account ?? true,
+        currency: doc.currency || 'IDR',
       };
       this.configs.set(userId, cfg);
       return cfg;
@@ -163,9 +162,8 @@ export class IndicatorService implements OnModuleDestroy {
     this.configs.set(userId, updated);
 
     const plainCfg = JSON.parse(JSON.stringify(updated));
-    await this.firebaseService.db.collection('indicator_configs').doc(userId).set(
-      { ...plainCfg, updatedAt: this.firebaseService.FieldValue.serverTimestamp() },
-      { merge: true },
+    await this.supabaseService.client.from('indicator_configs').upsert(
+      { user_id: userId, ...plainCfg, updated_at: this.supabaseService.now() },
     );
 
     return updated;
@@ -296,7 +294,7 @@ export class IndicatorService implements OnModuleDestroy {
       };
     }
 
-    const statusDoc = await this.firebaseService.db.collection('indicator_status').doc(userId).get();
+    const { data: statusDoc, error: statusError } = await this.supabaseService.client.from('indicator_status').select('*').eq('user_id', userId).single();
     return {
       isActive: false,
       isRunning: false,
@@ -1339,21 +1337,20 @@ export class IndicatorService implements OnModuleDestroy {
     }
 
     try {
-      const snap = await this.firebaseService.db
-        .collection('indicator_logs')
-        .doc(userId)
-        .collection('entries')
-        .orderBy('executedAt', 'desc')
-        .limit(limit)
-        .get();
+      const { data, error: logsError } = await this.supabaseService.client
+        .from('mode_logs')
+        .select('data, executed_at')
+        .eq('user_id', userId)
+        .eq('mode', 'INDICATOR')
+        .order('executed_at', { ascending: false })
+        .limit(limit);
 
-      return snap.docs.map((d) => {
-        const data = d.data() as any;
-        return {
-          ...data,
-          executedAt: data.executedAt?.toMillis?.() ?? data.executedAt ?? 0,
-        } as IndicatorLog;
-      });
+      if (logsError || !data) return [];
+
+      return data.map((row) => ({
+        ...(row.data as IndicatorLog),
+        executedAt: new Date(row.executed_at).getTime(),
+      }));
     } catch (err) {
       this.logger.error(`[${userId}] getLogs error: ${err}`);
       return [];
@@ -1372,21 +1369,21 @@ export class IndicatorService implements OnModuleDestroy {
       if (mode.logs.length > 500) mode.logs.splice(0, mode.logs.length - 500);
     }
 
-    this.appendLogToFirebase(userId, log).catch((err) =>
-      this.logger.error(`[${userId}] appendLogToFirebase error: ${err}`),
+    this.appendLogToSupabase(userId, log).catch((err) =>
+      this.logger.error(`[${userId}] appendLogToSupabase error: ${err}`),
     );
   }
 
-  private async appendLogToFirebase(userId: string, log: IndicatorLog) {
-    await this.firebaseService.db
-      .collection('indicator_logs')
-      .doc(userId)
-      .collection('entries')
-      .doc(log.id)
-      .set({
-        ...log,
-        executedAt: this.firebaseService.Timestamp.fromMillis(log.executedAt),
-      });
+  private async appendLogToSupabase(userId: string, log: IndicatorLog) {
+    await this.supabaseService.client
+      .from('mode_logs')
+      .upsert({
+        id: log.id,
+        user_id: userId,
+        mode: 'INDICATOR',
+        data: log,
+        executed_at: this.supabaseService.timestampFromMillis(log.executedAt),
+      }, { onConflict: 'id' });
   }
 
   private buildTradePayload(session: any, config: IndicatorConfig, amount: number, trend: string): any {
@@ -1429,9 +1426,8 @@ export class IndicatorService implements OnModuleDestroy {
   }
 
   private async updateStatus(userId: string, botState: string) {
-    await this.firebaseService.db.collection('indicator_status').doc(userId).set(
-      { botState, updatedAt: this.firebaseService.FieldValue.serverTimestamp() },
-      { merge: true },
+    await this.supabaseService.client.from('indicator_status').upsert(
+      { user_id: userId, bot_state: botState, updated_at: this.supabaseService.now() },
     );
   }
 

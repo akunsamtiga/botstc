@@ -2,13 +2,13 @@ import { Injectable, UnauthorizedException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { PassportStrategy } from '@nestjs/passport';
 import { ExtractJwt, Strategy } from 'passport-jwt';
-import { FirebaseService } from '../firebase/firebase.service';
+import { SupabaseService } from '../supabase/supabase.service';
 
 @Injectable()
 export class JwtStrategy extends PassportStrategy(Strategy) {
   constructor(
     private configService: ConfigService,
-    private firebaseService: FirebaseService,
+    private supabaseService: SupabaseService,
   ) {
     super({
       jwtFromRequest: ExtractJwt.fromAuthHeaderAsBearerToken(),
@@ -18,11 +18,16 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
   }
 
   async validate(payload: { sub: string; email: string }) {
-    const doc = await this.firebaseService.db
-      .collection('sessions')
-      .doc(payload.sub)
-      .get();
-    if (!doc.exists) throw new UnauthorizedException('Session tidak ditemukan, silakan login ulang');
+    const { data, error } = await this.supabaseService.client
+      .from('sessions')
+      .select('*')
+      .eq('user_id', payload.sub)
+      .single();
+
+    if (error || !data) {
+      throw new UnauthorizedException('Session tidak ditemukan, silakan login ulang');
+    }
+
     return { userId: payload.sub, email: payload.email };
   }
 }

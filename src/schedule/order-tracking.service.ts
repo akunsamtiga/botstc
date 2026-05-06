@@ -1,5 +1,5 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { FirebaseService } from '../firebase/firebase.service';
+import { SupabaseService } from '../supabase/supabase.service';
 import {
   ScheduledOrder,
   TrackedOrder,
@@ -44,7 +44,7 @@ export class OrderTrackingService {
    */
   private readonly TERMINAL_STATUSES = new Set(['WIN', 'LOSE', 'DRAW', 'FAILED', 'SKIPPED']);
 
-  constructor(private readonly firebaseService: FirebaseService) {}
+  constructor(private readonly supabaseService: SupabaseService) {}
 
   // ── Private Cache Helpers ──────────────────────────────────────────
 
@@ -55,9 +55,8 @@ export class OrderTrackingService {
     if (this.cache.has(userId)) {
       return this.cache.get(userId)!.data;
     }
-    const doc = await this.firebaseService.db.collection('order_tracking').doc(userId).get();
-    if (!doc.exists) return null;
-    const data = doc.data();
+    const { data, error } = await this.supabaseService.client.from('order_tracking').select('*').eq('user_id', userId).single();
+    if (error || !data) return null;
     this.cache.set(userId, { data, dirty: false, lastFlush: Date.now() });
     return data;
   }
@@ -94,12 +93,12 @@ export class OrderTrackingService {
       // Strip FieldValue sentinels dari data cache sebelum disimpan
       const dataToSave = this.stripCacheForFirestore(entry.data);
 
-      await this.firebaseService.db
-        .collection('order_tracking')
-        .doc(userId)
-        .set({
+      await this.supabaseService.client
+        .from('order_tracking')
+        .upsert({
+          user_id: userId,
           ...dataToSave,
-          updatedAt: this.firebaseService.FieldValue.serverTimestamp(),
+          updated_at: this.supabaseService.now(),
         });
 
       entry.dirty = false;
@@ -148,13 +147,13 @@ export class OrderTrackingService {
 
     // Simpan ke cache dan langsung flush (init selalu force)
     this.setCache(userId, trackingData);
-    await this.firebaseService.db
-      .collection('order_tracking')
-      .doc(userId)
-      .set({
+    await this.supabaseService.client
+      .from('order_tracking')
+      .upsert({
+        user_id: userId,
         ...trackingData,
-        startedAt: this.firebaseService.FieldValue.serverTimestamp(),
-        updatedAt: this.firebaseService.FieldValue.serverTimestamp(),
+        started_at: this.supabaseService.now(),
+        updated_at: this.supabaseService.now(),
       });
 
     // Update cache lastFlush
@@ -550,7 +549,7 @@ export class OrderTrackingService {
    */
   async clearTracking(userId: string): Promise<void> {
     this.cache.delete(userId);
-    await this.firebaseService.db.collection('order_tracking').doc(userId).delete();
+    await this.supabaseService.client.from('order_tracking').delete().eq('user_id', userId);
     this.logger.log(`[${userId}] Tracking cleared`);
   }
 
@@ -563,18 +562,17 @@ export class OrderTrackingService {
     await this.flushCache(userId, true);
     this.cache.delete(userId);
 
-    const doc = await this.firebaseService.db.collection('order_tracking').doc(userId).get();
-    if (!doc.exists) return;
+    const { data: trackData, error: trackError } = await this.supabaseService.client.from('order_tracking').select('*').eq('user_id', userId).single();
+    if (trackError || !trackData) return;
 
     const archiveData = {
-      ...doc.data(),
-      archivedAt: this.firebaseService.FieldValue.serverTimestamp(),
+      ...trackData,
+      archived_at: this.supabaseService.now(),
     };
     const historyId = `${userId}_${Date.now()}`;
-    await this.firebaseService.db
-      .collection('order_tracking_history')
-      .doc(historyId)
-      .set(archiveData);
+    await this.supabaseService.client
+      .from('order_tracking_history')
+      .upsert({ id: historyId, user_id: userId, data: archiveData });
 
     this.logger.log(`[${userId}] Tracking archived to ${historyId}`);
   }

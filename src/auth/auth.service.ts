@@ -49,7 +49,7 @@ export class AuthService {
     });
   }
 
-  private invalidateSessionCache(userId: string) {
+  invalidateSessionCache(userId: string) {
     this.sessionCache.delete(userId);
   }
 
@@ -206,6 +206,7 @@ export class AuthService {
         user_timezone:   DEFAULT_TIMEZONE,
         currency:        'IDR',
         currency_iso:    'IDR',
+        logged_out_at:   null,   // ← reset logout flag saat login baru
         updated_at:      this.supabaseService.now(),
       });
 
@@ -226,10 +227,11 @@ export class AuthService {
   async logout(userId: string) {
     await this.supabaseService.client
       .from('sessions')
-      .upsert({
-        user_id: userId,
+      .update({
         logged_out_at: this.supabaseService.now(),
-      });
+      })
+      .eq('user_id', userId);
+
     this.invalidateSessionCache(userId);
     return { message: 'Logout berhasil' };
   }
@@ -265,9 +267,7 @@ export class AuthService {
 
   async getSession(userId: string) {
     const cached = this.getCachedSession(userId);
-    if (cached) {
-      return cached;
-    }
+    if (cached) return cached;
 
     const { data, error } = await this.supabaseService.client
       .from('sessions')

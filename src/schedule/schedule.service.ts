@@ -183,19 +183,36 @@ export class ScheduleService implements OnModuleInit, OnModuleDestroy {
         15,
       );
 
+      // Response: { data: { assets: [...] }, success: true, errors: [] }
       const rawAssets: any[] = resp.data?.data?.assets || [];
+
+      this.logger.log(`[${userId}] Raw assets from Stockity: ${rawAssets.length}`);
+
       const processed: StockityAsset[] = [];
 
       for (const asset of rawAssets) {
         const ric: string = asset.ric;
         const name: string = asset.name;
+        if (!ric || !name) continue;
+
         const assetType: number = asset.type;
-        const typeName = TYPE_NAME_MAPPING[assetType] ?? `Type-${assetType}`;
+        const typeName =
+          asset.type_name                        // gunakan type_name dari API jika ada
+          ?? TYPE_NAME_MAPPING[assetType]
+          ?? `Type-${assetType}`;
+
         let iconUrl: string | null = asset.icon?.url ?? null;
         if (iconUrl && !iconUrl.startsWith('http')) {
           iconUrl = `https://stockity.id${iconUrl.startsWith('/') ? '' : '/'}${iconUrl}`;
         }
 
+        const ftt = asset.trading_tools_settings?.ftt ?? {};
+
+        // ── Cari profitRate turbo dari berbagai sumber ────────────────────
+        // Prioritas:
+        //   1. personal_user_payment_rates (rate personal user — paling akurat)
+        //   2. ftt.base_payment_rate_turbo (rate dasar aset — BENAR)
+        //   3. ftt.user_statuses.vip.payment_rate_turbo (VIP config — hanya fallback)
         let profitRate: number | null = null;
 
         const personalRates: any[] = asset.personal_user_payment_rates || [];
@@ -207,22 +224,21 @@ export class ScheduleService implements OnModuleInit, OnModuleDestroy {
         }
 
         if (profitRate === null) {
-          const settings = asset.trading_tools_settings;
-          profitRate =
-            settings?.ftt?.user_statuses?.vip?.payment_rate_turbo ??
-            settings?.bo?.payment_rate_turbo ??
-            settings?.payment_rate_turbo ??
-            null;
+          // base_payment_rate_turbo: rate asli aset untuk turbo trading
+          // Jika 0 → aset ini tidak support turbo, skip
+          profitRate = ftt.base_payment_rate_turbo ?? null;
         }
 
-        if (profitRate !== null) {
-          processed.push({ ric, name, type: assetType, typeName, profitRate, iconUrl });
-        }
+        // Lewati aset yang tidak support turbo trading (rate = 0 atau null)
+        if (!profitRate || profitRate <= 0) continue;
+
+        processed.push({ ric, name, type: assetType, typeName, profitRate, iconUrl });
       }
 
+      // Sort descending by profitRate
       processed.sort((a, b) => b.profitRate - a.profitRate);
 
-      this.logger.log(`[${userId}] Fetched ${processed.length} assets from Stockity`);
+      this.logger.log(`[${userId}] Fetched ${processed.length} turbo-capable assets (dari ${rawAssets.length} total)`);
       return processed;
     } catch (err: any) {
       this.logger.error(`[${userId}] Error fetching assets: ${err.message}`);

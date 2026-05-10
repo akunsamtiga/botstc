@@ -1,27 +1,24 @@
-import { Injectable, UnauthorizedException } from '@nestjs/common';
+import { Injectable, Logger, UnauthorizedException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { PassportStrategy } from '@nestjs/passport';
 import { ExtractJwt, Strategy } from 'passport-jwt';
 import { SupabaseService } from '../supabase/supabase.service';
 
 /**
- * ✅ FIX: Tambah in-memory session cache di JwtStrategy.
+ * ✅ FIX v2: Tambah logging detail di validate() agar 401 bisa langsung di-debug.
  *
- * ROOT CAUSE sebelumnya:
- *   validate() dipanggil untuk SETIAP request yang masuk.
- *   Ketika frontend fire 12+ request concurrent (loadAll / polling),
- *   12 query Supabase jalan bersamaan → sebagian timeout / kena rate-limit
- *   → error = true → throw UnauthorizedException → backend balik 401 massal.
+ * Sebelumnya, ketika session tidak ditemukan, error dilempar tanpa log sama sekali
+ * sehingga tidak bisa dibedakan antara:
+ *   (a) Session row tidak ada di Supabase (upsert gagal saat login)
+ *   (b) logged_out_at terisi (user sudah logout sebelumnya)
+ *   (c) Supabase query error (koneksi, RLS, dll)
  *
- * auth.service.ts sebenarnya sudah punya session cache, tapi JwtStrategy
- * tidak menggunakannya — ia langsung query Supabase sendiri.
+ * Sekarang setiap skenario di-log dengan context yang jelas.
  *
- * FIX:
- *   - Tambah cache lokal di JwtStrategy (TTL 30 detik).
- *   - Request ke user yang sama dalam 30 detik cukup pakai cache,
- *     tidak perlu query Supabase.
- *   - Select hanya kolom 'user_id' (bukan '*') untuk efisiensi.
- *   - Tambah cleanup otomatis agar cache tidak bocor memori.
+ * Cache behavior (tidak berubah):
+ *   - TTL 30 detik — bypass Supabase untuk burst request dari satu user.
+ *   - Cleanup otomatis setiap 5 menit agar tidak bocor memori.
+ *   - Select hanya kolom 'user_id, logged_out_at' untuk efisiensi + debug.
  */
 
 interface CacheEntry {
@@ -32,6 +29,8 @@ interface CacheEntry {
 
 @Injectable()
 export class JwtStrategy extends PassportStrategy(Strategy) {
+  private readonly logger = new Logger(JwtStrategy.name);
+
   /** In-memory cache: userId → validated session entry */
   private readonly cache = new Map<string, CacheEntry>();
 
@@ -45,10 +44,21 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
     private configService: ConfigService,
     private supabaseService: SupabaseService,
   ) {
+    const secret = configService.get<string>('JWT_SECRET');
+
+    // ✅ FIX: Validasi JWT_SECRET saat startup agar tidak diam-diam pakai
+    //    secret kosong yang menyebabkan semua token dianggap invalid.
+    if (!secret) {
+      throw new Error(
+        '❌ JWT_SECRET tidak terset di environment variables! ' +
+        'Pastikan JWT_SECRET ada di file .env dan pm2 di-restart dengan --update-env.',
+      );
+    }
+
     super({
       jwtFromRequest: ExtractJwt.fromAuthHeaderAsBearerToken(),
       ignoreExpiration: false,
-      secretOrKey: configService.get<string>('JWT_SECRET'),
+      secretOrKey: secret,
     });
 
     // Cleanup expired entries setiap 5 menit
@@ -79,18 +89,39 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
     }
 
     // ── Cache miss: query Supabase sekali, simpan ke cache ──────────────────
+    // ✅ FIX: Select 'logged_out_at' juga supaya bisa di-log saat debug.
     const { data, error } = await this.supabaseService.client
       .from('sessions')
-      .select('user_id')          // ← hanya kolom yang dibutuhkan, bukan '*'
+      .select('user_id, logged_out_at')
       .eq('user_id', userId)
-      .is('logged_out_at', null)  // ← pastikan belum logout
       .maybeSingle();             // ← maybeSingle() tidak throw jika tidak ada row
 
-    if (error || !data) {
+    // ✅ FIX: Log setiap skenario kegagalan secara spesifik
+    if (error) {
+      this.logger.error(
+        `❌ Supabase error saat validasi JWT untuk userId=${userId}: ` +
+        `code=${error.code} | message=${error.message} | hint=${error.hint}`,
+      );
+      throw new UnauthorizedException('Database error, silakan coba lagi');
+    }
+
+    if (!data) {
+      this.logger.warn(
+        `❌ Session row TIDAK DITEMUKAN di Supabase untuk userId=${userId}. ` +
+        `Kemungkinan: upsert saat login gagal. Cek log AuthService di atas.`,
+      );
       throw new UnauthorizedException('Session tidak ditemukan, silakan login ulang');
     }
 
-    // Simpan ke cache
+    if (data.logged_out_at !== null) {
+      this.logger.warn(
+        `❌ Session userId=${userId} sudah logout pada ${data.logged_out_at}. ` +
+        `Token lama masih dipakai setelah logout.`,
+      );
+      throw new UnauthorizedException('Session sudah logout, silakan login ulang');
+    }
+
+    // ── Session valid: simpan ke cache ──────────────────────────────────────
     this.cache.set(userId, {
       userId,
       email: payload.email,

@@ -107,14 +107,17 @@ export class AuthService {
     try {
       const { data: existing } = await this.supabaseService.client
         .from('sessions')
-        .select('*')
+        .select('device_id')
         .eq('email', email)
         .limit(1)
         .maybeSingle();
-      if (existing) {
-        if (existing.device_id) deviceId = existing.device_id;
+      if (existing?.device_id) {
+        deviceId = existing.device_id;
+        this.logger.log(`Reusing existing deviceId for ${email}`);
       }
-    } catch (_) {}
+    } catch (e) {
+      this.logger.warn(`Gagal ambil deviceId lama, pakai baru: ${e}`);
+    }
 
     let stockityAuthToken: string;
     let stockityUserId: string;
@@ -193,24 +196,60 @@ export class AuthService {
       throw new UnauthorizedException(errMsg);
     }
 
-    // Simpan session ke Supabase
-    await this.supabaseService.client
+    // ── Simpan session ke Supabase ────────────────────────────────────────────
+    // ✅ FIX: Cek error dari upsert — sebelumnya error diabaikan sehingga JWT
+    //    diterbitkan meski session tidak tersimpan → semua request berikutnya 401.
+    const { error: upsertError } = await this.supabaseService.client
       .from('sessions')
       .upsert({
-        user_id:         stockityUserId,
+        user_id:        stockityUserId,
         email,
-        stockity_token:  stockityAuthToken,
-        device_id:       deviceId,
-        device_type:     'web',
-        user_agent:      DEFAULT_USER_AGENT,
-        user_timezone:   DEFAULT_TIMEZONE,
-        currency:        'IDR',
-        currency_iso:    'IDR',
-        logged_out_at:   null,   // ← reset logout flag saat login baru
-        updated_at:      this.supabaseService.now(),
+        stockity_token: stockityAuthToken,
+        device_id:      deviceId,
+        device_type:    'web',
+        user_agent:     DEFAULT_USER_AGENT,
+        user_timezone:  DEFAULT_TIMEZONE,
+        currency:       'IDR',
+        currency_iso:   'IDR',
+        updated_at:     this.supabaseService.now(),
+        // ✅ FIX: logged_out_at TIDAK di-include di upsert karena beberapa
+        //    versi Supabase client skip null saat conflict update.
+        //    Di-reset via explicit UPDATE di bawah supaya pasti NULL.
       });
 
-    // Invalidate cache setelah write
+    if (upsertError) {
+      this.logger.error(
+        `❌ Gagal upsert session ke Supabase untuk userId=${stockityUserId}: ` +
+        `code=${upsertError.code} | message=${upsertError.message} | ` +
+        `details=${upsertError.details} | hint=${upsertError.hint}`,
+      );
+      throw new UnauthorizedException(
+        'Gagal menyimpan sesi ke server. Coba login ulang.',
+      );
+    }
+
+    this.logger.log(`✅ Session upserted ke Supabase untuk userId=${stockityUserId}`);
+
+    // ✅ FIX: Reset logged_out_at secara eksplisit via UPDATE terpisah.
+    //    Ini memastikan field benar-benar NULL meski upsert conflict-update
+    //    melewatkan null values.
+    const { error: resetError } = await this.supabaseService.client
+      .from('sessions')
+      .update({ logged_out_at: null })
+      .eq('user_id', stockityUserId);
+
+    if (resetError) {
+      // Tidak fatal — session sudah terupsert, hanya logged_out_at yang gagal.
+      // Log warning supaya bisa di-debug, tapi lanjut proses login.
+      this.logger.warn(
+        `⚠️ Gagal reset logged_out_at untuk userId=${stockityUserId}: ` +
+        `code=${resetError.code} | message=${resetError.message}`,
+      );
+    } else {
+      this.logger.log(`✅ logged_out_at di-reset NULL untuk userId=${stockityUserId}`);
+    }
+
+    // Invalidate cache setelah write supaya request berikutnya baca dari DB
     this.invalidateSessionCache(stockityUserId);
 
     const jwt = this.jwtService.sign({ sub: stockityUserId, email });
@@ -225,12 +264,14 @@ export class AuthService {
   }
 
   async logout(userId: string) {
-    await this.supabaseService.client
+    const { error } = await this.supabaseService.client
       .from('sessions')
-      .update({
-        logged_out_at: this.supabaseService.now(),
-      })
+      .update({ logged_out_at: this.supabaseService.now() })
       .eq('user_id', userId);
+
+    if (error) {
+      this.logger.warn(`Gagal update logged_out_at saat logout userId=${userId}: ${error.message}`);
+    }
 
     this.invalidateSessionCache(userId);
     return { message: 'Logout berhasil' };

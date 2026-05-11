@@ -51,14 +51,15 @@ export class FastradeService implements OnModuleDestroy {
 
     const session = await this.authService.getSession(userId);
     if (!session) throw new Error('Session tidak ditemukan. Silakan login ulang.');
-    if (!session.stockityToken) throw new Error('Token Stockity tidak ditemukan. Silakan login ulang.');
+    // ✅ FIX: Supabase returns snake_case columns — gunakan snake_case bukan camelCase
+    if (!session.stockity_token) throw new Error('Token Stockity tidak ditemukan. Silakan login ulang.');
 
     const sessionInfo: SessionInfo = {
-      stockityToken: session.stockityToken,
-      deviceId: session.deviceId,
-      deviceType: session.deviceType || 'web',
-      userAgent: session.userAgent,
-      userTimezone: session.userTimezone || 'Asia/Jakarta',
+      stockityToken: session.stockity_token,
+      deviceId: session.device_id,
+      deviceType: session.device_type || 'web',
+      userAgent: session.user_agent,
+      userTimezone: session.user_timezone || 'Asia/Jakarta',
     };
 
     const config: FastradeConfig = {
@@ -74,10 +75,10 @@ export class FastradeService implements OnModuleDestroy {
     // Create fresh WS connection
     const ws = new StockityWebSocketClient(
       userId,
-      session.stockityToken,
-      session.deviceId,
-      session.deviceType || 'web',
-      session.userAgent,
+      session.stockity_token,
+      session.device_id,
+      session.device_type || 'web',
+      session.user_agent,
     );
 
     ws.setOnStatusChange((connected, reason) => {

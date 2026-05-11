@@ -159,12 +159,13 @@ export class AISignalService implements OnModuleInit, OnModuleDestroy {
       throw new Error('Asset belum dikonfigurasi');
     }
 
+    // ✅ FIX: Supabase returns snake_case columns — gunakan snake_case bukan camelCase
     const ws = new StockityWebSocketClient(
       userId,
-      session.stockityToken,
-      session.deviceId,
-      session.deviceType || 'web',
-      session.userAgent,
+      session.stockity_token,
+      session.device_id,
+      session.device_type || 'web',
+      session.user_agent,
     );
 
     try {
@@ -972,7 +973,7 @@ export class AISignalService implements OnModuleInit, OnModuleDestroy {
       createdAt: createdAtSeconds * 1000,
       dealType: config.isDemoAccount ? 'demo' : 'real',
       expireAt: finalExpireAt,
-      iso: session.currencyIso || config.currency || 'IDR',
+      iso: session.currency_iso || config.currency || 'IDR',
       optionType: 'turbo',
       ric: config.asset!.ric,
       trend,

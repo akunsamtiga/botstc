@@ -1411,7 +1411,7 @@ export class IndicatorService implements OnModuleDestroy {
       createdAt: (createdAtSec + 1) * 1000,  // +1 detik agar tidak reject oleh server
       dealType: config.isDemoAccount ? 'demo' : 'real',
       expireAt,
-      iso: session.currencyIso || config.currency || 'IDR',
+      iso: session.currency_iso || config.currency || 'IDR',
       optionType: 'turbo',
       ric: config.asset!.ric,
       trend,

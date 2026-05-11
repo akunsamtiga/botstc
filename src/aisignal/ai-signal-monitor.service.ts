@@ -454,11 +454,12 @@ export class AISignalMonitorService implements OnModuleDestroy {
    */
   private buildStockityHeaders(session: any): Record<string, string> {
     return {
-      'authorization-token': session.stockityToken,
-      'device-id': session.deviceId,
-      'device-type': session.deviceType || 'web',
-      'user-timezone': session.userTimezone || 'Asia/Jakarta',
-      'User-Agent': session.userAgent,
+      // ✅ FIX: Supabase returns snake_case columns — gunakan snake_case bukan camelCase
+      'authorization-token': session.stockity_token,
+      'device-id': session.device_id,
+      'device-type': session.device_type || 'web',
+      'user-timezone': session.user_timezone || 'Asia/Jakarta',
+      'User-Agent': session.user_agent,
       Accept: 'application/json, text/plain, */*',
       Origin: 'https://stockity.id',
       Referer: 'https://stockity.id/',

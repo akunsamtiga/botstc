@@ -199,12 +199,13 @@ export class MomentumService implements OnModuleDestroy {
       throw new Error('Asset belum dikonfigurasi');
     }
 
+    // ✅ FIX: Supabase returns snake_case columns — gunakan snake_case bukan camelCase
     const ws = new StockityWebSocketClient(
       userId,
-      session.stockityToken,
-      session.deviceId,
-      session.deviceType || 'web',
-      session.userAgent,
+      session.stockity_token,
+      session.device_id,
+      session.device_type || 'web',
+      session.user_agent,
     );
 
     ws.setOnDealResult((payload) => {
@@ -1392,7 +1393,7 @@ export class MomentumService implements OnModuleDestroy {
       createdAt: (createdAtSec + 1) * 1000,
       dealType: config.isDemoAccount ? 'demo' : 'real',
       expireAt,
-      iso: session.currencyIso || config.currency || 'IDR',
+      iso: session.currency_iso || config.currency || 'IDR',
       optionType: 'turbo',
       ric: config.asset!.ric,
       trend,
@@ -1401,11 +1402,11 @@ export class MomentumService implements OnModuleDestroy {
 
   private buildStockityHeaders(session: any): Record<string, string> {
     return {
-      'authorization-token': session.stockityToken,
-      'device-id': session.deviceId,
-      'device-type': session.deviceType || 'web',
-      'user-timezone': session.userTimezone || 'Asia/Jakarta',
-      'User-Agent': session.userAgent,
+      'authorization-token': session.stockity_token,
+      'device-id': session.device_id,
+      'device-type': session.device_type || 'web',
+      'user-timezone': session.user_timezone || 'Asia/Jakarta',
+      'User-Agent': session.user_agent,
       'Accept': 'application/json, text/plain, */*',
       'Origin': 'https://stockity.id',
       'Referer': 'https://stockity.id/',

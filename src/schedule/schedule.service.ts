@@ -183,36 +183,19 @@ export class ScheduleService implements OnModuleInit, OnModuleDestroy {
         15,
       );
 
-      // Response: { data: { assets: [...] }, success: true, errors: [] }
       const rawAssets: any[] = resp.data?.data?.assets || [];
-
-      this.logger.log(`[${userId}] Raw assets from Stockity: ${rawAssets.length}`);
-
       const processed: StockityAsset[] = [];
 
       for (const asset of rawAssets) {
         const ric: string = asset.ric;
         const name: string = asset.name;
-        if (!ric || !name) continue;
-
         const assetType: number = asset.type;
-        const typeName =
-          asset.type_name                        // gunakan type_name dari API jika ada
-          ?? TYPE_NAME_MAPPING[assetType]
-          ?? `Type-${assetType}`;
-
+        const typeName = TYPE_NAME_MAPPING[assetType] ?? `Type-${assetType}`;
         let iconUrl: string | null = asset.icon?.url ?? null;
         if (iconUrl && !iconUrl.startsWith('http')) {
           iconUrl = `https://stockity.id${iconUrl.startsWith('/') ? '' : '/'}${iconUrl}`;
         }
 
-        const ftt = asset.trading_tools_settings?.ftt ?? {};
-
-        // ── Cari profitRate turbo dari berbagai sumber ────────────────────
-        // Prioritas:
-        //   1. personal_user_payment_rates (rate personal user — paling akurat)
-        //   2. ftt.base_payment_rate_turbo (rate dasar aset — BENAR)
-        //   3. ftt.user_statuses.vip.payment_rate_turbo (VIP config — hanya fallback)
         let profitRate: number | null = null;
 
         const personalRates: any[] = asset.personal_user_payment_rates || [];
@@ -224,21 +207,22 @@ export class ScheduleService implements OnModuleInit, OnModuleDestroy {
         }
 
         if (profitRate === null) {
-          // base_payment_rate_turbo: rate asli aset untuk turbo trading
-          // Jika 0 → aset ini tidak support turbo, skip
-          profitRate = ftt.base_payment_rate_turbo ?? null;
+          const settings = asset.trading_tools_settings;
+          profitRate =
+            settings?.ftt?.user_statuses?.vip?.payment_rate_turbo ??
+            settings?.bo?.payment_rate_turbo ??
+            settings?.payment_rate_turbo ??
+            null;
         }
 
-        // Lewati aset yang tidak support turbo trading (rate = 0 atau null)
-        if (!profitRate || profitRate <= 0) continue;
-
-        processed.push({ ric, name, type: assetType, typeName, profitRate, iconUrl });
+        if (profitRate !== null) {
+          processed.push({ ric, name, type: assetType, typeName, profitRate, iconUrl });
+        }
       }
 
-      // Sort descending by profitRate
       processed.sort((a, b) => b.profitRate - a.profitRate);
 
-      this.logger.log(`[${userId}] Fetched ${processed.length} turbo-capable assets (dari ${rawAssets.length} total)`);
+      this.logger.log(`[${userId}] Fetched ${processed.length} assets from Stockity`);
       return processed;
     } catch (err: any) {
       this.logger.error(`[${userId}] Error fetching assets: ${err.message}`);
@@ -247,12 +231,13 @@ export class ScheduleService implements OnModuleInit, OnModuleDestroy {
   }
 
   private buildStockityHeaders(session: any): Record<string, string> {
+    // ✅ FIX: Supabase returns snake_case columns (stockity_token, device_id, etc.)
     return {
-      'authorization-token': session.stockityToken,
-      'device-id': session.deviceId,
-      'device-type': session.deviceType || 'web',
-      'user-timezone': session.userTimezone || 'Asia/Jakarta',
-      'User-Agent': session.userAgent,
+      'authorization-token': session.stockity_token,
+      'device-id':           session.device_id,
+      'device-type':         session.device_type     || 'web',
+      'user-timezone':       session.user_timezone   || 'Asia/Jakarta',
+      'User-Agent':          session.user_agent      || 'Mozilla/5.0',
       'Accept': 'application/json, text/plain, */*',
       'Origin': 'https://stockity.id',
       'Referer': 'https://stockity.id/',
@@ -371,7 +356,7 @@ export class ScheduleService implements OnModuleInit, OnModuleDestroy {
 
     const session = await this.authService.getSession(userId);
     if (!session) throw new Error('Session tidak ditemukan. Silakan login ulang.');
-    if (!session.stockityToken) {
+    if (!session.stockity_token) { // ✅ FIX
       throw new Error('Token Stockity tidak ditemukan di session. Silakan login ulang.');
     }
 
@@ -404,10 +389,11 @@ export class ScheduleService implements OnModuleInit, OnModuleDestroy {
 
     const ws = new StockityWebSocketClient(
       userId,
-      session.stockityToken,
-      session.deviceId,
-      session.deviceType || 'web',
-      session.userAgent,
+      // ✅ FIX: snake_case Supabase columns
+      session.stockity_token,
+      session.device_id,
+      session.device_type || 'web',
+      session.user_agent,
     );
 
     ws.setOnStatusChange((connected, reason) => {

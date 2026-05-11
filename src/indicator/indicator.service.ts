@@ -185,10 +185,10 @@ export class IndicatorService implements OnModuleDestroy {
 
     const ws = new StockityWebSocketClient(
       userId,
-      session.stockityToken,
-      session.deviceId,
-      session.deviceType || 'web',
-      session.userAgent,
+      session.stockity_token,
+      session.device_id,
+      session.device_type || 'web',
+      session.user_agent,
     );
 
     try {
@@ -294,11 +294,17 @@ export class IndicatorService implements OnModuleDestroy {
       };
     }
 
-    const { data: statusDoc, error: statusError } = await this.supabaseService.client.from('indicator_status').select('*').eq('user_id', userId).single();
+    // ✅ FIX: Supabase maybeSingle() → null jika row tidak ada (bukan crash)
+    // Firestore pattern lama: statusDoc.exists / statusDoc.data() → CRASH di Supabase
+    const { data: statusDoc } = await this.supabaseService.client
+      .from('indicator_status')
+      .select('*')
+      .eq('user_id', userId)
+      .maybeSingle();
     return {
       isActive: false,
       isRunning: false,
-      botState: statusDoc.exists ? (statusDoc.data()?.botState ?? 'STOPPED') : 'STOPPED',
+      botState: statusDoc?.bot_state ?? 'STOPPED',
       totalTrades: 0,
       totalWins: 0,
       totalLosses: 0,
@@ -1245,11 +1251,11 @@ export class IndicatorService implements OnModuleDestroy {
   ): Promise<any | null> {
     try {
       const headers = {
-        'authorization-token': session.stockityToken,
-        'device-id': session.deviceId,
-        'device-type': session.deviceType || 'web',
-        'user-timezone': session.userTimezone || 'Asia/Jakarta',
-        'User-Agent': session.userAgent,
+        'authorization-token': session.stockity_token,
+        'device-id': session.device_id,
+        'device-type': session.device_type || 'web',
+        'user-timezone': session.user_timezone || 'Asia/Jakarta',
+        'User-Agent': session.user_agent,
         'Accept': 'application/json, text/plain, */*',
         'Origin': 'https://stockity.id',
         'Referer': 'https://stockity.id/',
@@ -1414,11 +1420,11 @@ export class IndicatorService implements OnModuleDestroy {
 
   private buildStockityHeaders(session: any): Record<string, string> {
     return {
-      'authorization-token': session.stockityToken,
-      'device-id': session.deviceId,
-      'device-type': session.deviceType || 'web',
-      'user-timezone': session.userTimezone || 'Asia/Jakarta',
-      'User-Agent': session.userAgent,
+      'authorization-token': session.stockity_token,
+      'device-id': session.device_id,
+      'device-type': session.device_type || 'web',
+      'user-timezone': session.user_timezone || 'Asia/Jakarta',
+      'User-Agent': session.user_agent,
       'Accept': 'application/json, text/plain, */*',
       'Origin': 'https://stockity.id',
       'Referer': 'https://stockity.id/',

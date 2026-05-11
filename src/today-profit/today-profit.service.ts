@@ -636,18 +636,25 @@ export class TodayProfitService {
         return null;
       }
 
-      const data = doc as Partial<UserStockityCredentials>;
-      if (!data.authToken || !data.deviceId || !data.deviceType) {
+      // ✅ FIX: Supabase returns snake_case columns, bukan camelCase.
+      // sessions table: stockity_token, device_id, device_type, user_timezone
+      // UserStockityCredentials interface: authToken, deviceId, deviceType, timezone
+      const authToken  = doc.stockity_token;
+      const deviceId   = doc.device_id;
+      const deviceType = doc.device_type;
+      const timezone   = doc.user_timezone;
+
+      if (!authToken || !deviceId || !deviceType) {
         this.logger.warn(`[${userId}] Incomplete Stockity credentials in Supabase`);
         this.credentialsCache.set(userId, { data: null, expiresAt: Date.now() + this.CREDENTIALS_CACHE_TTL_MS });
         return null;
       }
 
       const result = {
-        authToken:  data.authToken,
-        deviceId:   data.deviceId,
-        deviceType: data.deviceType,
-        timezone:   data.timezone || 'Asia/Jakarta',
+        authToken:  authToken,
+        deviceId:   deviceId,
+        deviceType: deviceType,
+        timezone:   timezone || 'Asia/Jakarta',
       };
 
       this.credentialsCache.set(userId, { data: result, expiresAt: Date.now() + this.CREDENTIALS_CACHE_TTL_MS });

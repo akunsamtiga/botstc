@@ -76,7 +76,7 @@ export class TodayProfitService {
    * Cache invalidated when day changes or accountType changes.
    */
   private readonly stockityCache = new Map<string, StockityCache>();
-  private readonly STOCKITY_CACHE_TTL_MS = 20_000; // ✅ sedikit diturunkan dari 25s
+  private readonly STOCKITY_CACHE_TTL_MS = 25_000;
 
   /**
    * In-memory per-user-per-day cache for Supabase mode logs.
@@ -84,7 +84,7 @@ export class TodayProfitService {
    * Each day has separate cache key so day changes auto-miss.
    */
   private readonly supabaseTradesCache = new Map<string, SupabaseTradesCache>();
-  private readonly SUPABASE_CACHE_TTL_MS = 3_000; // ✅ FIX delay: diturunkan dari 10s → 3s agar trade selesai langsung terlihat
+  private readonly SUPABASE_CACHE_TTL_MS = 10_000;
 
   /**
    * In-memory cache for Stockity credentials (sessions/{userId}).

@@ -28,7 +28,7 @@ export class IndicatorController {
   @Put('config')
   async updateConfig(@Request() req, @Body() dto: UpdateIndicatorConfigDto) {
     const config = await this.svc.getConfig(req.user.userId);
-    
+
     // Merge existing settings with updates
     const updatedSettings = {
       ...config.settings,
@@ -41,7 +41,18 @@ export class IndicatorController {
       ...(dto.amount && { amount: dto.amount }),
     };
 
-    return this.svc.updateConfig(req.user.userId, { settings: updatedSettings });
+    const updates: any = { settings: updatedSettings };
+
+    // Stop Loss & Stop Profit — simpan di martingale object (JSONB)
+    if (dto.stopLoss !== undefined || dto.stopProfit !== undefined) {
+      updates.martingale = {
+        ...config.martingale,
+        ...(dto.stopLoss !== undefined && { stopLoss: dto.stopLoss }),
+        ...(dto.stopProfit !== undefined && { stopProfit: dto.stopProfit }),
+      };
+    }
+
+    return this.svc.updateConfig(req.user.userId, updates);
   }
 
   @Put('config/asset')
@@ -49,6 +60,14 @@ export class IndicatorController {
     return this.svc.updateConfig(req.user.userId, { asset: body });
   }
 
+  /**
+   * PUT /indicator/config/martingale
+   * Update martingale settings termasuk Stop Loss & Stop Profit.
+   *
+   * Body fields:
+   *   isEnabled, maxSteps, baseAmount, multiplierValue, multiplierType,
+   *   isAlwaysSignal, stopLoss, stopProfit
+   */
   @Put('config/martingale')
   async setMartingale(@Request() req, @Body() body: {
     isEnabled?: boolean;
@@ -57,6 +76,10 @@ export class IndicatorController {
     multiplierValue?: number;
     multiplierType?: 'FIXED' | 'PERCENTAGE';
     isAlwaysSignal?: boolean;
+    /** Stop Loss dalam satuan currency (IDR). 0 = nonaktif. */
+    stopLoss?: number;
+    /** Stop Profit dalam satuan currency (IDR). 0 = nonaktif. */
+    stopProfit?: number;
   }) {
     const config = await this.svc.getConfig(req.user.userId);
     const updatedMartingale = { ...config.martingale, ...body };

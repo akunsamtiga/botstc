@@ -42,6 +42,16 @@ export interface MomentumConfig {
     multiplierValue: number;
     multiplierType: 'FIXED' | 'PERCENTAGE';
     isAlwaysSignal: boolean;
+    /**
+     * Stop Loss: bot otomatis berhenti jika total kerugian sesi
+     * mencapai atau melebihi nilai ini. 0 = nonaktif.
+     */
+    stopLoss?: number;
+    /**
+     * Stop Profit: bot otomatis berhenti jika total keuntungan sesi
+     * mencapai atau melebihi nilai ini. 0 = nonaktif.
+     */
+    stopProfit?: number;
   };
   isDemoAccount: boolean;
   currency: string;
@@ -126,6 +136,8 @@ export class MomentumService implements OnModuleDestroy {
           multiplierValue: 2.5,
           multiplierType: 'FIXED',
           isAlwaysSignal: false,
+          stopLoss: 0,
+          stopProfit: 0,
         },
         isDemoAccount: data.is_demo_account ?? true,
         currency: data.currency || 'IDR',
@@ -149,6 +161,8 @@ export class MomentumService implements OnModuleDestroy {
         multiplierValue: 2.5,
         multiplierType: 'FIXED',
         isAlwaysSignal: false,
+        stopLoss: 0,
+        stopProfit: 0,
       },
       isDemoAccount: true,
       currency: 'IDR',
@@ -974,6 +988,12 @@ export class MomentumService implements OnModuleDestroy {
 
           mode.sessionPnL += profit;
 
+          // ── Stop Loss / Stop Profit check ───────────────────────────────
+          if (this.checkStopConditions(userId, mode, config)) {
+            clearInterval(checkInterval);
+            return;
+          }
+
           this.updateLog(userId, orderId, {
             result: isWin ? 'WIN' : 'LOSE',
             profit,
@@ -1046,6 +1066,12 @@ export class MomentumService implements OnModuleDestroy {
 
           mode.sessionPnL += profit;
 
+          // ── Stop Loss / Stop Profit check ───────────────────────────────
+          if (this.checkStopConditions(userId, mode, config)) {
+            clearInterval(checkInterval);
+            return;
+          }
+
           this.updateLog(userId, orderId, {
             result: isWin ? 'WIN' : 'LOSE',
             profit,
@@ -1111,6 +1137,10 @@ export class MomentumService implements OnModuleDestroy {
     const amount = matchedLog.amount;
     const profit = isWin ? (payload.win || payload.payment || 0) : -amount;
     mode.sessionPnL += profit;
+
+    // ── Stop Loss / Stop Profit check ─────────────────────────────────────
+    const config = this.configs.get(userId);
+    if (config && this.checkStopConditions(userId, mode, config)) return;
 
     this.updateLog(userId, matchedLog.orderId, {
       result: isWin ? 'WIN' : 'LOSE',
@@ -1232,6 +1262,12 @@ export class MomentumService implements OnModuleDestroy {
           const profit = isWin ? (result.win || result.payment || 0) : -martingaleAmount;
 
           mode.sessionPnL += profit;
+
+          // ── Stop Loss / Stop Profit check ───────────────────────────────
+          if (this.checkStopConditions(userId, mode, config)) {
+            clearInterval(checkInterval);
+            return;
+          }
 
           this.updateLog(userId, parentOrderId, {
             result: isWin ? 'WIN' : 'LOSE',
@@ -1411,6 +1447,56 @@ export class MomentumService implements OnModuleDestroy {
       'Origin': 'https://stockity.id',
       'Referer': 'https://stockity.id/',
     };
+  }
+
+  /**
+   * Cek apakah Stop Loss atau Stop Profit telah tercapai.
+   * Menghentikan bot secara otomatis jika ya.
+   * @returns true jika bot dihentikan, false jika tidak
+   */
+  private checkStopConditions(userId: string, mode: ActiveModeState, config: MomentumConfig): boolean {
+    const { stopLoss, stopProfit } = config.martingale;
+
+    if (stopLoss && stopLoss > 0 && mode.sessionPnL <= -stopLoss) {
+      this.logger.log(
+        `[${userId}] 🛑 Stop Loss tercapai: sessionPnL=${mode.sessionPnL} ≤ -${stopLoss}. Bot dihentikan.`,
+      );
+      // Tulis log sebelum stop
+      const stopLog: MomentumLog = {
+        id: `stoploss_${Date.now()}`,
+        orderId: 'system',
+        momentumType: MomentumType.CANDLE_SABIT, // placeholder
+        trend: '-',
+        amount: 0,
+        martingaleStep: 0,
+        executedAt: Date.now(),
+        note: `⛔ Stop Loss triggered: sessionPnL=${mode.sessionPnL} ≤ -${stopLoss}`,
+      };
+      this.appendLog(userId, stopLog);
+      this.stopMomentumMode(userId);
+      return true;
+    }
+
+    if (stopProfit && stopProfit > 0 && mode.sessionPnL >= stopProfit) {
+      this.logger.log(
+        `[${userId}] ✅ Stop Profit tercapai: sessionPnL=${mode.sessionPnL} ≥ ${stopProfit}. Bot dihentikan.`,
+      );
+      const stopLog: MomentumLog = {
+        id: `stopprofit_${Date.now()}`,
+        orderId: 'system',
+        momentumType: MomentumType.CANDLE_SABIT, // placeholder
+        trend: '-',
+        amount: 0,
+        martingaleStep: 0,
+        executedAt: Date.now(),
+        note: `🎯 Stop Profit triggered: sessionPnL=${mode.sessionPnL} ≥ ${stopProfit}`,
+      };
+      this.appendLog(userId, stopLog);
+      this.stopMomentumMode(userId);
+      return true;
+    }
+
+    return false;
   }
 
   private sleep(ms: number): Promise<void> {

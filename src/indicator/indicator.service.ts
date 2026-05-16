@@ -60,6 +60,16 @@ export interface IndicatorConfig {
     multiplierValue: number;
     multiplierType: 'FIXED' | 'PERCENTAGE';
     isAlwaysSignal: boolean;
+    /**
+     * Stop Loss: bot otomatis berhenti jika total kerugian sesi
+     * mencapai atau melebihi nilai ini. 0 = nonaktif.
+     */
+    stopLoss?: number;
+    /**
+     * Stop Profit: bot otomatis berhenti jika total keuntungan sesi
+     * mencapai atau melebihi nilai ini. 0 = nonaktif.
+     */
+    stopProfit?: number;
   };
   isDemoAccount: boolean;
   currency: string;
@@ -130,6 +140,8 @@ export class IndicatorService implements OnModuleDestroy {
           multiplierValue: 2.5,
           multiplierType: 'FIXED',
           isAlwaysSignal: false,
+          stopLoss: 0,
+          stopProfit: 0,
         },
         isDemoAccount: doc.is_demo_account ?? true,
         currency: doc.currency || 'IDR',
@@ -148,6 +160,8 @@ export class IndicatorService implements OnModuleDestroy {
         multiplierValue: 2.5,
         multiplierType: 'FIXED',
         isAlwaysSignal: false,
+        stopLoss: 0,
+        stopProfit: 0,
       },
       isDemoAccount: true,
       currency: 'IDR',
@@ -1051,6 +1065,9 @@ export class IndicatorService implements OnModuleDestroy {
     else if (!isDraw) tradePnL = -mode.activeOrderAmount;
     mode.sessionPnL += tradePnL;
 
+    // ── Stop Loss / Stop Profit check ─────────────────────────────────────
+    if (this.checkStopConditions(userId, mode, config)) return;
+
     const resultLogId = `${mode.activeOrderId}_s${step}`;
     this.writeLog(userId, {
       id: resultLogId,
@@ -1435,6 +1452,53 @@ export class IndicatorService implements OnModuleDestroy {
     await this.supabaseService.client.from('indicator_status').upsert(
       { user_id: userId, bot_state: botState, updated_at: this.supabaseService.now() },
     );
+  }
+
+  /**
+   * Cek apakah Stop Loss atau Stop Profit telah tercapai.
+   * Menghentikan bot secara otomatis jika ya.
+   * @returns true jika bot dihentikan, false jika tidak
+   */
+  private checkStopConditions(userId: string, mode: ActiveMode, config: IndicatorConfig): boolean {
+    const { stopLoss, stopProfit } = config.martingale;
+
+    if (stopLoss && stopLoss > 0 && mode.sessionPnL <= -stopLoss) {
+      this.logger.log(
+        `[${userId}] 🛑 Stop Loss tercapai: sessionPnL=${mode.sessionPnL} ≤ -${stopLoss}. Bot dihentikan.`,
+      );
+      this.writeLog(userId, {
+        id: `stoploss_${Date.now()}`,
+        orderId: mode.activeOrderId ?? 'system',
+        trend: mode.activeOrderTrend ?? '-',
+        amount: 0,
+        martingaleStep: mode.currentMartingaleStep,
+        executedAt: Date.now(),
+        note: `⛔ Stop Loss triggered: sessionPnL=${mode.sessionPnL} ≤ -${stopLoss}`,
+        isDemoAccount: config.isDemoAccount,
+      });
+      this.stopIndicatorMode(userId);
+      return true;
+    }
+
+    if (stopProfit && stopProfit > 0 && mode.sessionPnL >= stopProfit) {
+      this.logger.log(
+        `[${userId}] ✅ Stop Profit tercapai: sessionPnL=${mode.sessionPnL} ≥ ${stopProfit}. Bot dihentikan.`,
+      );
+      this.writeLog(userId, {
+        id: `stopprofit_${Date.now()}`,
+        orderId: mode.activeOrderId ?? 'system',
+        trend: mode.activeOrderTrend ?? '-',
+        amount: 0,
+        martingaleStep: mode.currentMartingaleStep,
+        executedAt: Date.now(),
+        note: `🎯 Stop Profit triggered: sessionPnL=${mode.sessionPnL} ≥ ${stopProfit}`,
+        isDemoAccount: config.isDemoAccount,
+      });
+      this.stopIndicatorMode(userId);
+      return true;
+    }
+
+    return false;
   }
 
   private sleep(ms: number): Promise<void> {

@@ -48,13 +48,19 @@ export class MomentumController {
     if (
       dto.maxSteps !== undefined ||
       dto.multiplierValue !== undefined ||
-      dto.baseAmount !== undefined
+      dto.baseAmount !== undefined ||
+      dto.isAlwaysSignal !== undefined ||
+      dto.stopLoss !== undefined ||      // ← NEW
+      dto.stopProfit !== undefined        // ← NEW
     ) {
       updates.martingale = {
         ...config.martingale,
-        ...(dto.maxSteps && { maxSteps: dto.maxSteps }),
-        ...(dto.multiplierValue && { multiplierValue: dto.multiplierValue }),
-        ...(dto.baseAmount && { baseAmount: dto.baseAmount }),
+        ...(dto.maxSteps !== undefined && { maxSteps: dto.maxSteps }),
+        ...(dto.multiplierValue !== undefined && { multiplierValue: dto.multiplierValue }),
+        ...(dto.baseAmount !== undefined && { baseAmount: dto.baseAmount }),
+        ...(dto.isAlwaysSignal !== undefined && { isAlwaysSignal: dto.isAlwaysSignal }),
+        ...(dto.stopLoss !== undefined && { stopLoss: dto.stopLoss }),        // ← NEW
+        ...(dto.stopProfit !== undefined && { stopProfit: dto.stopProfit }),  // ← NEW
       };
     }
 

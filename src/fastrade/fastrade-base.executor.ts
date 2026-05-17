@@ -296,37 +296,51 @@ export abstract class FastradeBaseExecutor {
     const m = this.config.martingale;
     if (!m.isEnabled || !m.isAlwaysSignal) return;
 
-    const nextStep = (this.alwaysSignalLossState?.currentMartingaleStep ?? 0) + 1;
+    const currentStep = this.alwaysSignalLossState?.currentMartingaleStep ?? 0;
+    const nextStep = currentStep + 1;
 
     if (nextStep > m.maxSteps) {
-      this.logger.log(`[${this.userId}] Always Signal: Max steps reached - RESET`);
+      // Sudah melewati max step — reset loss state, siklus selesai dengan LOSE
+      this.logger.log(
+        `[${this.userId}] 📊 Always Signal: Max steps (${m.maxSteps}) reached — loss state di-reset`
+      );
       this.alwaysSignalLossState = null;
       return;
     }
+
+    const totalLoss = (this.alwaysSignalLossState?.totalLoss ?? 0) + order.amount;
 
     this.alwaysSignalLossState = {
       hasOutstandingLoss: true,
       currentMartingaleStep: nextStep,
       originalOrderId: order.id,
-      totalLoss: (this.alwaysSignalLossState?.totalLoss ?? 0) + order.amount,
-      currentTrend: order.trend,
+      totalLoss,
+      // currentTrend dihapus — trend martingale ditentukan dari analisis candle
+      // sinyal berikutnya, bukan disimpan dari order yang LOSE.
     };
 
     this.logger.log(
-      `[${this.userId}] 📊 Always Signal: Loss recorded, step ${nextStep}/${m.maxSteps}, ` +
-      `totalLoss=${this.alwaysSignalLossState.totalLoss}`
+      `[${this.userId}] 📊 Always Signal: Loss recorded step=${currentStep}→${nextStep}/${m.maxSteps} ` +
+      `lossAmount=${order.amount} totalLoss=${totalLoss}`
     );
   }
 
   /**
-   * Execute Always Signal martingale pada sinyal berikutnya
+   * Execute Always Signal martingale pada sinyal berikutnya.
+   *
+   * @param trend - Trend hasil analisis candle sinyal baru.
+   *   FTT: sama dengan hasil candle (trend tidak di-reverse oleh always signal).
+   *   CTC: sama dengan hasil candle; CTC yang akan meng-handle reverse sendiri
+   *        di onLose() jika loss lagi, sesuai logika CTC normal.
+   *
+   * Desain: always signal hanya menaikkan amount (step) — arah trend tetap
+   * mengikuti sinyal baru, bukan tersimpan dari order loss sebelumnya.
    */
-  protected async executeAlwaysSignalMartingale(): Promise<boolean> {
+  protected async executeAlwaysSignalMartingale(trend: TrendType): Promise<boolean> {
     if (!this.alwaysSignalLossState?.hasOutstandingLoss) return false;
 
     const m = this.config.martingale;
     const step = this.alwaysSignalLossState.currentMartingaleStep;
-    const trend = this.alwaysSignalLossState.currentTrend;
     const amount = this.calcAmount(step);
 
     this.logger.log(
@@ -452,16 +466,20 @@ export abstract class FastradeBaseExecutor {
 
     // Handle Always Signal logic
     if (isWin) {
+      // WIN: bersihkan loss state lalu lanjutkan
       this.clearAlwaysSignalLoss();
       this.onWin(completedOrder);
     } else if (isDraw) {
       this.onDraw(completedOrder);
     } else {
-      // LOSE - check if Always Signal mode
-      if (this.config.martingale.isAlwaysSignal) {
+      // LOSE
+      if (this.config.martingale.isEnabled && this.config.martingale.isAlwaysSignal) {
+        // Catat loss — naikkan step dan totalLoss di alwaysSignalLossState.
+        // resetMartingale() TIDAK dipanggil di sini karena onLose() akan memicu
+        // startNewCycle(), yang harus menganalisis candle dulu baru eksekusi martingale.
+        // martingaleStep & martingaleActive akan di-reset oleh resetMartingale() di
+        // startNewCycle() setelah pengecekan alwaysSignalLossState.
         this.handleAlwaysSignalLoss(completedOrder);
-        // Jangan lanjutkan martingale langsung, tunggu sinyal berikutnya
-        this.resetMartingale();
         this.onLose(completedOrder);
       } else {
         this.onLose(completedOrder);

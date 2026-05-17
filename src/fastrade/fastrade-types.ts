@@ -69,11 +69,13 @@ export interface FastradeTradeOrder {
   trend: TrendType;
 }
 
-// Always Signal Loss State untuk melacak loss yang belum tertutupi
+// Always Signal Loss State untuk melacak loss yang belum tertutupi.
+// currentTrend TIDAK disimpan di sini — trend martingale ditentukan dari
+// analisis candle sinyal berikutnya (FTT: sama dengan sinyal, CTC: sama dengan sinyal
+// dan di-reverse saat LOSE lagi sesuai logika CTC normal).
 export interface FastradeAlwaysSignalLossState {
   hasOutstandingLoss: boolean;
   currentMartingaleStep: number;
   originalOrderId: string;
   totalLoss: number;
-  currentTrend: TrendType;
 }

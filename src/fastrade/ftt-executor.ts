@@ -44,24 +44,30 @@ export class FttExecutor extends FastradeBaseExecutor {
   protected startNewCycle(): void {
     if (!this.isRunning) return;
 
-    // Check Always Signal - jika ada loss yang belum tertutupi, eksekusi martingale
-    if (this.alwaysSignalLossState?.hasOutstandingLoss) {
-      this.logger.log(
-        `[${this.userId}] 🔄 FTT: Always Signal active - executing martingale step ` +
-        `${this.alwaysSignalLossState.currentMartingaleStep}`
-      );
-      this.executeAlwaysSignalMartingale();
-      return;
-    }
-
     this.cycleNumber++;
     this.currentTrend = undefined;
     this.phase = 'IDLE';
-    this.resetMartingale();
+    // Reset martingale state HANYA jika always signal tidak aktif.
+    // Jika always signal aktif, martingaleStep & totalLoss tetap di alwaysSignalLossState —
+    // runCycle() akan menganalisis candle, lalu executeWithTrend() memakai step yang benar.
+    if (!this.alwaysSignalLossState?.hasOutstandingLoss) {
+      this.resetMartingale();
+    }
     this.clearCycleTimer();
 
-    this.logger.log(`[${this.userId}] 🔄 FTT CYCLE ${this.cycleNumber}: Starting`);
-    this.callbacks.onStatusChange(`FTT CYCLE ${this.cycleNumber}: Menunggu batas menit...`);
+    if (this.alwaysSignalLossState?.hasOutstandingLoss) {
+      this.logger.log(
+        `[${this.userId}] 🔄 FTT CYCLE ${this.cycleNumber}: Always Signal aktif ` +
+        `(step ${this.alwaysSignalLossState.currentMartingaleStep}) — analisis candle dulu`
+      );
+      this.callbacks.onStatusChange(
+        `FTT CYCLE ${this.cycleNumber}: Always Signal step ` +
+        `${this.alwaysSignalLossState.currentMartingaleStep} — Menunggu batas menit...`
+      );
+    } else {
+      this.logger.log(`[${this.userId}] 🔄 FTT CYCLE ${this.cycleNumber}: Starting`);
+      this.callbacks.onStatusChange(`FTT CYCLE ${this.cycleNumber}: Menunggu batas menit...`);
+    }
 
     this.runCycle().catch((err) => {
       this.logger.error(`[${this.userId}] FTT CYCLE ${this.cycleNumber} unhandled error: ${err.message}`);
@@ -169,16 +175,26 @@ export class FttExecutor extends FastradeBaseExecutor {
       return;
     }
 
+    // Always Signal: jika ada outstanding loss, override step & amount dari loss state.
+    // Trend tetap dari parameter (hasil analisis candle baru) — hanya amount yang dinaikkan.
+    let effectiveStep = step;
+    if (this.alwaysSignalLossState?.hasOutstandingLoss && step === 0) {
+      effectiveStep = this.alwaysSignalLossState.currentMartingaleStep;
+      this.logger.log(
+        `[${this.userId}] FTT: Always Signal override — step ${step}→${effectiveStep}`
+      );
+    }
+
     this.phase = 'EXECUTING';
-    const amount = this.calcAmount(step);
+    const amount = this.calcAmount(effectiveStep);
 
     this.logger.log(
-      `[${this.userId}] FTT: Execute trend=${trend.toUpperCase()} amount=${amount} step=${step} ` +
+      `[${this.userId}] FTT: Execute trend=${trend.toUpperCase()} amount=${amount} step=${effectiveStep} ` +
       `cycle=${this.cycleNumber}` +
       (retryCount > 0 ? ` (retry ${retryCount}/${MAX_RETRIES})` : ''),
     );
 
-    const order = await this.executeTrade(trend, amount, step, this.cycleNumber);
+    const order = await this.executeTrade(trend, amount, effectiveStep, this.cycleNumber);
 
     if (!order) {
       if (!this.isRunning) return;
@@ -216,21 +232,21 @@ export class FttExecutor extends FastradeBaseExecutor {
     const m = this.config.martingale;
     const trend = this.currentTrend ?? order.trend;
 
-    // Jika Always Signal mode aktif, loss sudah di-handle di handleDealResult
-    // dan martingale akan di-trigger pada cycle berikutnya
+    // Always Signal mode aktif: loss state sudah dicatat di handleDealResult.
+    // Mulai cycle baru untuk analisis candle — executeWithTrend() akan otomatis
+    // memakai step & amount yang sudah dinaikkan dari alwaysSignalLossState.
     if (m.isEnabled && m.isAlwaysSignal) {
       this.phase = 'ALWAYS_SIGNAL_WAITING';
+      const nextStep = this.alwaysSignalLossState?.currentMartingaleStep ?? 1;
       this.logger.log(
-        `[${this.userId}] FTT LOSE — Always Signal: Menunggu sinyal berikutnya ` +
-        `untuk martingale step ${this.alwaysSignalLossState?.currentMartingaleStep ?? 1}`
+        `[${this.userId}] FTT LOSE — Always Signal: Menunggu sinyal candle berikutnya ` +
+        `untuk martingale step ${nextStep}/${m.maxSteps}`
       );
       this.callbacks.onStatusChange(
-        `FTT LOSE — Always Signal: Menunggu sinyal berikutnya...`
+        `FTT LOSE — Always Signal step ${nextStep}: Menunggu sinyal berikutnya...`
       );
-      // Lanjutkan ke cycle baru untuk menunggu sinyal berikutnya
-      setTimeout(() => {
-        if (this.isRunning) this.startNewCycle();
-      }, CYCLE_RESTART_DELAY_MS);
+      // Cycle baru: analisis 2 candle → executeWithTrend() pakai step dari alwaysSignalLossState
+      this.scheduleNewCycle(CYCLE_RESTART_DELAY_MS);
       return;
     }
 

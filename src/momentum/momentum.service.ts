@@ -822,6 +822,7 @@ export class MomentumService implements OnModuleDestroy {
     if (!mode) return;
 
     if (config.martingale.isAlwaysSignal && mode.alwaysSignalLossState?.hasOutstandingLoss) {
+      // Pass signal.trend (dari candle pattern baru) — bukan trend dari loss state lama.
       await this.executeAlwaysSignalMartingale(userId, config, session, signal);
       return;
     }
@@ -910,16 +911,19 @@ export class MomentumService implements OnModuleDestroy {
     const step = lossState.currentMartingaleStep;
 
     if (step > config.martingale.maxSteps) {
-      this.logger.log(`[${userId}] Always Signal: Max steps reached - RESET`);
+      this.logger.log(`[${userId}] 📊 Always Signal: Max steps (${config.martingale.maxSteps}) reached — loss state di-reset`);
       mode.alwaysSignalLossState = null;
       return;
     }
 
     const amount = this.calculateMartingaleAmount(config, step);
+    // FIX: Gunakan signal.trend (dari candle pattern baru), bukan lossState.currentTrend (trend lama).
+    // Always signal hanya menaikkan amount — arah trade mengikuti sinyal momentum baru.
+    const trend = signal.trend;
 
     this.logger.log(
       `[${userId}] 🔄 Always Signal: Executing step ${step}/${config.martingale.maxSteps} ` +
-      `trend=${lossState.currentTrend} amount=${amount}`
+      `trend=${trend} (dari sinyal ${signal.momentumType}) amount=${amount}`
     );
 
     const orderId = uuidv4();
@@ -929,16 +933,16 @@ export class MomentumService implements OnModuleDestroy {
       id: orderId,
       orderId,
       momentumType: lossState.momentumType,
-      trend: lossState.currentTrend,
+      trend,
       amount,
       martingaleStep: step,
       executedAt: currentTime,
-      note: `Always Signal Martingale step ${step}/${config.martingale.maxSteps}`,
+      note: `Always Signal Martingale step ${step}/${config.martingale.maxSteps} | signal=${signal.momentumType}`,
     };
     this.appendLog(userId, execLog);
 
     const tradeResult = await mode.wsClient.placeTrade(
-      this.buildTradePayload(session, config, amount, lossState.currentTrend),
+      this.buildTradePayload(session, config, amount, trend),
     );
 
     if (tradeResult?.dealId) {
@@ -1002,22 +1006,31 @@ export class MomentumService implements OnModuleDestroy {
 
           if (isWin) {
             mode.totalWins++;
-            this.logger.log(`[${userId}] Always Signal: WIN at step ${step}`);
+            this.logger.log(`[${userId}] ✅ Always Signal: WIN at step ${step} — loss state di-reset`);
             mode.alwaysSignalLossState = null;
           } else {
             mode.totalLosses++;
             const newTotalLoss = (lossState.totalLoss || 0) + amount;
 
             if (step >= config.martingale.maxSteps) {
-              this.logger.log(`[${userId}] Always Signal: Max steps reached - RESET`);
+              this.logger.log(
+                `[${userId}] 📊 Always Signal: Max steps (${config.martingale.maxSteps}) reached — loss state di-reset`
+              );
               mode.alwaysSignalLossState = null;
             } else {
+              // FIX: spread lossState dan override field yang berubah.
+              // currentTrend tidak ada lagi di state — trend mengikuti sinyal baru.
               mode.alwaysSignalLossState = {
-                ...lossState,
+                hasOutstandingLoss: true,
                 currentMartingaleStep: step + 1,
+                originalOrderId: lossState.originalOrderId,
                 totalLoss: newTotalLoss,
+                momentumType: lossState.momentumType,
               };
-              this.logger.log(`[${userId}] Always Signal: LOSE at step ${step}, next step=${step + 1}`);
+              this.logger.log(
+                `[${userId}] 📊 Always Signal: LOSE at step ${step}→${step + 1}/${config.martingale.maxSteps} ` +
+                `lossAmount=${amount} totalLoss=${newTotalLoss}`
+              );
             }
           }
         }
@@ -1086,14 +1099,20 @@ export class MomentumService implements OnModuleDestroy {
             if (config.martingale.isEnabled && !config.martingale.isAlwaysSignal) {
               await this.startMartingale(userId, config, session, orderId, momentumType, 1);
             } else if (config.martingale.isAlwaysSignal) {
+              // FIX: currentTrend dihapus — trend mengikuti sinyal momentum berikutnya.
+              // totalLoss adalah akumulasi dari loss sebelumnya (jika ada).
+              const prevTotalLoss = mode.alwaysSignalLossState?.totalLoss ?? 0;
               mode.alwaysSignalLossState = {
                 hasOutstandingLoss: true,
                 currentMartingaleStep: 1,
                 originalOrderId: orderId,
-                totalLoss: amount,
-                currentTrend: mode.activeMomentumOrders.get(momentumType)?.trend || 'call',
+                totalLoss: prevTotalLoss + amount,
                 momentumType,
               };
+              this.logger.log(
+                `[${userId}] 📊 Always Signal: Loss recorded step=0→1/${config.martingale.maxSteps} ` +
+                `lossAmount=${amount} totalLoss=${prevTotalLoss + amount}`
+              );
               mode.activeMomentumOrders.delete(momentumType);
             } else {
               mode.totalLosses++;

@@ -50,24 +50,30 @@ export class CtcExecutor extends FastradeBaseExecutor {
   protected startNewCycle(): void {
     if (!this.isRunning) return;
 
-    // Check Always Signal - jika ada loss yang belum tertutupi, eksekusi martingale
-    if (this.alwaysSignalLossState?.hasOutstandingLoss) {
-      this.logger.log(
-        `[${this.userId}] 🔄 CTC: Always Signal active - executing martingale step ` +
-        `${this.alwaysSignalLossState.currentMartingaleStep}`
-      );
-      this.executeAlwaysSignalMartingale();
-      return;
-    }
-
     this.cycleNumber++;
     this.currentTrend = undefined;
     this.activeTrend = undefined;
     this.phase = 'IDLE';
-    this.resetMartingale();
+    // Reset martingale state HANYA jika always signal tidak aktif.
+    // Jika always signal aktif, step & totalLoss dijaga di alwaysSignalLossState —
+    // runCycle() akan analisis candle, lalu executeWithTrend() memakai step yang benar.
+    if (!this.alwaysSignalLossState?.hasOutstandingLoss) {
+      this.resetMartingale();
+    }
 
-    this.logger.log(`[${this.userId}] 🔄 CTC CYCLE ${this.cycleNumber}: Starting`);
-    this.callbacks.onStatusChange(`CTC CYCLE ${this.cycleNumber}: Menunggu batas menit...`);
+    if (this.alwaysSignalLossState?.hasOutstandingLoss) {
+      this.logger.log(
+        `[${this.userId}] 🔄 CTC CYCLE ${this.cycleNumber}: Always Signal aktif ` +
+        `(step ${this.alwaysSignalLossState.currentMartingaleStep}) — analisis candle dulu`
+      );
+      this.callbacks.onStatusChange(
+        `CTC CYCLE ${this.cycleNumber}: Always Signal step ` +
+        `${this.alwaysSignalLossState.currentMartingaleStep} — Menunggu batas menit...`
+      );
+    } else {
+      this.logger.log(`[${this.userId}] 🔄 CTC CYCLE ${this.cycleNumber}: Starting`);
+      this.callbacks.onStatusChange(`CTC CYCLE ${this.cycleNumber}: Menunggu batas menit...`);
+    }
 
     this.runCycle().catch((err) => {
       this.logger.error(`[${this.userId}] CTC CYCLE ${this.cycleNumber} unhandled error: ${err.message}`);
@@ -238,16 +244,26 @@ export class CtcExecutor extends FastradeBaseExecutor {
       return;
     }
 
+    // Always Signal: jika ada outstanding loss dan ini bukan lanjutan martingale regular,
+    // override step dari loss state. Trend tetap dari parameter (hasil analisis candle).
+    let effectiveStep = step;
+    if (this.alwaysSignalLossState?.hasOutstandingLoss && step === 0) {
+      effectiveStep = this.alwaysSignalLossState.currentMartingaleStep;
+      this.logger.log(
+        `[${this.userId}] CTC: Always Signal override — step ${step}→${effectiveStep}`
+      );
+    }
+
     this.phase = 'EXECUTING';
-    const amount = this.calcAmount(step);
+    const amount = this.calcAmount(effectiveStep);
 
     this.logger.log(
-      `[${this.userId}] CTC: Execute trend=${trend.toUpperCase()} amount=${amount} step=${step} ` +
+      `[${this.userId}] CTC: Execute trend=${trend.toUpperCase()} amount=${amount} step=${effectiveStep} ` +
       `activeTrend=${this.activeTrend} cycle=${this.cycleNumber}` +
       (retryCount > 0 ? ` (retry ${retryCount}/${MAX_RETRIES})` : ''),
     );
 
-    const order = await this.executeTrade(trend, amount, step, this.cycleNumber);
+    const order = await this.executeTrade(trend, amount, effectiveStep, this.cycleNumber);
 
     if (!order) {
       if (!this.isRunning) return;
@@ -287,18 +303,22 @@ export class CtcExecutor extends FastradeBaseExecutor {
     const m = this.config.martingale;
     const currentActiveTrend = this.activeTrend ?? this.currentTrend ?? order.trend;
 
-    // Jika Always Signal mode aktif, loss sudah di-handle di handleDealResult
-    // dan martingale akan di-trigger pada cycle berikutnya
+    // Always Signal mode aktif: loss state sudah dicatat di handleDealResult.
+    // Mulai cycle baru untuk analisis candle — executeWithTrend() akan otomatis
+    // memakai step & amount yang sudah dinaikkan dari alwaysSignalLossState.
+    // Trend: CTC akan menentukan dari analisis candle baru; jika LOSE lagi,
+    // onLose() regular akan me-reverse trend sesuai logika CTC normal.
     if (m.isEnabled && m.isAlwaysSignal) {
       this.phase = 'ALWAYS_SIGNAL_WAITING';
+      const nextStep = this.alwaysSignalLossState?.currentMartingaleStep ?? 1;
       this.logger.log(
-        `[${this.userId}] CTC LOSE — Always Signal: Menunggu sinyal berikutnya ` +
-        `untuk martingale step ${this.alwaysSignalLossState?.currentMartingaleStep ?? 1}`
+        `[${this.userId}] CTC LOSE — Always Signal: Menunggu sinyal candle berikutnya ` +
+        `untuk martingale step ${nextStep}/${m.maxSteps}`
       );
       this.callbacks.onStatusChange(
-        `CTC LOSE — Always Signal: Menunggu sinyal berikutnya...`
+        `CTC LOSE — Always Signal step ${nextStep}: Menunggu sinyal berikutnya...`
       );
-      // Lanjutkan ke cycle baru untuk menunggu sinyal berikutnya
+      // Cycle baru: analisis 2 candle → executeWithTrend() pakai step dari alwaysSignalLossState
       setTimeout(() => {
         if (this.isRunning) this.startNewCycle();
       }, CYCLE_RESTART_DELAY_MS);

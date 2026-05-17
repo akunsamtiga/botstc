@@ -60,13 +60,14 @@ export interface MomentumMartingaleResult {
   momentumType: MomentumType;
 }
 
-// Always Signal Loss State untuk momentum mode
+// Always Signal Loss State untuk momentum mode.
+// currentTrend dihapus: trend martingale mengikuti sinyal momentum baru
+// (arah dari candle pattern yang terdeteksi), bukan disimpan dari order yang LOSE.
 export interface MomentumAlwaysSignalLossState {
   hasOutstandingLoss: boolean;
   currentMartingaleStep: number;
   originalOrderId: string;
   totalLoss: number;
-  currentTrend: string;
   momentumType: MomentumType;
 }
 

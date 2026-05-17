@@ -247,6 +247,11 @@ export class AISignalMonitorService implements OnModuleDestroy {
 
   /**
    * Check orders untuk user tertentu via API
+   *
+   * FIX Bug #1: Gunakan endpoint yang benar — /bo-deals-history/v3/deals/trade
+   *             bukan /profile/trading-history yang tidak mengembalikan closed deals.
+   * FIX Bug #2: Simpan trade.uuid (bukan trade.id) agar konsisten dengan findMatchingTrade.
+   * FIX Bug #3: Gunakan finished_at (waktu trade selesai) bukan created_at (waktu dibuka).
    */
   private async checkOrdersForUser(
     userId: string,
@@ -264,16 +269,18 @@ export class AISignalMonitorService implements OnModuleDestroy {
     }
 
     try {
-      // Fetch trading history dari API via curl
+      // FIX #1: Pakai endpoint bo-deals-history yang benar (sama dengan StockityHistoryService)
+      const accountType = orders[0].isDemoAccount ? 'demo' : 'real';
       const headers = this.buildStockityHeaders(session);
       const response = await curlGet(
-        `${this.BASE_URL}/profile/trading-history?type=${orders[0].isDemoAccount ? 'demo' : 'real'}`,
+        `${this.BASE_URL}/bo-deals-history/v3/deals/trade?type=${accountType}&locale=id`,
         headers,
-        15, // seconds — curlGet takes timeoutSec, not timeoutMs
+        20,
       );
 
       if (response?.data?.data) {
-        const trades = response.data.data;
+        // Endpoint ini mengembalikan { data: { standard_trade_deals: [...], batch_key: ... } }
+        const trades: any[] = response.data.data.standard_trade_deals ?? [];
 
         // Cari trade yang cocok dengan order yang sedang dimonitor
         for (const order of orders) {
@@ -296,9 +303,10 @@ export class AISignalMonitorService implements OnModuleDestroy {
               isCompleted: true,
             });
 
-            this.processedResults.set(`${userId}_${order.monitoringOrderId}`, matchingTrade.id);
+            // FIX #2: Simpan uuid (bukan id) agar konsisten dengan findMatchingTrade
+            const tradeUuid = matchingTrade.uuid ?? matchingTrade.id;
+            this.processedResults.set(`${userId}_${order.monitoringOrderId}`, tradeUuid);
 
-            // Build result
             const result: TradeResult = {
               parentOrderId: order.parentOrderId,
               monitoringOrderId: order.monitoringOrderId,
@@ -306,12 +314,12 @@ export class AISignalMonitorService implements OnModuleDestroy {
               isMartingale: order.isMartingale,
               martingaleStep: order.martingaleStep,
               details: new Map([
-                ['trade_id', matchingTrade.id],
+                ['trade_id', tradeUuid],
                 ['amount', matchingTrade.amount],
                 ['trend', matchingTrade.trend],
                 ['status', matchingTrade.status],
                 ['win_amount', matchingTrade.win || 0],
-                ['payment', matchingTrade.payment || 0],
+                ['payment_rate', matchingTrade.payment_rate || 0],
                 ['detection_method', 'ai_signal_monitor_api'],
                 ['detection_time', Date.now()],
                 ['monitoring_duration', Date.now() - order.startTime],
@@ -329,18 +337,28 @@ export class AISignalMonitorService implements OnModuleDestroy {
 
   /**
    * Find matching trade dari history
+   *
+   * FIX Bug #3: Gunakan finished_at (bukan created_at) untuk cek waktu trade selesai.
+   * FIX Bug #2: Bandingkan trade.uuid (konsisten dengan processedResults).
    */
   private findMatchingTrade(trades: any[], order: MonitoringOrder, userId: string): any | null {
     const recentTimeThreshold = Date.now() - 120000; // 2 menit terakhir
 
     for (const trade of trades) {
-      const tradeTime = new Date(trade.created_at).getTime();
+      // FIX #3: finished_at = waktu trade selesai (bukan created_at = waktu dibuka)
+      const finishedAt = trade.finished_at
+        ? new Date(trade.finished_at).getTime()
+        : new Date(trade.created_at).getTime();
+
       const amountMatch = Math.abs(trade.amount - order.amount) < 100;
       const trendMatch = trade.trend?.toLowerCase() === order.trend.toLowerCase();
-      const isCompleted = ['won', 'lost'].includes(trade.status?.toLowerCase());
-      const isRecent = tradeTime >= recentTimeThreshold;
-      // Use same key format as the setters: `${userId}_${monitoringOrderId}`
-      const isNotProcessed = trade.uuid !== this.processedResults.get(`${userId}_${order.monitoringOrderId}`);
+      const isCompleted = ['won', 'lost', 'equal'].includes(trade.status?.toLowerCase());
+      const isRecent = finishedAt >= recentTimeThreshold;
+
+      // FIX #2: Gunakan uuid (sama dengan yang disimpan di processedResults)
+      const tradeUuid = trade.uuid ?? trade.id;
+      const processedKey = `${userId}_${order.monitoringOrderId}`;
+      const isNotProcessed = tradeUuid !== this.processedResults.get(processedKey);
 
       if (isRecent && amountMatch && trendMatch && isCompleted && isNotProcessed) {
         return trade;

@@ -4,7 +4,7 @@ import { TradeOrderData } from './types';
 
 export interface PlaceTradeResult {
   dealId: string | null;
-  error?: 'amount_min' | 'duplicate' | 'unknown';
+  error?: 'amount_min' | 'amount_max' | 'duplicate' | 'unknown';
 }
 
 export interface DealResultPayload {
@@ -227,6 +227,7 @@ export class StockityWebSocketClient {
             const reasons: string[] = (response?.reasons ?? []).map((r: any) => r.validation as string);
             const error: PlaceTradeResult['error'] =
               reasons.includes('deal_amount_min') ? 'amount_min' :
+              reasons.includes('deal_amount_max') ? 'amount_max' :
               reasons.includes('duplicate_deal')  ? 'duplicate'  : 'unknown';
             pending.resolve({ dealId: null, error });
             this.pendingTrades.delete(ref);

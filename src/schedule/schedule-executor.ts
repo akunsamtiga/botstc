@@ -185,16 +185,7 @@ export class ScheduleExecutor {
   getOrders(): ScheduledOrder[] { return [...this.orders]; }
   getActiveMartingaleOrderId() { return this.activeMartingaleOrderId; }
   getAlwaysSignalLossState() { return this.alwaysSignalLossState; }
-  updateConfig(config: ScheduleConfig) {
-    const wasAlways = this.config.martingale.isAlwaysSignal;
-    this.config = { ...config };
-    // Jika mode AlwaysSignal dinonaktifkan saat bot running, bersihkan state loss
-    // agar order berikutnya tidak membawa sisa step dari sesi always signal sebelumnya.
-    if (wasAlways && !config.martingale.isAlwaysSignal) {
-      this.alwaysSignalLossState = undefined;
-      this.logger.log(`[${this.userId}] AlwaysSignal dinonaktifkan — loss state di-reset`);
-    }
-  }
+  updateConfig(config: ScheduleConfig) { this.config = { ...config }; }
 
   addOrders(newOrders: ScheduledOrder[]): ScheduledOrder[] {
     const now = Date.now();
@@ -374,12 +365,10 @@ export class ScheduleExecutor {
       // Notify tracking service
       await this.callbacks.onOrderExecuted?.(order.id, dealId, amount, estimatedCompletionTime).catch(() => {});
     } else if (result.error !== 'duplicate') {
-      // Trade gagal di level WS (timeout, network, dll) — bukan LOSE dari Stockity.
-      // AlwaysSignal step TIDAK dinaikkan di sini; step hanya naik setelah hasil
-      // resmi dari Stockity (LOSE) diterima via handleDealResult.
       this.logger.error(`[${this.userId}] ❌ Trade failed for ${order.id}`);
       this.executionInfoMap.delete(order.id);
       this.callbacks.onOrderFailed?.(order.id, result.error || 'Trade failed').catch(() => {});
+      if (isAlways) this.advanceAlwaysSignalLoss(order, step, amount);
     } else {
       this.logger.warn(`[${this.userId}] ⚠️ Duplicate deal ${order.id} — menunggu hasil via WS`);
       // Still notify tracking that order is being monitored
@@ -491,29 +480,18 @@ export class ScheduleExecutor {
     const isRegular = this.config.martingale.isEnabled && !isAlways && this.config.martingale.maxSteps > 1;
 
     if (isDraw) {
-      // DRAW: tidak ada menang/kalah — loss state di-reset (tidak dilanjutkan ke step berikutnya).
-      // Capture step sebelum reset agar PnL log akurat.
-      const alwaysSignalStepBeforeReset = isAlways
-        ? (this.alwaysSignalLossState?.currentMartingaleStep ?? 0)
-        : undefined;
-      if (isAlways) this.alwaysSignalLossState = undefined;
-      this.completeOrder(orderIdx, 'DRAW', dealId, alwaysSignalStepBeforeReset);
+      this.completeOrder(orderIdx, 'DRAW', dealId);
       return;
     }
 
     if (isWin) {
-      // Capture step aktif sebelum loss state di-reset, agar completeOrder bisa
-      // menghitung PnL yang benar (WIN di step 2 harusnya profit dari amount step 2).
-      const alwaysSignalStepBeforeReset = isAlways
-        ? (this.alwaysSignalLossState?.currentMartingaleStep ?? 0)
-        : undefined;
       if (isAlways) this.alwaysSignalLossState = undefined;
       if (this.activeMartingaleOrderId === order.id) {
         this.activeMartingaleOrderId = undefined;
         this.martingaleStartTime = undefined;
         this.callbacks.onActiveMartingaleChange?.(null).catch(() => {});
       }
-      this.completeOrder(orderIdx, 'WIN', dealId, alwaysSignalStepBeforeReset);
+      this.completeOrder(orderIdx, 'WIN', dealId);
     } else {
       if (isAlways) {
         const step = this.alwaysSignalLossState?.currentMartingaleStep ?? 0;
@@ -719,9 +697,7 @@ export class ScheduleExecutor {
   private advanceAlwaysSignalLoss(order: ScheduledOrder, step: number, lossAmount: number) {
     const nextStep = step + 1;
     if (nextStep > this.config.martingale.maxSteps) {
-      // Sudah melewati max step — reset loss state, siklus selesai dengan LOSE
       this.alwaysSignalLossState = undefined;
-      this.logger.log(`[${this.userId}] 📊 AlwaysSignal max step ${step}/${this.config.martingale.maxSteps} tercapai — loss state di-reset`);
       return;
     }
     const prev = this.alwaysSignalLossState?.totalLoss ?? 0;
@@ -730,13 +706,12 @@ export class ScheduleExecutor {
       currentMartingaleStep: nextStep,
       originalOrderId: order.id,
       totalLoss: prev + lossAmount,
-      // currentTrend dihapus — always signal mengikuti arah sinyal order berikutnya,
-      // bukan arah loss sebelumnya. Field ini tidak pernah digunakan di mana pun.
+      currentTrend: order.trend,
     };
-    this.logger.log(`[${this.userId}] 📊 AlwaysSignal loss recorded: step=${step} amount=${lossAmount} → nextStep=${nextStep}/${this.config.martingale.maxSteps} totalLoss=${prev + lossAmount}`);
+    this.logger.log(`[${this.userId}] 📊 AlwaysSignal step=${nextStep}/${this.config.martingale.maxSteps}`);
   }
 
-  private completeOrder(orderIdx: number, result: 'WIN' | 'LOSE' | 'DRAW', dealId?: string, alwaysSignalStep?: number) {
+  private completeOrder(orderIdx: number, result: 'WIN' | 'LOSE' | 'DRAW', dealId?: string) {
     const order = this.orders[orderIdx];
     const finalResult = result === 'WIN' ? 'WIN' : result === 'DRAW' ? 'DRAW' : 'LOSS';
 
@@ -746,68 +721,42 @@ export class ScheduleExecutor {
       this.callbacks.onActiveMartingaleChange?.(null).catch(() => {});
     }
 
-    const isAlways = this.config.martingale.isEnabled && this.config.martingale.isAlwaysSignal;
-
-    /**
-     * FIX #4: Hitung step & amount yang benar-benar dieksekusi.
-     *
-     * Always Signal: martingale berjalan lintas order — order.martingaleState
-     * TIDAK pernah diset isActive karena tidak pakai startMartingale().
-     * Step aktual ada di alwaysSignalLossState.currentMartingaleStep.
-     * Saat WIN, loss state sudah di-clear di handleDealResult sebelum completeOrder
-     * dipanggil, sehingga step di-capture sebelumnya dan dipass via alwaysSignalStep.
-     *
-     * Regular Martingale: pakai order.martingaleState seperti biasa.
-     */
-    let effectiveStep: number;
-    let effectiveAmount: number;
-
-    const execInfo = this.executionInfoMap.get(order.id);
-
-    if (isAlways) {
-      // Amount aktual diambil dari executionInfoMap yang diset saat executeOrder/placeMartingaleTrade.
-      // Ini adalah amount yang benar-benar dikirim ke Stockity.
-      effectiveAmount = execInfo?.amount ?? this.calcAmount(0);
-      // Step:
-      //   - Saat WIN: alwaysSignalLossState sudah di-reset sebelum completeOrder dipanggil.
-      //     Step di-capture sebelumnya dan dipass via parameter alwaysSignalStep.
-      //   - Saat LOSE: alwaysSignalLossState belum di-advance (advance terjadi di
-      //     handleDealResult SETELAH completeOrder). Baca langsung dari state sekarang.
-      effectiveStep = alwaysSignalStep ?? this.alwaysSignalLossState?.currentMartingaleStep ?? 0;
-    } else {
-      effectiveStep  = order.martingaleState.isActive ? order.martingaleState.currentStep : 0;
-      effectiveAmount = this.calcAmount(effectiveStep);
-    }
-
     const profitRate = (this.config.asset.profitRate ?? 85) / 100;
     let tradePnL = 0;
     if (result === 'WIN') {
-      tradePnL = Math.floor(effectiveAmount * profitRate);
+      tradePnL = Math.floor(order.martingaleState.isActive
+        ? this.calcAmount(order.martingaleState.currentStep) * profitRate
+        : this.calcAmount(0) * profitRate);
     } else if (result === 'LOSE') {
-      tradePnL = -effectiveAmount;
+      tradePnL = -(order.martingaleState.isActive
+        ? this.calcAmount(order.martingaleState.currentStep)
+        : this.calcAmount(0));
     }
 
     this.sessionPnL += tradePnL;
 
     this.logger.log(
       `[${this.userId}] ✅ ${order.time} ${order.trend} → ${result} ` +
-      `| step=${effectiveStep} amount=${effectiveAmount} tradePnL=${tradePnL > 0 ? '+' : ''}${tradePnL} sessionPnL=${this.sessionPnL > 0 ? '+' : ''}${this.sessionPnL}`,
+      `| tradePnL=${tradePnL > 0 ? '+' : ''}${tradePnL} sessionPnL=${this.sessionPnL > 0 ? '+' : ''}${this.sessionPnL}`,
     );
+
+    const resultStep = order.martingaleState.isActive ? order.martingaleState.currentStep : 0;
+    const resultAmount = this.calcAmount(resultStep);
 
     // Emit log ke Firebase history (terpisah dari orders)
     this.callbacks.onLog({
-      id: `${order.id}_s${effectiveStep}`,
+      id: `${order.id}_s${resultStep}`,
       orderId: order.id,
       time: order.time,
       trend: order.trend,
-      amount: effectiveAmount,
-      martingaleStep: effectiveStep,
+      amount: resultAmount,
+      martingaleStep: resultStep,
       dealId: dealId,
       result: finalResult,
       profit: tradePnL,
       sessionPnL: this.sessionPnL,
       executedAt: Date.now(),
-      note: `Result: ${finalResult} | step=${effectiveStep} | PnL: ${tradePnL > 0 ? '+' : ''}${tradePnL}`,
+      note: `Result: ${finalResult} | PnL: ${tradePnL > 0 ? '+' : ''}${tradePnL}`,
       isDemoAccount: this.config.isDemoAccount,
     });
 

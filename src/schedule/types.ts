@@ -124,8 +124,7 @@ export interface AlwaysSignalLossState {
   currentMartingaleStep: number;
   originalOrderId: string;
   totalLoss: number;
-  // currentTrend dihapus: always signal mengikuti arah sinyal order berikutnya,
-  // bukan menyimpan arah loss sebelumnya. Field ini tidak pernah dipakai.
+  currentTrend: TrendType;
 }
 
 export interface TradeOrderData {

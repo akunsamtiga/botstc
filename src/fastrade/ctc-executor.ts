@@ -232,7 +232,9 @@ export class CtcExecutor extends FastradeBaseExecutor {
   private async executeWithTrend(trend: TrendType, step: number, retryCount = 0): Promise<void> {
     if (!this.isRunning) return;
 
-    const MAX_RETRIES = 3;
+    // FIX: Naikkan dari 3 ke 5 — WS reconnect + channel join bisa butuh 4-5 detik,
+    // dengan interval 2s per retry, 3 retry hanya memberi 6s. 5 retry = 10s window.
+    const MAX_RETRIES = 5;
     if (retryCount >= MAX_RETRIES) {
       this.logger.error(
         `[${this.userId}] CTC: Trade gagal ${MAX_RETRIES}x berturut-turut — bot dihentikan`,
@@ -243,6 +245,11 @@ export class CtcExecutor extends FastradeBaseExecutor {
       this.stop();
       return;
     }
+
+    // FIX: Tunggu WS siap sebelum execute — penting di martingale step tinggi
+    // di mana WS bisa reconnect di tengah sequence.
+    await this.waitForWsReady(15_000);
+    if (!this.isRunning) return;
 
     // Always Signal: jika ada outstanding loss dan ini bukan lanjutan martingale regular,
     // override step dari loss state. Trend tetap dari parameter (hasil analisis candle).

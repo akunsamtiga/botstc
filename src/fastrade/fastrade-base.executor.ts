@@ -187,6 +187,11 @@ export abstract class FastradeBaseExecutor {
       return null;
     }
 
+    // FIX: Pastikan WS siap sebelum place trade — terutama penting saat martingale
+    // multi-step di mana WS bisa reconnect di tengah sequence.
+    await this.waitForWsReady(15_000);
+    if (!this.isRunning) return null;
+
     const result = await this.wsClient.placeTrade(tradeData as any);
 
     if (result.error === 'amount_min') {
@@ -201,6 +206,25 @@ export abstract class FastradeBaseExecutor {
       });
       this.callbacks.onStatusChange(
         `❌ Amount ${amount} di bawah minimum Stockity — bot dihentikan. Cek konfigurasi.`,
+      );
+      setTimeout(() => this.stop(), 300);
+      return null;
+    }
+
+    // FIX: Handle amount_max — amount martingale melebihi batas maksimum Stockity.
+    // Bot dihentikan dengan pesan jelas daripada retry 3x yang pasti gagal.
+    if (result.error === 'amount_max') {
+      this.logger.error(
+        `[${this.userId}] ❌ Amount ${amount} melebihi maksimum Stockity — bot dihentikan`,
+      );
+      this.callbacks.onLog({
+        id: uuidv4(), orderId, trend, amount, martingaleStep,
+        result: 'FAILED', executedAt: now, cycleNumber: cycleNum,
+        note: `Trade gagal: amount ${amount} melebihi batas maksimum Stockity. Kurangi multiplier atau baseAmount.`,
+        isDemoAccount: this.config.isDemoAccount,
+      });
+      this.callbacks.onStatusChange(
+        `❌ Amount ${amount} melebihi maksimum Stockity (step=${martingaleStep}) — bot dihentikan. Kurangi multiplier.`,
       );
       setTimeout(() => this.stop(), 300);
       return null;
@@ -575,5 +599,30 @@ export abstract class FastradeBaseExecutor {
     const res = this._sleepResolve;
     this._sleepResolve = undefined;
     res?.();
+  }
+
+  /**
+   * Tunggu sampai WebSocket connected + required channels ready.
+   * Dipakai sebelum placeTrade agar WS tidak dalam kondisi reconnecting.
+   *
+   * @param timeoutMs - Batas waktu tunggu (default 15s). Jika timeout, lanjut
+   *                    dan biarkan executeTrade handle error-nya sendiri.
+   */
+  protected async waitForWsReady(timeoutMs = 15_000): Promise<void> {
+    const CHECK_INTERVAL_MS = 300;
+    const deadline = Date.now() + timeoutMs;
+
+    while (Date.now() < deadline) {
+      if (!this.isRunning) return;
+      if (this.wsClient.isConnected() && this.wsClient.isRequiredChannelsReady()) return;
+
+      this.logger.warn(
+        `[${this.userId}] ⏳ WS not ready (connected=${this.wsClient.isConnected()} ` +
+        `channelsReady=${this.wsClient.isRequiredChannelsReady()}) — waiting ${CHECK_INTERVAL_MS}ms...`,
+      );
+      await new Promise<void>(resolve => setTimeout(resolve, CHECK_INTERVAL_MS));
+    }
+
+    this.logger.warn(`[${this.userId}] ⚠️ waitForWsReady timeout ${timeoutMs}ms — proceeding anyway`);
   }
 }

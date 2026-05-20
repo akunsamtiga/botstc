@@ -16,6 +16,15 @@ const DEFAULT_USER_AGENT =
 const DEFAULT_TIMEZONE = 'Asia/Bangkok';
 
 /**
+ * Proxy untuk request login ke Stockity.
+ * Isi di .env:
+ *   Cara A (SSH SOCKS5) : LOGIN_PROXY=socks5://127.0.0.1:1080
+ *   Cara B (Tinyproxy)  : LOGIN_PROXY=http://IP_VPS_BERSIH:8888
+ * Kosongkan / hapus untuk tidak pakai proxy.
+ */
+const LOGIN_PROXY = process.env.LOGIN_PROXY ?? '';
+
+/**
  * Durasi cooldown antar percobaan login per email (ms).
  * Mencegah spam login yang memicu rate limit Stockity (HTTP 429).
  * Default: 15 detik — cukup longgar untuk UX normal tapi mencegah loop.
@@ -150,11 +159,16 @@ export class AuthService {
     url: string,
     body: object,
     headers: Record<string, string>,
+    proxy?: string,
   ): Promise<{ status: number; data: any }> {
     const headerArgs: string[] = [];
     for (const [k, v] of Object.entries(headers)) {
       headerArgs.push('-H', `${k}: ${v}`);
     }
+
+    // Tambahkan --proxy hanya jika proxy diisi
+    const proxyArgs: string[] = proxy ? ['--proxy', proxy] : [];
+    if (proxy) this.logger.debug(`curlPost via proxy: ${proxy} → ${url}`);
 
     const { stdout } = await execFileAsync('curl', [
       '-s',
@@ -164,6 +178,7 @@ export class AuthService {
       '-H', 'Content-Type: application/json',
       '-d', JSON.stringify(body),
       '--max-time', '15',
+      ...proxyArgs,
       '-w', '\n__HTTP_STATUS__%{http_code}',
     ]);
 
@@ -217,6 +232,7 @@ export class AuthService {
       // Catat waktu attempt tepat sebelum request dikirim
       this.recordLoginAttempt(email);
 
+      // LOGIN_PROXY dari .env digunakan di sini saja — request lain tidak lewat proxy
       const result = await this.curlPost(
         `${BASE_URL}/passport/v2/sign_in?locale=id`,
         { email, password },
@@ -229,6 +245,7 @@ export class AuthService {
           'Origin':        'https://stockity.id',
           'Referer':       'https://stockity.id/',
         },
+        LOGIN_PROXY || undefined,
       );
 
       if (result.status >= 400) {

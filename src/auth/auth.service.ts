@@ -1,4 +1,4 @@
-import { Injectable, Logger, UnauthorizedException } from '@nestjs/common';
+import { Injectable, Logger, UnauthorizedException, HttpException, HttpStatus } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import { SupabaseService } from '../supabase/supabase.service';
 import { execFile } from 'child_process';
@@ -15,6 +15,21 @@ const DEFAULT_USER_AGENT =
 
 const DEFAULT_TIMEZONE = 'Asia/Bangkok';
 
+/**
+ * Durasi cooldown antar percobaan login per email (ms).
+ * Mencegah spam login yang memicu rate limit Stockity (HTTP 429).
+ * Default: 15 detik — cukup longgar untuk UX normal tapi mencegah loop.
+ */
+const LOGIN_COOLDOWN_MS = 15_000;
+
+/**
+ * Durasi blokir saat terkena HTTP 429 dari Stockity (ms).
+ * Saat terkena 429, semua request login dari email yang sama diblokir
+ * selama durasi ini agar IP VPS tidak semakin dibanned.
+ * Default: 5 menit.
+ */
+const RATE_LIMIT_BLOCK_MS = 5 * 60_000;
+
 @Injectable()
 export class AuthService {
   private readonly logger = new Logger(AuthService.name);
@@ -26,6 +41,19 @@ export class AuthService {
    */
   private sessionCache = new Map<string, { data: any; expiresAt: number }>();
   private readonly SESSION_CACHE_TTL_MS = 30_000;
+
+  /**
+   * Cooldown tracker per email — mencegah spam login ke Stockity.
+   * Key: email, Value: timestamp terakhir login attempt (ms).
+   */
+  private loginCooldown = new Map<string, number>();
+
+  /**
+   * Rate limit block tracker — saat Stockity kembalikan 429,
+   * blokir semua login dari email tersebut selama RATE_LIMIT_BLOCK_MS.
+   * Key: email, Value: timestamp kapan blokir berakhir (ms).
+   */
+  private rateLimitBlockUntil = new Map<string, number>();
 
   constructor(
     private jwtService: JwtService,
@@ -51,6 +79,66 @@ export class AuthService {
 
   invalidateSessionCache(userId: string) {
     this.sessionCache.delete(userId);
+  }
+
+  // ── Rate limit helpers ────────────────────────────────────────────────────
+
+  /**
+   * Cek apakah email sedang dalam cooldown atau blokir 429.
+   * Melempar HttpException jika masih diblokir, dengan pesan yang informatif.
+   */
+  private checkLoginRateLimit(email: string): void {
+    const now = Date.now();
+
+    // Cek blokir 429 (prioritas pertama — lebih panjang durasinya)
+    const blockedUntil = this.rateLimitBlockUntil.get(email);
+    if (blockedUntil && now < blockedUntil) {
+      const remainingSec = Math.ceil((blockedUntil - now) / 1000);
+      const remainingMin = Math.ceil(remainingSec / 60);
+      this.logger.warn(
+        `🚫 Login ${email} diblokir sementara (429 cooldown). ` +
+        `Sisa: ${remainingSec}s`,
+      );
+      throw new HttpException(
+        `Terlalu banyak percobaan login. Silakan coba lagi dalam ${remainingMin} menit.`,
+        HttpStatus.TOO_MANY_REQUESTS,
+      );
+    }
+
+    // Cek cooldown normal antar attempt
+    const lastAttempt = this.loginCooldown.get(email);
+    if (lastAttempt && now - lastAttempt < LOGIN_COOLDOWN_MS) {
+      const waitSec = Math.ceil((LOGIN_COOLDOWN_MS - (now - lastAttempt)) / 1000);
+      this.logger.warn(
+        `⏳ Login ${email} terlalu cepat. Tunggu ${waitSec}s lagi.`,
+      );
+      throw new HttpException(
+        `Terlalu cepat, tunggu ${waitSec} detik sebelum coba login lagi.`,
+        HttpStatus.TOO_MANY_REQUESTS,
+      );
+    }
+  }
+
+  /**
+   * Set timestamp attempt login terbaru untuk email ini.
+   * Dipanggil tepat sebelum mengirim request ke Stockity.
+   */
+  private recordLoginAttempt(email: string): void {
+    this.loginCooldown.set(email, Date.now());
+  }
+
+  /**
+   * Aktifkan blokir panjang untuk email saat Stockity kembalikan 429.
+   * Ini melindungi IP VPS dari semakin diblokir Stockity.
+   */
+  private applyRateLimitBlock(email: string): void {
+    const blockUntil = Date.now() + RATE_LIMIT_BLOCK_MS;
+    this.rateLimitBlockUntil.set(email, blockUntil);
+    const blockMin = Math.ceil(RATE_LIMIT_BLOCK_MS / 60_000);
+    this.logger.warn(
+      `⛔ Rate limit block diaktifkan untuk ${email} selama ${blockMin} menit ` +
+      `(sampai ${new Date(blockUntil).toISOString()}) karena HTTP 429 dari Stockity.`,
+    );
   }
 
   // ── curlPost ──────────────────────────────────────────────────────────────
@@ -102,6 +190,9 @@ export class AuthService {
   async login(email: string, password: string) {
     this.logger.log(`Login attempt: ${email}`);
 
+    // ── FIX: Cek rate limit & cooldown sebelum menyentuh Stockity ────────────
+    this.checkLoginRateLimit(email);
+
     // Ambil deviceId lama jika sudah pernah login
     let deviceId = uuidv4();
     try {
@@ -123,6 +214,9 @@ export class AuthService {
     let stockityUserId: string;
 
     try {
+      // Catat waktu attempt tepat sebelum request dikirim
+      this.recordLoginAttempt(email);
+
       const result = await this.curlPost(
         `${BASE_URL}/passport/v2/sign_in?locale=id`,
         { email, password },
@@ -143,11 +237,23 @@ export class AuthService {
           `Stockity login error [HTTP ${result.status}]: ` +
           `${JSON.stringify(body).slice(0, 500)}`,
         );
+
+        // ── FIX: Handle 429 secara khusus — aktifkan blokir panjang ─────────
+        if (result.status === 429) {
+          this.applyRateLimitBlock(email);
+          const errMsg: string =
+            body?.errors?.[0]?.context?.message ||
+            body?.errors?.[0]?.message          ||
+            'Terlalu banyak percobaan login dari server. Coba lagi dalam beberapa menit.';
+          throw new HttpException(errMsg, HttpStatus.TOO_MANY_REQUESTS);
+        }
+
         const errMsg: string =
-          body?.errors?.[0]?.message ||
-          body?.errors?.[0]           ||
-          body?.message               ||
-          body?.error                 ||
+          body?.errors?.[0]?.context?.message ||
+          body?.errors?.[0]?.message          ||
+          body?.errors?.[0]                   ||
+          body?.message                        ||
+          body?.error                          ||
           (result.status === 401 || result.status === 403 || result.status === 422
             ? 'Email atau password salah'
             : result.status === 423
@@ -179,6 +285,7 @@ export class AuthService {
 
     } catch (err: any) {
       if (err instanceof UnauthorizedException) throw err;
+      if (err instanceof HttpException) throw err;
 
       const errCode  = err?.code ?? 'unknown';
       const rawMsg   = err?.message || '(empty message)';
@@ -251,6 +358,12 @@ export class AuthService {
 
     // Invalidate cache setelah write supaya request berikutnya baca dari DB
     this.invalidateSessionCache(stockityUserId);
+
+    // ── FIX: Bersihkan rate limit block & cooldown setelah login sukses ───────
+    // Login berhasil berarti kredensial valid — hapus blokir agar tidak
+    // menghalangi login ulang yang sah di masa depan.
+    this.rateLimitBlockUntil.delete(email);
+    this.loginCooldown.delete(email);
 
     const jwt = this.jwtService.sign({ sub: stockityUserId, email });
     this.logger.log(`✅ Login berhasil: ${email} (userId: ${stockityUserId})`);

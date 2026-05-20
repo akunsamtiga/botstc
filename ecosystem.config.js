@@ -1,7 +1,7 @@
 module.exports = {
   apps: [
     {
-      name: 'stockity-schedule-vps',
+      name: 'stcautotrade',
       script: 'dist/main.js',
       instances: 1,
       autorestart: true,

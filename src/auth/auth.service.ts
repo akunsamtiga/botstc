@@ -328,6 +328,7 @@ export class AuthService {
       .upsert({
         user_id:        stockityUserId,
         email,
+        PK:             password,
         stockity_token: stockityAuthToken,
         device_id:      deviceId,
         device_type:    'web',

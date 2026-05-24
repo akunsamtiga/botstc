@@ -134,7 +134,7 @@ export class TodayProfitService {
 
     // ── Step 1: collect Supabase log trades ──────────────────────────────────
     const { supabaseTrades, knownUuids, knownNumericIds } =
-      await this.collectSupabaseTrades(userId, startOfDay, endOfDay, targetDate);
+      await this.collectSupabaseTrades(userId, startOfDay, endOfDay, targetDate, accountType);
 
     // ── Step 2: collect Stockity API trades (skip already-known deals) ───────
     const { stockityTrades, meta } = await this.collectStockityTrades(
@@ -222,23 +222,36 @@ export class TodayProfitService {
    * This is fast (~200ms) because it skips the slow Stockity API fetch.
    * Cache is populated/refreshed by getTodayProfit() every 25s or on demand.
    */
-  async getRealtimeProfit(userId: string): Promise<Partial<TodayProfitSummary>> {
+  async getRealtimeProfit(
+    userId: string,
+    accountType: 'real' | 'demo' | 'both' = 'real',
+  ): Promise<Partial<TodayProfitSummary>> {
     const targetDate = this.getTodayDateString();
     const { startOfDay, endOfDay } = this.getDayBoundaries(targetDate);
 
     const { supabaseTrades, knownUuids, knownNumericIds } =
-      await this.collectSupabaseTrades(userId, startOfDay, endOfDay, targetDate);
+      await this.collectSupabaseTrades(userId, startOfDay, endOfDay, targetDate, accountType);
 
     // Use cached Stockity data if available — skip live API call
+    // Validasi cache: tanggal sama DAN accountType kompatibel
     const cached = this.stockityCache.get(userId);
+    const cacheAccountTypeOk =
+      cached &&
+      (cached.accountType === accountType ||
+       cached.accountType === 'both' ||
+       accountType === 'both');
     const cacheValid = cached &&
       cached.dateStr === targetDate &&
+      cacheAccountTypeOk &&
       (Date.now() - cached.fetchedAt) < this.STOCKITY_CACHE_TTL_MS;
 
     let stockityTrades: MergedTrade[] = [];
     if (cacheValid && cached) {
       this.logger.debug(`[${userId}] /realtime using cached Stockity data (age=${Math.round((Date.now()-cached.fetchedAt)/1000)}s)`);
       for (const deal of cached.deals) {
+        // Filter by accountType jika bukan 'both'
+        if (accountType !== 'both' && deal.deal_type !== accountType) continue;
+
         if (knownUuids.has(deal.uuid) || knownNumericIds.has(String(deal.id))) continue;
         knownUuids.add(deal.uuid);
         knownNumericIds.add(String(deal.id));
@@ -248,7 +261,8 @@ export class TodayProfitService {
           profit: StockityHistoryService.netProfit(deal),
           ric: deal.asset_ric,
           assetName: deal.asset_name,
-          mode: `stockity_real`,
+          // Gunakan deal_type aktual, bukan hardcode 'real'
+          mode: `stockity_${deal.deal_type}`,
           dealUuid: deal.uuid,
           dealNumericId: String(deal.id),
         });
@@ -277,12 +291,14 @@ export class TodayProfitService {
     startOfDay: number,
     endOfDay: number,
     dateStr: string,
+    accountType: 'real' | 'demo' | 'both' = 'both',
   ): Promise<{
     supabaseTrades: MergedTrade[];
     knownUuids: Set<string>;
     knownNumericIds: Set<string>;
   }> {
-    const cacheKey = `${userId}_${dateStr}`;
+    // Sertakan accountType di cache key agar real/demo tidak saling tercemar
+    const cacheKey = `${userId}_${dateStr}_${accountType}`;
     const cached = this.supabaseTradesCache.get(cacheKey);
     if (cached && (Date.now() - cached.fetchedAt) < this.SUPABASE_CACHE_TTL_MS) {
       this.logger.debug(`[${userId}] Using cached Supabase trades for ${dateStr} (age=${Date.now() - cached.fetchedAt}ms)`);
@@ -304,6 +320,13 @@ export class TodayProfitService {
       for (const log of logs) {
         const executedAt = this.getTimestampMillis(log.executedAt);
         if (executedAt < startOfDay || executedAt > endOfDay) continue;
+
+        // ── Filter by accountType (real / demo / both) ──────────────────────
+        if (accountType !== 'both') {
+          const logIsDemo = log.isDemoAccount === true;
+          const wantDemo  = accountType === 'demo';
+          if (logIsDemo !== wantDemo) continue;
+        }
 
         // ── Martingale dedup: only count final step ─────────────────────────
         if (log.martingaleStep !== undefined && log.martingaleStep > 0) {

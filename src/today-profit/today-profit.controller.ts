@@ -23,8 +23,10 @@ export class TodayProfitController {
    * Query params:
    *   - date:        optional, YYYY-MM-DD (default: today)
    *   - accountType: 'real' | 'demo' | 'both' (default: 'real')
-   *                  Controls which Stockity account type is fetched from the API.
-   *                  Supabase mode logs are always fetched regardless of this param.
+   *                  Mengontrol mode logs Supabase DAN Stockity API yang difetch.
+   *                  'real'  → hanya trade real
+   *                  'demo'  → hanya trade demo
+   *                  'both'  → semua trade (real + demo digabung)
    */
   @Get()
   @HttpCode(200)
@@ -74,11 +76,23 @@ export class TodayProfitController {
   /**
    * GET /today-profit/realtime
    * Get real-time profit including active sessions.
+   * Menggunakan Stockity cache — response cepat (~200ms).
+   *
+   * Query params:
+   *   - accountType: 'real' | 'demo' | 'both' (default: 'real')
+   *                  Harus konsisten dengan parameter yang dipakai di GET /today-profit
+   *                  agar deduplication UUID bekerja dengan benar.
    */
   @Get('realtime')
   @HttpCode(200)
-  async getRealtimeProfit(@Request() req) {
-    const result = await this.todayProfitService.getRealtimeProfit(req.user.userId);
+  async getRealtimeProfit(
+    @Request() req,
+    @Query('accountType') accountType?: 'real' | 'demo' | 'both',
+  ) {
+    const result = await this.todayProfitService.getRealtimeProfit(
+      req.user.userId,
+      accountType ?? 'real',
+    );
     return { success: true, data: result };
   }
 

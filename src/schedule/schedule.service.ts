@@ -282,10 +282,20 @@ export class ScheduleService implements OnModuleInit, OnModuleDestroy {
     };
     this.configs.set(userId, cfg);
 
-    const plainCfg = JSON.parse(JSON.stringify(cfg));
-    await this.supabaseService.client.from('schedule_configs').upsert(
-      { user_id: userId, ...plainCfg, updated_at: this.supabaseService.now() },
-    );
+    // ✅ FIX: Supabase pakai snake_case — stopLoss/stopProfit harus disimpan sebagai
+    // stop_loss/stop_profit agar getConfig() bisa membacanya kembali dengan benar.
+    // Tanpa fix ini, setelah restart/restore sessionPnL check akan compare vs 0 → bug.
+    await this.supabaseService.client.from('schedule_configs').upsert({
+      user_id: userId,
+      asset: cfg.asset,
+      martingale: cfg.martingale,
+      currency: cfg.currency,
+      is_demo_account: cfg.isDemoAccount,
+      currency_iso: cfg.currencyIso,
+      stop_loss: cfg.stopLoss ?? 0,
+      stop_profit: cfg.stopProfit ?? 0,
+      updated_at: this.supabaseService.now(),
+    });
     this.executors.get(userId)?.updateConfig(cfg);
     return cfg;
   }

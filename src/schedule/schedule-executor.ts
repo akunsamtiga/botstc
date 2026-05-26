@@ -721,36 +721,36 @@ export class ScheduleExecutor {
       this.callbacks.onActiveMartingaleChange?.(null).catch(() => {});
     }
 
+    // Gunakan amount aktual dari executionInfoMap jika tersedia,
+    // fallback ke calcAmount berdasarkan currentStep.
+    // Ini penting agar tradePnL konsisten dengan amount yang benar-benar dikirim ke Stockity.
+    const executionInfo = this.executionInfoMap.get(order.id);
+    const actualStep = order.martingaleState.isActive ? order.martingaleState.currentStep : 0;
+    const actualAmount = executionInfo?.amount ?? this.calcAmount(actualStep);
+
     const profitRate = (this.config.asset.profitRate ?? 85) / 100;
     let tradePnL = 0;
     if (result === 'WIN') {
-      tradePnL = Math.floor(order.martingaleState.isActive
-        ? this.calcAmount(order.martingaleState.currentStep) * profitRate
-        : this.calcAmount(0) * profitRate);
+      tradePnL = Math.floor(actualAmount * profitRate);
     } else if (result === 'LOSE') {
-      tradePnL = -(order.martingaleState.isActive
-        ? this.calcAmount(order.martingaleState.currentStep)
-        : this.calcAmount(0));
+      tradePnL = -actualAmount;
     }
 
     this.sessionPnL += tradePnL;
 
     this.logger.log(
       `[${this.userId}] ✅ ${order.time} ${order.trend} → ${result} ` +
-      `| tradePnL=${tradePnL > 0 ? '+' : ''}${tradePnL} sessionPnL=${this.sessionPnL > 0 ? '+' : ''}${this.sessionPnL}`,
+      `| amount=${actualAmount} tradePnL=${tradePnL > 0 ? '+' : ''}${tradePnL} sessionPnL=${this.sessionPnL > 0 ? '+' : ''}${this.sessionPnL}`,
     );
-
-    const resultStep = order.martingaleState.isActive ? order.martingaleState.currentStep : 0;
-    const resultAmount = this.calcAmount(resultStep);
 
     // Emit log ke Firebase history (terpisah dari orders)
     this.callbacks.onLog({
-      id: `${order.id}_s${resultStep}`,
+      id: `${order.id}_s${actualStep}`,
       orderId: order.id,
       time: order.time,
       trend: order.trend,
-      amount: resultAmount,
-      martingaleStep: resultStep,
+      amount: actualAmount,
+      martingaleStep: actualStep,
       dealId: dealId,
       result: finalResult,
       profit: tradePnL,

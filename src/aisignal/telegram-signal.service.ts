@@ -1,4 +1,5 @@
 import { Injectable, Logger, OnModuleDestroy } from '@nestjs/common';
+import type { RealtimeChannel } from '@supabase/supabase-js';
 import { SupabaseService } from '../supabase/supabase.service';
 import { TelegramSignal } from './types';
 
@@ -16,14 +17,14 @@ export class TelegramSignalService implements OnModuleDestroy {
   // Track which userIds are actively listening
   private activeUserIds = new Set<string>();
 
-  // Single global Firestore listener for 'telegram_signals' collection
+  // Single global Supabase Realtime channel for 'telegram_signals' table
   // (written by Python bridge after receiving from Telegram)
-  private globalUnsubscribe: (() => void) | null = null;
+  private globalChannel: RealtimeChannel | null = null;
 
   constructor(private readonly supabaseService: SupabaseService) {}
 
-  onModuleDestroy() {
-    this.stopGlobalListener();
+  async onModuleDestroy() {
+    await this.stopGlobalListener();
     this.signalCallbacks.clear();
     this.activeUserIds.clear();
     this.logger.log('TelegramSignalService destroyed, all listeners cleaned up');
@@ -52,7 +53,7 @@ export class TelegramSignalService implements OnModuleDestroy {
     this.logger.log(`[${userId}] Starting to listen for Telegram signals`);
 
     // Start global listener if not already running
-    if (!this.globalUnsubscribe) {
+    if (!this.globalChannel) {
       await this.startGlobalListener();
     }
 
@@ -75,8 +76,8 @@ export class TelegramSignalService implements OnModuleDestroy {
   }
 
   /**
-   * Start global Firestore listener on 'telegram_signals' collection.
-   * This collection is written by the Python Telegram bridge.
+   * Start global Supabase Realtime listener on 'telegram_signals' table.
+   * Written by the Python Telegram bridge.
    *
    * Schema written by Python:
    * {
@@ -89,9 +90,18 @@ export class TelegramSignalService implements OnModuleDestroy {
    *   receivedAt: number (ms),
    *   source: "telegram",
    * }
+   *
+   * IMPORTANT: Always call stopGlobalListener() first to remove any existing
+   * channel with the same name. Supabase throws
+   * "cannot add postgres_changes callbacks after subscribe()" if a channel
+   * with that name still exists in the internal registry.
    */
   private async startGlobalListener(): Promise<void> {
     try {
+      // Always clean up any stale channel before creating a new one.
+      // removeChannel() is async; not awaiting it caused the "after subscribe" error.
+      await this.stopGlobalListener();
+
       const channel = this.supabaseService.client
         .channel('telegram_signals_global')
         .on(
@@ -108,7 +118,7 @@ export class TelegramSignalService implements OnModuleDestroy {
             );
           } else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') {
             this.logger.error(`Supabase realtime listener error: ${status}`);
-            this.globalUnsubscribe = null;
+            this.globalChannel = null;
             setTimeout(() => {
               if (this.activeUserIds.size > 0) {
                 this.startGlobalListener().catch((e) =>
@@ -119,9 +129,7 @@ export class TelegramSignalService implements OnModuleDestroy {
           }
         });
 
-      this.globalUnsubscribe = () => {
-        this.supabaseService.client.removeChannel(channel);
-      };
+      this.globalChannel = channel;
     } catch (error) {
       this.logger.error(
         `Failed to start global listener: ${(error as Error).message}`,
@@ -130,11 +138,16 @@ export class TelegramSignalService implements OnModuleDestroy {
     }
   }
 
-  private stopGlobalListener(): void {
-    if (this.globalUnsubscribe) {
-      this.globalUnsubscribe();
-      this.globalUnsubscribe = null;
-      this.logger.log('Global Firestore listener stopped');
+  private async stopGlobalListener(): Promise<void> {
+    if (this.globalChannel) {
+      try {
+        await this.supabaseService.client.removeChannel(this.globalChannel);
+      } catch (e) {
+        // Ignore errors during cleanup (channel may already be gone)
+        this.logger.warn(`Error removing channel: ${(e as Error).message}`);
+      }
+      this.globalChannel = null;
+      this.logger.log('Global Supabase listener stopped');
     }
   }
 
@@ -312,7 +325,7 @@ export class TelegramSignalService implements OnModuleDestroy {
     return {
       isListening: this.activeUserIds.has(userId),
       hasCallback: this.signalCallbacks.has(userId),
-      globalListenerActive: this.globalUnsubscribe !== null,
+      globalListenerActive: this.globalChannel !== null,
     };
   }
 }

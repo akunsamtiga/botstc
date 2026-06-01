@@ -1,19 +1,12 @@
-import { Logger } from '@nestjs/common';
 import { StockityWebSocketClient } from '../schedule/websocket-client';
 import { FastradeBaseExecutor, FastradeExecutorCallbacks, SessionInfo } from './fastrade-base.executor';
 import { FastradeConfig, FastradeOrder, TrendType } from './fastrade-types';
 
-// Offset minimal agar candle sudah settle di server Stockity (~50ms cukup)
-const FIRST_FETCH_OFFSET_MS    = 50;
-const SECOND_FETCH_OFFSET_MS   = 50;
-const CYCLE_RESTART_DELAY_MS   = 2_000;
-const RESULT_TIMEOUT_MS        = 180_000;
-const BOUNDARY_INTERVAL_SECS   = 5;
-// Toleransi minimum sebelum akhir menit — dikurangi dari 5000 ke 1000ms
-// agar tidak mudah skip ke menit berikutnya
-const EXECUTION_MIN_ADVANCE_MS = 1_000;
-// Jika jarak ke boundary berikutnya < nilai ini, eksekusi langsung sekarang
-const INSTANT_EXEC_THRESHOLD_MS = 200;
+const FETCH_OFFSET_MS            = 50;
+const CYCLE_RESTART_DELAY_MS     = 2_000;
+const BOUNDARY_INTERVAL_SECS     = 5;
+const EXECUTION_MIN_ADVANCE_MS   = 1_000;
+const INSTANT_EXEC_THRESHOLD_MS  = 200;
 
 type CtcPhase =
   | 'IDLE'
@@ -29,7 +22,15 @@ type CtcPhase =
 
 export class CtcExecutor extends FastradeBaseExecutor {
   private phase: CtcPhase = 'IDLE';
+  private cycleTimer?: NodeJS.Timeout;   // FIX KEANDALAN: ditambahkan — sebelumnya tidak ada
+
+  /**
+   * Trend aktif CTC: WIN → lanjut sama, LOSE → reverse.
+   * Dipertahankan lintas result, berbeda dari currentTrend base yang reset tiap cycle.
+   */
   private activeTrend?: TrendType;
+
+  protected get modeName(): string { return 'CTC'; }
 
   constructor(
     userId: string,
@@ -39,13 +40,34 @@ export class CtcExecutor extends FastradeBaseExecutor {
     callbacks: FastradeExecutorCallbacks,
   ) {
     super(userId, wsClient, config, session, callbacks);
-    this.logger = new Logger('CtcExecutor');
   }
 
   stop() {
-    super.stop();
+    // FIX KEANDALAN: clearCycleTimer() ditambahkan di sini.
+    // Sebelumnya CTC tidak punya clearCycleTimer() di stop() — berbeda dari FTT
+    // yang sudah punya. Akibatnya, jika user stop() saat bot menunggu delay
+    // (misal ALWAYS_SIGNAL_WAITING + CYCLE_RESTART_DELAY_MS), timer bocor dan
+    // startNewCycle() tetap berjalan 2s kemudian, melakukan trade setelah bot
+    // seharusnya berhenti. Dengan timer bocor yang menumpuk, memory juga meningkat.
+    this.clearCycleTimer();
     this.activeTrend = undefined;
+    super.stop();
   }
+
+  // ── Abstract hook implementations ─────────────────────────────────────────
+
+  protected setExecutingPhase(): void {
+    this.phase = 'EXECUTING';
+  }
+
+  protected setWaitingResultPhase(trend: TrendType, step: number): void {
+    this.phase = 'WAITING_RESULT';
+    this.callbacks.onStatusChange(
+      `CTC CYCLE ${this.cycleNumber}: Menunggu hasil ${trend.toUpperCase()} (step=${step})...`,
+    );
+  }
+
+  // ── Cycle lifecycle ───────────────────────────────────────────────────────
 
   protected startNewCycle(): void {
     if (!this.isRunning) return;
@@ -54,22 +76,16 @@ export class CtcExecutor extends FastradeBaseExecutor {
     this.currentTrend = undefined;
     this.activeTrend = undefined;
     this.phase = 'IDLE';
-    // Reset martingale state HANYA jika always signal tidak aktif.
-    // Jika always signal aktif, step & totalLoss dijaga di alwaysSignalLossState —
-    // runCycle() akan analisis candle, lalu executeWithTrend() memakai step yang benar.
+    this.clearCycleTimer();
+
     if (!this.alwaysSignalLossState?.hasOutstandingLoss) {
       this.resetMartingale();
     }
 
     if (this.alwaysSignalLossState?.hasOutstandingLoss) {
-      this.logger.log(
-        `[${this.userId}] 🔄 CTC CYCLE ${this.cycleNumber}: Always Signal aktif ` +
-        `(step ${this.alwaysSignalLossState.currentMartingaleStep}) — analisis candle dulu`
-      );
-      this.callbacks.onStatusChange(
-        `CTC CYCLE ${this.cycleNumber}: Always Signal step ` +
-        `${this.alwaysSignalLossState.currentMartingaleStep} — Menunggu batas menit...`
-      );
+      const step = this.alwaysSignalLossState.currentMartingaleStep;
+      this.logger.log(`[${this.userId}] 🔄 CTC CYCLE ${this.cycleNumber}: Always Signal aktif (step ${step}) — analisis candle dulu`);
+      this.callbacks.onStatusChange(`CTC CYCLE ${this.cycleNumber}: Always Signal step ${step} — Menunggu batas menit...`);
     } else {
       this.logger.log(`[${this.userId}] 🔄 CTC CYCLE ${this.cycleNumber}: Starting`);
       this.callbacks.onStatusChange(`CTC CYCLE ${this.cycleNumber}: Menunggu batas menit...`);
@@ -77,136 +93,107 @@ export class CtcExecutor extends FastradeBaseExecutor {
 
     this.runCycle().catch((err) => {
       this.logger.error(`[${this.userId}] CTC CYCLE ${this.cycleNumber} unhandled error: ${err.message}`);
-      if (this.isRunning) {
-        setTimeout(() => this.startNewCycle(), CYCLE_RESTART_DELAY_MS);
-      }
+      if (this.isRunning) this.scheduleNewCycle(CYCLE_RESTART_DELAY_MS);
     });
   }
 
+  /**
+   * Analisis 2 candle, sync ke boundary 5 detik, lalu eksekusi.
+   *
+   * FIX: sleep double → single per boundary.
+   * FIX: fetchCandleClosePrice sekarang retry 3x di base — kegagalan transient
+   *      tidak lagi membuang sinyal 2 menit.
+   * CTC: jika harga sama → default PUT (FTT = cycle ulang).
+   */
   private async runCycle(): Promise<void> {
+    // ── Candle 1 ──────────────────────────────────────────────────────────
     this.phase = 'WAITING_MINUTE_1';
     const firstBoundary = this.getNextMinuteBoundary();
     const waitToFirst = firstBoundary - Date.now();
 
-    this.logger.log(
-      `[${this.userId}] CTC CYCLE ${this.cycleNumber}: ` +
-      `Waiting ${waitToFirst}ms to first minute boundary`,
-    );
+    this.logger.log(`[${this.userId}] CTC CYCLE ${this.cycleNumber}: Waiting ${waitToFirst}ms to first boundary`);
 
-    if (waitToFirst > 0) await this.sleep(waitToFirst);
-    if (!this.isRunning) return;
-
-    // Offset minimal — hanya cukup untuk candle settle di server
-    await this.sleep(FIRST_FETCH_OFFSET_MS);
+    await this.sleep(Math.max(0, waitToFirst) + FETCH_OFFSET_MS);
     if (!this.isRunning) return;
 
     this.phase = 'FETCHING_1';
     this.callbacks.onStatusChange(`CTC CYCLE ${this.cycleNumber}: Mengambil candle pertama...`);
 
     const price1 = await this.fetchCandleClosePrice();
-
     if (price1 === null) {
-      this.logger.warn(`[${this.userId}] CTC CYCLE ${this.cycleNumber}: First fetch failed, restarting`);
-      if (this.isRunning) setTimeout(() => this.startNewCycle(), CYCLE_RESTART_DELAY_MS);
+      this.logger.warn(`[${this.userId}] CTC CYCLE ${this.cycleNumber}: First fetch failed setelah retry — restart`);
+      if (this.isRunning) this.scheduleNewCycle(CYCLE_RESTART_DELAY_MS);
       return;
     }
 
     this.logger.log(`[${this.userId}] CTC CYCLE ${this.cycleNumber}: Price 1 = ${price1}`);
 
+    // ── Candle 2 ──────────────────────────────────────────────────────────
     this.phase = 'WAITING_MINUTE_2';
     this.callbacks.onStatusChange(`CTC CYCLE ${this.cycleNumber}: Menunggu menit kedua (Price1=${price1})...`);
 
-    // Tunggu tepat ke batas menit kedua (dari firstBoundary, bukan dari Date.now())
     const secondBoundary = firstBoundary + 60_000;
     const waitToSecond = secondBoundary - Date.now();
 
-    if (waitToSecond > 0) await this.sleep(waitToSecond);
-    if (!this.isRunning) return;
-
-    // Offset minimal — sama seperti fetch pertama
-    await this.sleep(SECOND_FETCH_OFFSET_MS);
+    await this.sleep(Math.max(0, waitToSecond) + FETCH_OFFSET_MS);
     if (!this.isRunning) return;
 
     this.phase = 'FETCHING_2';
     this.callbacks.onStatusChange(`CTC CYCLE ${this.cycleNumber}: Mengambil candle kedua...`);
 
     const price2 = await this.fetchCandleClosePrice();
-
     if (price2 === null) {
-      this.logger.warn(`[${this.userId}] CTC CYCLE ${this.cycleNumber}: Second fetch failed, restarting`);
-      if (this.isRunning) setTimeout(() => this.startNewCycle(), CYCLE_RESTART_DELAY_MS);
+      this.logger.warn(`[${this.userId}] CTC CYCLE ${this.cycleNumber}: Second fetch failed setelah retry — restart`);
+      if (this.isRunning) this.scheduleNewCycle(CYCLE_RESTART_DELAY_MS);
       return;
     }
 
     this.logger.log(`[${this.userId}] CTC CYCLE ${this.cycleNumber}: Price 2 = ${price2}`);
 
+    // ── Analysis ──────────────────────────────────────────────────────────
     this.phase = 'ANALYZING';
-    let trend = this.determineTrend(price1, price2);
-    if (trend === null) {
-      this.logger.log(
-        `[${this.userId}] CTC CYCLE ${this.cycleNumber}: Harga sama (${price1}) → default PUT`,
-      );
-      trend = 'put';
-    }
-
+    const trend = this.determineTrend(price1, price2) ?? 'put';
     this.currentTrend = trend;
     this.activeTrend = trend;
 
-    const priceChange = price2 - price1;
+    const delta = (price2 - price1).toFixed(6);
     this.logger.log(
       `[${this.userId}] CTC CYCLE ${this.cycleNumber}: ` +
-      `Trend=${trend.toUpperCase()} (Δ=${priceChange >= 0 ? '+' : ''}${priceChange.toFixed(6)}) ` +
-      `activeTrend set to ${trend.toUpperCase()}`,
+      `Trend=${trend.toUpperCase()} (Δ=${price2 >= price1 ? '+' : ''}${delta})`,
     );
 
+    // ── Sync ke boundary 5 detik ──────────────────────────────────────────
     this.phase = 'WAITING_EXEC_SYNC';
     const execTime = this.calculateOptimalExecutionTime();
     const waitForExec = execTime - Date.now();
 
     if (waitForExec > 0) {
-      this.logger.log(
-        `[${this.userId}] CTC CYCLE ${this.cycleNumber}: ` +
-        `Syncing to 5s boundary, wait ${waitForExec}ms`,
-      );
+      this.logger.log(`[${this.userId}] CTC CYCLE ${this.cycleNumber}: Sync 5s boundary — wait ${waitForExec}ms`);
       await this.sleep(waitForExec);
-    } else {
-      this.logger.log(
-        `[${this.userId}] CTC CYCLE ${this.cycleNumber}: Already at boundary — execute instantly`,
-      );
     }
-
     if (!this.isRunning) return;
 
-    this.callbacks.onStatusChange(
-      `CTC CYCLE ${this.cycleNumber}: Eksekusi ${trend.toUpperCase()} segera`,
-    );
-
+    this.callbacks.onStatusChange(`CTC CYCLE ${this.cycleNumber}: Eksekusi ${trend.toUpperCase()} segera`);
     await this.executeWithTrend(trend, 0);
   }
 
   /**
-   * Hitung waktu eksekusi optimal yang paling dekat dengan boundary 5 detik.
+   * Hitung waktu eksekusi optimal paling dekat dengan boundary 5 detik.
    *
-   * Logika:
-   * 1. Hitung sisa ms ke boundary 5s berikutnya
-   * 2. Jika sisa < INSTANT_EXEC_THRESHOLD_MS (200ms) → eksekusi sekarang (skip wait)
-   * 3. Jika candidate boundary < EXECUTION_MIN_ADVANCE_MS (1s) sebelum akhir menit
-   *    → pakai boundary 5s pertama di menit berikutnya (bukan +60s penuh)
-   * 4. Selainnya → pakai candidate boundary tersebut
+   * 1. Jika sisa ke boundary < 200ms → eksekusi sekarang (sudah di boundary)
+   * 2. Jika candidate boundary < 1s sebelum akhir menit → defer ke menit berikutnya
+   * 3. Selainnya → gunakan candidate boundary
    */
   private calculateOptimalExecutionTime(): number {
     const now = Date.now();
     const msIntoCurrentSec = now % 1000;
     const currentSec = Math.floor(now / 1000);
     const secInMinute = currentSec % 60;
-    const secsUntilNextBoundary = BOUNDARY_INTERVAL_SECS - (secInMinute % BOUNDARY_INTERVAL_SECS);
-    const msToBoundary = secsUntilNextBoundary * 1000 - msIntoCurrentSec;
+    const secsUntilBoundary = BOUNDARY_INTERVAL_SECS - (secInMinute % BOUNDARY_INTERVAL_SECS);
+    const msToBoundary = secsUntilBoundary * 1000 - msIntoCurrentSec;
 
-    // Sudah sangat dekat boundary → eksekusi sekarang tanpa tunggu
     if (msToBoundary <= INSTANT_EXEC_THRESHOLD_MS) {
-      this.logger.log(
-        `[${this.userId}] CTC: Already at boundary (${msToBoundary}ms away) — instant execute`,
-      );
+      this.logger.log(`[${this.userId}] CTC: Already at boundary (${msToBoundary}ms away) — instant execute`);
       return now;
     }
 
@@ -214,14 +201,12 @@ export class CtcExecutor extends FastradeBaseExecutor {
     const candidateSec = Math.floor(candidateMs / 1000);
     const msUntilMinuteEnd = (60 - (candidateSec % 60)) * 1000;
 
-    // Candidate terlalu dekat akhir menit → cari boundary 5s pertama di menit berikutnya
     if (msUntilMinuteEnd < EXECUTION_MIN_ADVANCE_MS) {
-      // Maju ke awal menit berikutnya, lalu ambil boundary 5s pertama (detik ke-5)
-      const nextMinuteStartMs = candidateMs + msUntilMinuteEnd;
-      const nextBoundaryMs = nextMinuteStartMs + BOUNDARY_INTERVAL_SECS * 1000;
+      const nextMinuteMs = candidateMs + msUntilMinuteEnd;
+      const nextBoundaryMs = nextMinuteMs + BOUNDARY_INTERVAL_SECS * 1000;
       this.logger.log(
-        `[${this.userId}] CTC: Candidate too close to minute end (${msUntilMinuteEnd}ms) ` +
-        `— defer to next minute boundary (+${Math.round(nextBoundaryMs - now)}ms)`,
+        `[${this.userId}] CTC: Candidate terlalu dekat akhir menit (${msUntilMinuteEnd}ms) ` +
+        `— defer ke boundary berikutnya (+${Math.round(nextBoundaryMs - now)}ms)`,
       );
       return nextBoundaryMs;
     }
@@ -229,109 +214,35 @@ export class CtcExecutor extends FastradeBaseExecutor {
     return candidateMs;
   }
 
-  private async executeWithTrend(trend: TrendType, step: number, retryCount = 0): Promise<void> {
-    if (!this.isRunning) return;
-
-    // FIX: Naikkan dari 3 ke 5 — WS reconnect + channel join bisa butuh 4-5 detik,
-    // dengan interval 2s per retry, 3 retry hanya memberi 6s. 5 retry = 10s window.
-    const MAX_RETRIES = 5;
-    if (retryCount >= MAX_RETRIES) {
-      this.logger.error(
-        `[${this.userId}] CTC: Trade gagal ${MAX_RETRIES}x berturut-turut — bot dihentikan`,
-      );
-      this.callbacks.onStatusChange(
-        `CTC: Trade gagal ${MAX_RETRIES}x — cek konfigurasi amount/koneksi`,
-      );
-      this.stop();
-      return;
-    }
-
-    // FIX: Tunggu WS siap sebelum execute — penting di martingale step tinggi
-    // di mana WS bisa reconnect di tengah sequence.
-    await this.waitForWsReady(15_000);
-    if (!this.isRunning) return;
-
-    // Always Signal: jika ada outstanding loss dan ini bukan lanjutan martingale regular,
-    // override step dari loss state. Trend tetap dari parameter (hasil analisis candle).
-    let effectiveStep = step;
-    if (this.alwaysSignalLossState?.hasOutstandingLoss && step === 0) {
-      effectiveStep = this.alwaysSignalLossState.currentMartingaleStep;
-      this.logger.log(
-        `[${this.userId}] CTC: Always Signal override — step ${step}→${effectiveStep}`
-      );
-    }
-
-    this.phase = 'EXECUTING';
-    const amount = this.calcAmount(effectiveStep);
-
-    this.logger.log(
-      `[${this.userId}] CTC: Execute trend=${trend.toUpperCase()} amount=${amount} step=${effectiveStep} ` +
-      `activeTrend=${this.activeTrend} cycle=${this.cycleNumber}` +
-      (retryCount > 0 ? ` (retry ${retryCount}/${MAX_RETRIES})` : ''),
-    );
-
-    const order = await this.executeTrade(trend, amount, effectiveStep, this.cycleNumber);
-
-    if (!order) {
-      if (!this.isRunning) return;
-
-      this.logger.error(
-        `[${this.userId}] CTC: Trade placement failed — retry ${retryCount + 1}/${MAX_RETRIES} in 2s`,
-      );
-      setTimeout(() => {
-        if (this.isRunning) this.executeWithTrend(trend, step, retryCount + 1);
-      }, 2000);
-      return;
-    }
-
-    this.activeOrder = order;
-    this.phase = 'WAITING_RESULT';
-    this.callbacks.onStatusChange(
-      `CTC CYCLE ${this.cycleNumber}: Menunggu hasil ${trend.toUpperCase()} (step=${step})...`,
-    );
-
-    this.startResultTimeout(order.id, RESULT_TIMEOUT_MS);
-  }
+  // ── Result handlers ───────────────────────────────────────────────────────
 
   protected onWin(order: FastradeOrder): void {
     const trend = this.activeTrend ?? this.currentTrend ?? order.trend;
-    this.logger.log(
-      `[${this.userId}] CTC WIN ✅ — Keep trend: ${trend.toUpperCase()} (activeTrend unchanged)`,
-    );
+    this.logger.log(`[${this.userId}] CTC WIN ✅ — Keep trend: ${trend.toUpperCase()}`);
     this.callbacks.onStatusChange(`CTC WIN ✅ — Lanjut ${trend.toUpperCase()} segera`);
     this.resetMartingale();
 
-    setTimeout(() => {
-      if (this.isRunning) this.executeWithTrend(trend, 0);
-    }, 200);
+    // FIX: afterDelay — dilindungi stopGeneration agar tidak execute setelah stop()
+    this.afterDelay(200, () => this.executeWithTrend(trend, 0));
   }
 
   protected onLose(order: FastradeOrder): void {
     const m = this.config.martingale;
     const currentActiveTrend = this.activeTrend ?? this.currentTrend ?? order.trend;
 
-    // Always Signal mode aktif: loss state sudah dicatat di handleDealResult.
-    // Mulai cycle baru untuk analisis candle — executeWithTrend() akan otomatis
-    // memakai step & amount yang sudah dinaikkan dari alwaysSignalLossState.
-    // Trend: CTC akan menentukan dari analisis candle baru; jika LOSE lagi,
-    // onLose() regular akan me-reverse trend sesuai logika CTC normal.
+    // ── Always Signal ──────────────────────────────────────────────────────
     if (m.isEnabled && m.isAlwaysSignal) {
       this.phase = 'ALWAYS_SIGNAL_WAITING';
       const nextStep = this.alwaysSignalLossState?.currentMartingaleStep ?? 1;
       this.logger.log(
-        `[${this.userId}] CTC LOSE — Always Signal: Menunggu sinyal candle berikutnya ` +
-        `untuk martingale step ${nextStep}/${m.maxSteps}`
+        `[${this.userId}] CTC LOSE — Always Signal: menunggu candle berikutnya (step ${nextStep}/${m.maxSteps})`,
       );
-      this.callbacks.onStatusChange(
-        `CTC LOSE — Always Signal step ${nextStep}: Menunggu sinyal berikutnya...`
-      );
-      // Cycle baru: analisis 2 candle → executeWithTrend() pakai step dari alwaysSignalLossState
-      setTimeout(() => {
-        if (this.isRunning) this.startNewCycle();
-      }, CYCLE_RESTART_DELAY_MS);
+      this.callbacks.onStatusChange(`CTC LOSE — Always Signal step ${nextStep}: Menunggu sinyal berikutnya...`);
+      this.scheduleNewCycle(CYCLE_RESTART_DELAY_MS);
       return;
     }
 
+    // ── Martingale regular: setiap LOSE → reverse arah ────────────────────
     if (m.isEnabled && m.maxSteps > 0) {
       const nextStep = this.martingaleStep + 1;
 
@@ -350,51 +261,60 @@ export class CtcExecutor extends FastradeBaseExecutor {
           `CTC LOSE — Martingale ${nextStep}/${m.maxSteps}: REVERSED → ${reversedTrend.toUpperCase()}`,
         );
 
-        setTimeout(() => {
-          if (this.isRunning) this.executeWithTrend(reversedTrend, nextStep);
-        }, 200);
+        this.afterDelay(200, () => this.executeWithTrend(reversedTrend, nextStep));
         return;
       }
 
+      // Martingale max → reverse, lanjut segera
+      // FIX: capture step SEBELUM resetMartingale() agar log benar
+      const reachedStep = this.martingaleStep;
       const reversedTrend = this.reverseTrend(currentActiveTrend);
       this.activeTrend = reversedTrend;
-
-      this.logger.log(
-        `[${this.userId}] CTC: Martingale max reached (step ${this.martingaleStep}/${m.maxSteps}) ` +
-        `— REVERSE to ${reversedTrend.toUpperCase()} and continue immediately`,
-      );
-      this.callbacks.onStatusChange(
-        `CTC Martingale max — REVERSED → ${reversedTrend.toUpperCase()} (lanjut segera)`,
-      );
-
       this.resetMartingale();
 
-      setTimeout(() => {
-        if (this.isRunning) this.executeWithTrend(reversedTrend, 0);
-      }, 200);
+      this.logger.log(
+        `[${this.userId}] CTC: Martingale max (step ${reachedStep}/${m.maxSteps}) ` +
+        `— REVERSE to ${reversedTrend.toUpperCase()} lanjut segera`,
+      );
+      this.callbacks.onStatusChange(
+        `CTC Martingale max ❌ — REVERSED → ${reversedTrend.toUpperCase()} (lanjut segera)`,
+      );
+
+      this.afterDelay(200, () => this.executeWithTrend(reversedTrend, 0));
       return;
     }
 
+    // ── No martingale: lanjut trend sama (CTC tanpa martingale tidak reverse) ──
     this.logger.log(
       `[${this.userId}] CTC LOSE (no martingale) — Continue SAME trend: ${currentActiveTrend.toUpperCase()}`,
     );
-    this.callbacks.onStatusChange(
-      `CTC LOSE — Lanjut ${currentActiveTrend.toUpperCase()} (tanpa martingale)`,
-    );
+    this.callbacks.onStatusChange(`CTC LOSE — Lanjut ${currentActiveTrend.toUpperCase()} (tanpa martingale)`);
 
-    setTimeout(() => {
-      if (this.isRunning) this.executeWithTrend(currentActiveTrend, 0);
-    }, 200);
+    this.afterDelay(200, () => this.executeWithTrend(currentActiveTrend, 0));
   }
 
   protected onDraw(order: FastradeOrder): void {
     const trend = this.activeTrend ?? this.currentTrend ?? order.trend;
-    this.logger.log(`[${this.userId}] CTC DRAW — Continue ${trend.toUpperCase()} (no martingale)`);
+    this.logger.log(`[${this.userId}] CTC DRAW — Continue ${trend.toUpperCase()} step=${this.martingaleStep}`);
     this.callbacks.onStatusChange(`CTC DRAW — Lanjut ${trend.toUpperCase()}`);
 
-    setTimeout(() => {
-      if (this.isRunning) this.executeWithTrend(trend, this.martingaleStep);
-    }, 200);
+    this.afterDelay(200, () => this.executeWithTrend(trend, this.martingaleStep));
+  }
+
+  // ── Helpers ───────────────────────────────────────────────────────────────
+
+  private scheduleNewCycle(delayMs: number): void {
+    this.clearCycleTimer();
+    this.cycleTimer = setTimeout(() => {
+      if (this.isRunning) this.startNewCycle();
+    }, delayMs);
+  }
+
+  private clearCycleTimer(): void {
+    if (this.cycleTimer) {
+      clearTimeout(this.cycleTimer);
+      this.cycleTimer = undefined;
+    }
   }
 
   getStatus() {

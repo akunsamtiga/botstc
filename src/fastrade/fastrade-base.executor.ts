@@ -8,7 +8,7 @@ import {
 } from './fastrade-types';
 
 const BASE_URL = 'https://api.stockity.id';
-const MAX_PRICE_FETCH_TIME = 5;
+const MAX_PRICE_FETCH_TIME   = 5;
 const FALLBACK_MATCH_WINDOW_MS = 120_000;
 const TERMINAL_STATUSES = new Set(['won', 'win', 'lost', 'lose', 'loss', 'stand', 'draw', 'tie']);
 
@@ -44,13 +44,25 @@ export abstract class FastradeBaseExecutor {
   protected martingaleActive = false;
   protected martingaleTotalLoss = 0;
 
-  // Always Signal state - melacak loss yang belum tertutupi
   protected alwaysSignalLossState: FastradeAlwaysSignalLossState | null = null;
 
   protected resultTimeoutTimer?: NodeJS.Timeout;
 
   private _sleepTimer?: NodeJS.Timeout;
   private _sleepResolve?: () => void;
+
+  // ── Keandalan: stop-generation counter ────────────────────────────────────
+  // Naik setiap stop()/start() — dipakai oleh afterDelay() agar callback yang
+  // dijadwalkan sebelum stop() tidak bisa execute setelah start() baru.
+  protected stopGeneration = 0;
+
+  // ── Konstanta — override di subclass jika perlu ───────────────────────────
+  protected readonly MAX_RETRIES   = 5;
+  protected readonly RETRY_DELAY_MS = 2_000;
+  protected readonly RESULT_TIMEOUT_MS = 180_000;
+
+  /** Nama mode untuk log/status ('FTT' / 'CTC'). */
+  protected abstract get modeName(): string;
 
   constructor(
     protected readonly userId: string,
@@ -66,6 +78,7 @@ export abstract class FastradeBaseExecutor {
   start() {
     if (this.isRunning) return;
     this.isRunning = true;
+    this.stopGeneration++;          // invalidate semua callback lama
     this.sessionPnL = 0;
     this.totalWins = 0;
     this.totalLosses = 0;
@@ -75,20 +88,21 @@ export abstract class FastradeBaseExecutor {
     this.executionTime = undefined;
     this.resetMartingale();
     this.alwaysSignalLossState = null;
-    this.logger.log(`[${this.userId}] ▶️ Starting`);
+    this.logger.log(`[${this.userId}] ▶️ Starting (gen=${this.stopGeneration})`);
     this.startNewCycle();
   }
 
   stop() {
     if (!this.isRunning && !this.activeOrder) return;
     this.isRunning = false;
+    this.stopGeneration++;          // invalidate semua callback yang dijadwalkan
     this.clearResultTimeout();
     this.wakeUp();
     this.activeOrder = undefined;
     this.executionTime = undefined;
     this.resetMartingale();
     this.alwaysSignalLossState = null;
-    this.logger.log(`[${this.userId}] ⏹️ Stopped`);
+    this.logger.log(`[${this.userId}] ⏹️ Stopped (gen=${this.stopGeneration})`);
     this.callbacks.onStopped();
   }
 
@@ -99,7 +113,105 @@ export abstract class FastradeBaseExecutor {
   protected abstract onLose(order: FastradeOrder): void;
   protected abstract onDraw(order: FastradeOrder): void;
 
-  protected async fetchCandleClosePrice(): Promise<number | null> {
+  protected abstract setExecutingPhase(): void;
+  protected abstract setWaitingResultPhase(trend: TrendType, step: number): void;
+
+  // ── afterDelay: pengganti setTimeout yang aman terhadap race stop/start ───
+  //
+  // Sebelumnya: setTimeout(() => { if (this.isRunning) fn(); }, ms)
+  // Masalah: jika stop() + start() terjadi dalam window `ms`, stopGeneration
+  //   sudah berubah di stop() (naik 1) tapi naik lagi di start() (naik 1 lagi).
+  //   Callback lama membawa gen lama → gen !== stopGeneration → tidak execute.
+  //   Callback baru dari start() membawa gen baru → lolos.
+  //
+  // Ini mencegah "trade basi" yang bisa terjadi jika user stop+start cepat.
+  protected afterDelay(ms: number, fn: () => void): void {
+    const gen = this.stopGeneration;
+    setTimeout(() => {
+      if (this.isRunning && this.stopGeneration === gen) fn();
+    }, ms);
+  }
+
+  // ── executeWithTrend (terpusat di base, tidak duplikat di FTT/CTC) ─────────
+  protected async executeWithTrend(trend: TrendType, step: number, retryCount = 0): Promise<void> {
+    if (!this.isRunning) return;
+
+    if (retryCount >= this.MAX_RETRIES) {
+      this.logger.error(`[${this.userId}] ${this.modeName}: Trade gagal ${this.MAX_RETRIES}x — bot dihentikan`);
+      this.callbacks.onStatusChange(`${this.modeName}: Trade gagal ${this.MAX_RETRIES}x — cek koneksi/amount`);
+      this.stop();
+      return;
+    }
+
+    // waitForWsReady hanya dipanggil SATU KALI di sini.
+    // executeTrade() TIDAK memanggil waitForWsReady lagi (sudah dihapus).
+    await this.waitForWsReady(15_000);
+    if (!this.isRunning) return;
+
+    const effectiveStep =
+      (this.alwaysSignalLossState?.hasOutstandingLoss && step === 0)
+        ? this.alwaysSignalLossState.currentMartingaleStep
+        : step;
+
+    if (effectiveStep !== step) {
+      this.logger.log(`[${this.userId}] ${this.modeName}: Always Signal override — step ${step}→${effectiveStep}`);
+    }
+
+    const amount = this.calcAmount(effectiveStep);
+    this.setExecutingPhase();
+
+    this.logger.log(
+      `[${this.userId}] ${this.modeName}: Execute trend=${trend.toUpperCase()} ` +
+      `amount=${amount} step=${effectiveStep} cycle=${this.cycleNumber}` +
+      (retryCount > 0 ? ` (retry ${retryCount}/${this.MAX_RETRIES})` : ''),
+    );
+
+    const order = await this.executeTrade(trend, amount, effectiveStep, this.cycleNumber);
+
+    if (!order) {
+      if (!this.isRunning) return;
+      this.logger.error(
+        `[${this.userId}] ${this.modeName}: Placement failed — retry ${retryCount + 1}/${this.MAX_RETRIES} in ${this.RETRY_DELAY_MS}ms`,
+      );
+      // afterDelay: retry juga diproteksi stopGeneration
+      this.afterDelay(this.RETRY_DELAY_MS, () => this.executeWithTrend(trend, step, retryCount + 1));
+      return;
+    }
+
+    this.activeOrder = order;
+    this.setWaitingResultPhase(trend, step);
+    this.startResultTimeout(order.id);
+  }
+
+  // ── Candle fetching ───────────────────────────────────────────────────────
+
+  /**
+   * Ambil harga close candle terakhir dari Stockity API.
+   *
+   * FIX PERFORMA: sebelumnya 1 attempt → 1 gagal = restart cycle + tunggu 2+ menit.
+   * Sekarang: 3 attempt dengan 1s jeda per retry.
+   * HTTP error transient (timeout jaringan, server busy) tidak lagi membuang sinyal.
+   */
+  protected async fetchCandleClosePrice(maxAttempts = 3): Promise<number | null> {
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      if (!this.isRunning) return null;
+
+      const price = await this._fetchCandleOnce();
+      if (price !== null) return price;
+
+      if (attempt < maxAttempts) {
+        this.logger.warn(
+          `[${this.userId}] Candle fetch attempt ${attempt}/${maxAttempts} failed — retry in 1s`,
+        );
+        await new Promise<void>(r => setTimeout(r, 1_000));
+      }
+    }
+
+    this.logger.error(`[${this.userId}] Candle fetch failed after ${maxAttempts} attempts`);
+    return null;
+  }
+
+  private async _fetchCandleOnce(): Promise<number | null> {
     try {
       const utcDate = new Date();
       const dateStr = this.formatApiDate(utcDate);
@@ -122,20 +234,18 @@ export abstract class FastradeBaseExecutor {
         MAX_PRICE_FETCH_TIME,
       );
 
-      if (!response.data?.data) return null;
+      const candles: any[] = response.data?.data;
+      if (!candles?.length) return null;
 
-      const candles: any[] = response.data.data;
-      if (!candles || candles.length === 0) return null;
+      const last = [...candles]
+        .sort((a, b) => (a.created_at as string).localeCompare(b.created_at as string))
+        .at(-1)!;
 
-      const sorted = [...candles].sort((a, b) =>
-        (a.created_at as string).localeCompare(b.created_at as string),
-      );
-      const last = sorted[sorted.length - 1];
       const closePrice = parseFloat(last.close);
       return isNaN(closePrice) ? null : closePrice;
 
     } catch (err: any) {
-      this.logger.error(`[${this.userId}] fetchCandleClosePrice error: ${err.message}`);
+      this.logger.error(`[${this.userId}] _fetchCandleOnce error: ${err.message}`);
       return null;
     }
   }
@@ -152,8 +262,7 @@ export abstract class FastradeBaseExecutor {
 
   protected getNextMinuteBoundary(): number {
     const now = Date.now();
-    const msIntoMinute = now % 60_000;
-    return now + (60_000 - msIntoMinute);
+    return now + (60_000 - (now % 60_000));
   }
 
   protected formatApiDate(date: Date): string {
@@ -164,6 +273,13 @@ export abstract class FastradeBaseExecutor {
     );
   }
 
+  // ── Trade execution ───────────────────────────────────────────────────────
+
+  /**
+   * Kirim trade ke Stockity via WebSocket.
+   * waitForWsReady() TIDAK dipanggil di sini — caller (executeWithTrend) sudah
+   * memanggil satu kali. Duplikasi sebelumnya bisa menyebabkan delay +15s per trade.
+   */
   protected async executeTrade(
     trend: TrendType,
     amount: number,
@@ -187,53 +303,36 @@ export abstract class FastradeBaseExecutor {
       return null;
     }
 
-    // FIX: Pastikan WS siap sebelum place trade — terutama penting saat martingale
-    // multi-step di mana WS bisa reconnect di tengah sequence.
-    await this.waitForWsReady(15_000);
-    if (!this.isRunning) return null;
-
     const result = await this.wsClient.placeTrade(tradeData as any);
 
     if (result.error === 'amount_min') {
-      this.logger.error(
-        `[${this.userId}] ❌ Amount ${amount} di bawah minimum Stockity — bot dihentikan`,
-      );
+      this.logger.error(`[${this.userId}] ❌ Amount ${amount} di bawah minimum Stockity — bot dihentikan`);
       this.callbacks.onLog({
         id: uuidv4(), orderId, trend, amount, martingaleStep,
         result: 'FAILED', executedAt: now, cycleNumber: cycleNum,
-        note: 'Trade gagal: amount di bawah minimum Stockity. Cek konfigurasi.',
+        note: 'Amount di bawah minimum Stockity. Cek konfigurasi.',
         isDemoAccount: this.config.isDemoAccount,
       });
-      this.callbacks.onStatusChange(
-        `❌ Amount ${amount} di bawah minimum Stockity — bot dihentikan. Cek konfigurasi.`,
-      );
+      this.callbacks.onStatusChange(`❌ Amount ${amount} di bawah minimum Stockity — bot dihentikan.`);
       setTimeout(() => this.stop(), 300);
       return null;
     }
 
-    // FIX: Handle amount_max — amount martingale melebihi batas maksimum Stockity.
-    // Bot dihentikan dengan pesan jelas daripada retry 3x yang pasti gagal.
     if (result.error === 'amount_max') {
-      this.logger.error(
-        `[${this.userId}] ❌ Amount ${amount} melebihi maksimum Stockity — bot dihentikan`,
-      );
+      this.logger.error(`[${this.userId}] ❌ Amount ${amount} melebihi maksimum Stockity — bot dihentikan`);
       this.callbacks.onLog({
         id: uuidv4(), orderId, trend, amount, martingaleStep,
         result: 'FAILED', executedAt: now, cycleNumber: cycleNum,
-        note: `Trade gagal: amount ${amount} melebihi batas maksimum Stockity. Kurangi multiplier atau baseAmount.`,
+        note: `Amount ${amount} melebihi batas maksimum. Kurangi multiplier/baseAmount.`,
         isDemoAccount: this.config.isDemoAccount,
       });
-      this.callbacks.onStatusChange(
-        `❌ Amount ${amount} melebihi maksimum Stockity (step=${martingaleStep}) — bot dihentikan. Kurangi multiplier.`,
-      );
+      this.callbacks.onStatusChange(`❌ Amount ${amount} melebihi maksimum Stockity (step=${martingaleStep}) — kurangi multiplier.`);
       setTimeout(() => this.stop(), 300);
       return null;
     }
 
     if (result.error === 'duplicate') {
-      this.logger.warn(
-        `[${this.userId}] ⚠️ Duplicate deal — trade probably went through, tracking without dealId`,
-      );
+      this.logger.warn(`[${this.userId}] ⚠️ Duplicate deal — menunggu hasil via WS`);
     }
 
     const dealId = result.dealId ?? null;
@@ -268,19 +367,26 @@ export abstract class FastradeBaseExecutor {
     return order;
   }
 
+  /**
+   * Bangun payload trade untuk eksekusi instan (non-scheduled).
+   *
+   * FIX PERFORMA: sebelumnya `remainingInMinute >= 45` bisa menghasilkan
+   * durasi tepat 45s jika dipanggil di detik :15 menit — di batas minimum
+   * Stockity tanpa slack. Sekarang threshold dinaikkan ke 48 agar durasi
+   * minimal ~48s, memberikan 3 detik buffer untuk prosesan server.
+   */
   protected buildInstantTrade(trend: TrendType, amount: number): FastradeTradeOrder {
     const nowMs = Date.now();
     const createdAtSeconds = Math.floor(nowMs / 1000) + 1;
-    const secondsInMinute = createdAtSeconds % 60;
-    const remainingInMinute = 60 - secondsInMinute;
+    const remainingInMinute = 60 - (createdAtSeconds % 60);
 
-    const expireAt =
-      remainingInMinute >= 45
-        ? createdAtSeconds + remainingInMinute
-        : createdAtSeconds + remainingInMinute + 60;
+    // FIX: threshold 48 (bukan 45) → durasi minimal 48s, bukan tepat 45s
+    const expireAt = remainingInMinute >= 48
+      ? createdAtSeconds + remainingInMinute
+      : createdAtSeconds + remainingInMinute + 60;
 
     const duration = expireAt - createdAtSeconds;
-    if (duration < 45) throw new Error(`Duration terlalu pendek: ${duration}s (min 45s)`);
+    if (duration < 45)  throw new Error(`Duration terlalu pendek: ${duration}s (min 45s)`);
     if (duration > 125) throw new Error(`Duration terlalu panjang: ${duration}s (max 125s)`);
     if (expireAt <= createdAtSeconds) throw new Error(`expireAt tidak valid`);
 
@@ -312,10 +418,8 @@ export abstract class FastradeBaseExecutor {
     this.martingaleTotalLoss = 0;
   }
 
-  /**
-   * Handle Always Signal feature
-   * Dipanggil saat loss terjadi dan isAlwaysSignal aktif
-   */
+  // ── Always Signal helpers ─────────────────────────────────────────────────
+
   protected handleAlwaysSignalLoss(order: FastradeOrder): void {
     const m = this.config.martingale;
     if (!m.isEnabled || !m.isAlwaysSignal) return;
@@ -324,79 +428,36 @@ export abstract class FastradeBaseExecutor {
     const nextStep = currentStep + 1;
 
     if (nextStep > m.maxSteps) {
-      // Sudah melewati max step — reset loss state, siklus selesai dengan LOSE
-      this.logger.log(
-        `[${this.userId}] 📊 Always Signal: Max steps (${m.maxSteps}) reached — loss state di-reset`
-      );
+      this.logger.log(`[${this.userId}] 📊 Always Signal: max steps (${m.maxSteps}) reached — reset`);
       this.alwaysSignalLossState = null;
       return;
     }
 
     const totalLoss = (this.alwaysSignalLossState?.totalLoss ?? 0) + order.amount;
-
     this.alwaysSignalLossState = {
       hasOutstandingLoss: true,
       currentMartingaleStep: nextStep,
       originalOrderId: order.id,
       totalLoss,
-      // currentTrend dihapus — trend martingale ditentukan dari analisis candle
-      // sinyal berikutnya, bukan disimpan dari order yang LOSE.
     };
 
     this.logger.log(
-      `[${this.userId}] 📊 Always Signal: Loss recorded step=${currentStep}→${nextStep}/${m.maxSteps} ` +
-      `lossAmount=${order.amount} totalLoss=${totalLoss}`
+      `[${this.userId}] 📊 Always Signal: step=${currentStep}→${nextStep}/${m.maxSteps} ` +
+      `loss=${order.amount} totalLoss=${totalLoss}`,
     );
   }
 
-  /**
-   * Execute Always Signal martingale pada sinyal berikutnya.
-   *
-   * @param trend - Trend hasil analisis candle sinyal baru.
-   *   FTT: sama dengan hasil candle (trend tidak di-reverse oleh always signal).
-   *   CTC: sama dengan hasil candle; CTC yang akan meng-handle reverse sendiri
-   *        di onLose() jika loss lagi, sesuai logika CTC normal.
-   *
-   * Desain: always signal hanya menaikkan amount (step) — arah trend tetap
-   * mengikuti sinyal baru, bukan tersimpan dari order loss sebelumnya.
-   */
-  protected async executeAlwaysSignalMartingale(trend: TrendType): Promise<boolean> {
-    if (!this.alwaysSignalLossState?.hasOutstandingLoss) return false;
-
-    const m = this.config.martingale;
-    const step = this.alwaysSignalLossState.currentMartingaleStep;
-    const amount = this.calcAmount(step);
-
-    this.logger.log(
-      `[${this.userId}] 🔄 Always Signal: Executing step ${step}/${m.maxSteps} ` +
-      `trend=${trend.toUpperCase()} amount=${amount}`
-    );
-
-    const order = await this.executeTrade(trend, amount, step, this.cycleNumber);
-
-    if (order) {
-      this.activeOrder = order;
-      this.martingaleStep = step;
-      this.martingaleActive = true;
-      return true;
-    }
-
-    return false;
-  }
-
-  /**
-   * Clear Always Signal state saat WIN terjadi
-   */
   protected clearAlwaysSignalLoss(): void {
     if (this.alwaysSignalLossState) {
-      this.logger.log(`[${this.userId}] ✅ Always Signal: Loss cleared (WIN)`);
+      this.logger.log(`[${this.userId}] ✅ Always Signal: cleared (WIN)`);
       this.alwaysSignalLossState = null;
     }
   }
 
+  // ── Deal result handling ──────────────────────────────────────────────────
+
   protected handleDealResult(payload: DealResultPayload) {
     const s = (payload.status || payload.result || '').toLowerCase();
-
     if (!TERMINAL_STATUSES.has(s)) {
       this.logger.debug(`[${this.userId}] Skip non-terminal status="${s}"`);
       return;
@@ -406,7 +467,7 @@ export abstract class FastradeBaseExecutor {
     if (!active) return;
 
     const dealId = String(payload.id ?? '');
-    const isWin  = s === 'won'  || s === 'win';
+    const isWin  = s === 'won' || s === 'win';
     const isDraw = s === 'stand' || s === 'draw' || s === 'tie';
 
     let isMatch = active.dealId === dealId;
@@ -437,21 +498,10 @@ export abstract class FastradeBaseExecutor {
     else if (!isDraw) tradePnL = -active.amount;
     this.sessionPnL += tradePnL;
 
-    // ── Martingale-aware stats counter ────────────────────────────────────
-    // Saat martingale aktif:
-    //   - LOSE di step mana pun SELAMA step < maxSteps → skip (tidak dihitung)
-    //     Ini TERMASUK step 0 (base trade) karena martingale akan lanjut.
-    //   - WIN di mana saja                → totalTrades+1, totalWins+1
-    //   - LOSE di step terakhir (maxSteps) → totalTrades+1, totalLosses+1
-    // Saat martingale tidak aktif → setiap loss langsung dihitung.
     const _m = this.config.martingale;
-    const _isMartingaleEnabled = _m.isEnabled && _m.maxSteps > 0;
-    // FIX: tidak pakai active.isMartingale (yang false di step 0) — step 0 pun
-    // harus di-skip jika martingale aktif, karena sequence belum selesai.
     const _isMidSequenceLoss =
-      _isMartingaleEnabled &&
-      !isWin &&
-      !isDraw &&
+      _m.isEnabled && _m.maxSteps > 0 &&
+      !isWin && !isDraw &&
       active.martingaleStep < _m.maxSteps;
 
     if (!_isMidSequenceLoss) {
@@ -480,41 +530,33 @@ export abstract class FastradeBaseExecutor {
       isDemoAccount: this.config.isDemoAccount,
     });
 
-    const completedOrder: FastradeOrder = { ...active, result: result as any, dealId: dealId || active.dealId };
+    const completedOrder: FastradeOrder = {
+      ...active,
+      result: result as any,
+      dealId: dealId || active.dealId,
+    };
     this.activeOrder = undefined;
     this.executionTime = undefined;
 
     if (!this.isRunning) return;
-
     if (this.checkStopConditions()) return;
 
-    // Handle Always Signal logic
     if (isWin) {
-      // WIN: bersihkan loss state lalu lanjutkan
       this.clearAlwaysSignalLoss();
       this.onWin(completedOrder);
     } else if (isDraw) {
       this.onDraw(completedOrder);
     } else {
-      // LOSE
       if (this.config.martingale.isEnabled && this.config.martingale.isAlwaysSignal) {
-        // Catat loss — naikkan step dan totalLoss di alwaysSignalLossState.
-        // resetMartingale() TIDAK dipanggil di sini karena onLose() akan memicu
-        // startNewCycle(), yang harus menganalisis candle dulu baru eksekusi martingale.
-        // martingaleStep & martingaleActive akan di-reset oleh resetMartingale() di
-        // startNewCycle() setelah pengecekan alwaysSignalLossState.
         this.handleAlwaysSignalLoss(completedOrder);
-        this.onLose(completedOrder);
-      } else {
-        this.onLose(completedOrder);
       }
+      this.onLose(completedOrder);
     }
   }
 
   protected isFallbackMatch(payload: DealResultPayload, order: FastradeOrder): boolean {
     if (!this.executionTime) return false;
-    const elapsed = Date.now() - this.executionTime;
-    if (elapsed > FALLBACK_MATCH_WINDOW_MS) return false;
+    if (Date.now() - this.executionTime > FALLBACK_MATCH_WINDOW_MS) return false;
     if (payload.amount !== undefined && payload.amount !== order.amount) return false;
     if (payload.trend && payload.trend !== order.trend) return false;
     return true;
@@ -540,8 +582,11 @@ export abstract class FastradeBaseExecutor {
     return false;
   }
 
-  protected startResultTimeout(orderId: string, timeoutMs = 180_000) {
+  // ── Result timeout ────────────────────────────────────────────────────────
+
+  protected startResultTimeout(orderId: string, timeoutMs?: number) {
     this.clearResultTimeout();
+    const timeout = timeoutMs ?? this.RESULT_TIMEOUT_MS;
     this.resultTimeoutTimer = setTimeout(() => {
       if (this.activeOrder?.id !== orderId) return;
       this.logger.warn(`[${this.userId}] ⚠️ Result timeout for order ${orderId} — treating as LOSE`);
@@ -549,7 +594,7 @@ export abstract class FastradeBaseExecutor {
       this.activeOrder = undefined;
       this.executionTime = undefined;
       if (this.isRunning) this.onLose(timedOut);
-    }, timeoutMs);
+    }, timeout);
   }
 
   protected clearResultTimeout() {
@@ -558,6 +603,8 @@ export abstract class FastradeBaseExecutor {
       this.resultTimeoutTimer = undefined;
     }
   }
+
+  // ── Status ────────────────────────────────────────────────────────────────
 
   getStatus() {
     return {
@@ -577,10 +624,17 @@ export abstract class FastradeBaseExecutor {
       wsConnected: this.wsClient.isConnected(),
       alwaysSignalActive: this.alwaysSignalLossState?.hasOutstandingLoss ?? false,
       alwaysSignalStep: this.alwaysSignalLossState?.currentMartingaleStep ?? 0,
+      stopGeneration: this.stopGeneration,
     };
   }
 
+  // ── Sleep utilities ───────────────────────────────────────────────────────
+
   protected sleep(ms: number): Promise<void> {
+    // FIX: wake up sleep lama sebelum register yang baru — mencegah _sleepResolve
+    // ditimpa tanpa resolve, yang menyebabkan memory leak dan race condition.
+    if (this._sleepTimer) this.wakeUp();
+
     return new Promise((resolve) => {
       this._sleepResolve = resolve;
       this._sleepTimer = setTimeout(() => {
@@ -602,25 +656,30 @@ export abstract class FastradeBaseExecutor {
   }
 
   /**
-   * Tunggu sampai WebSocket connected + required channels ready.
-   * Dipakai sebelum placeTrade agar WS tidak dalam kondisi reconnecting.
+   * Tunggu sampai WS connected + required channels ready.
    *
-   * @param timeoutMs - Batas waktu tunggu (default 15s). Jika timeout, lanjut
-   *                    dan biarkan executeTrade handle error-nya sendiri.
+   * FIX PERFORMA: logging dikurangi — log satu kali saat mulai tunggu,
+   * satu kali saat ready. Sebelumnya log warn setiap 300ms → ~50 baris noise per reconnect.
    */
   protected async waitForWsReady(timeoutMs = 15_000): Promise<void> {
     const CHECK_INTERVAL_MS = 300;
     const deadline = Date.now() + timeoutMs;
+    let hasLoggedWaiting = false;
 
     while (Date.now() < deadline) {
       if (!this.isRunning) return;
-      if (this.wsClient.isConnected() && this.wsClient.isRequiredChannelsReady()) return;
-
-      this.logger.warn(
-        `[${this.userId}] ⏳ WS not ready (connected=${this.wsClient.isConnected()} ` +
-        `channelsReady=${this.wsClient.isRequiredChannelsReady()}) — waiting ${CHECK_INTERVAL_MS}ms...`,
-      );
-      await new Promise<void>(resolve => setTimeout(resolve, CHECK_INTERVAL_MS));
+      if (this.wsClient.isConnected() && this.wsClient.isRequiredChannelsReady()) {
+        if (hasLoggedWaiting) this.logger.log(`[${this.userId}] ✅ WS ready`);
+        return;
+      }
+      if (!hasLoggedWaiting) {
+        this.logger.warn(
+          `[${this.userId}] ⏳ WS not ready — waiting up to ${timeoutMs}ms ` +
+          `(connected=${this.wsClient.isConnected()} channels=${this.wsClient.isRequiredChannelsReady()})`,
+        );
+        hasLoggedWaiting = true;
+      }
+      await new Promise<void>(r => setTimeout(r, CHECK_INTERVAL_MS));
     }
 
     this.logger.warn(`[${this.userId}] ⚠️ waitForWsReady timeout ${timeoutMs}ms — proceeding anyway`);

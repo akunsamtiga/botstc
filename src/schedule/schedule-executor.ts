@@ -82,10 +82,27 @@ export class ScheduleExecutor {
   private lastCompletionCheck = 0;
 
   /**
+   * Interval aktif untuk monitoring loop.
+   * FAST_TICK_MS  (50ms)   → dipakai saat order berikutnya dalam <10 detik
+   * IDLE_TICK_MS  (1000ms) → dipakai saat order masih jauh / semua awaiting
+   * Ini mencegah CPU waste saat tidak ada order yang akan segera dieksekusi.
+   */
+  private readonly FAST_TICK_MS = 50;
+  private readonly IDLE_TICK_MS = 1000;
+  private currentTickInterval = 0;
+
+  /**
    * Salinan order asli (sebelum dieksekusi) untuk restore saat stop().
    * Diupdate setiap kali addOrders() / removeOrder() / clearOrders() dipanggil.
    */
   private originalOrders: ScheduledOrder[] = [];
+
+  /**
+   * Set untuk guard re-entrant eksekusi order.
+   * Mencegah order yang sama di-execute dua kali jika tick() berjalan
+   * sementara executeOrder() sebelumnya masih await placeTrade().
+   */
+  private executingOrderIds = new Set<string>();
 
   /** Map orderId → ExecutionInfo untuk fallback matching */
   private executionInfoMap = new Map<string, ExecutionInfo>();
@@ -174,6 +191,7 @@ export class ScheduleExecutor {
     this.martingaleStartTime = undefined;
     this.alwaysSignalLossState = undefined;
     this.executionInfoMap.clear();
+    this.executingOrderIds.clear(); // FIX: bersihkan guard agar order bisa di-execute setelah restart
     this.sessionPnL = 0;
     this.callbacks.onOrdersUpdate(this.orders);
     // Notify tracking service
@@ -219,7 +237,11 @@ export class ScheduleExecutor {
     if (this.orders.length !== before) this.callbacks.onOrdersUpdate(this.orders);
     if (this.orders.length === 0 && this.botState === 'RUNNING') {
       this.stop();
-      this.callbacks.onAllCompleted();
+      // FIX: Gunakan hasCompleted guard agar tidak double-trigger bersama checkCompletion()
+      if (!this.hasCompleted) {
+        this.hasCompleted = true;
+        this.callbacks.onAllCompleted();
+      }
     }
   }
 
@@ -229,21 +251,63 @@ export class ScheduleExecutor {
     this.activeMartingaleOrderId = undefined;
     this.alwaysSignalLossState = undefined;
     this.executionInfoMap.clear();
+    this.executingOrderIds.clear();
     if (this.botState === 'RUNNING') this.stop();
     this.callbacks.onOrdersUpdate([]);
     this.callbacks.onActiveMartingaleChange?.(null).catch(() => {});
-    this.callbacks.onAllCompleted();
+    // FIX: Gunakan hasCompleted guard agar tidak double-trigger bersama checkCompletion()
+    if (!this.hasCompleted) {
+      this.hasCompleted = true;
+      this.callbacks.onAllCompleted();
+    }
   }
 
   // ── Monitoring Loop ──────────────────────────
 
-  private startMonitoringLoop() {
+  private startMonitoringLoop(intervalMs = this.IDLE_TICK_MS) {
     this.stopMonitoringLoop();
-    this.monitoringTimer = setInterval(() => this.tick(), PRECISION_CHECK_MS);
+    this.currentTickInterval = intervalMs;
+    this.monitoringTimer = setInterval(() => this.tick(), intervalMs);
   }
 
   private stopMonitoringLoop() {
     if (this.monitoringTimer) { clearInterval(this.monitoringTimer); this.monitoringTimer = undefined; }
+    this.currentTickInterval = 0;
+  }
+
+  /**
+   * Sesuaikan interval tick berdasarkan seberapa dekat order berikutnya.
+   * - Order dalam 10 detik ke depan → FAST_TICK_MS (50ms) untuk presisi eksekusi
+   * - Semua order masih jauh / bot idle → IDLE_TICK_MS (1000ms) untuk hemat CPU
+   *
+   * Dipanggil di akhir setiap tick() agar transisi terjadi otomatis.
+   */
+  private adjustTickInterval(now: number) {
+    if (this.botState !== 'RUNNING') return;
+
+    const nextPending = this.orders
+      .filter(o => !o.isExecuted && !o.isSkipped)
+      .reduce<ScheduledOrder | null>((min, o) =>
+        !min || o.timeInMillis < min.timeInMillis ? o : min, null);
+
+    const timeUntilNext = nextPending
+      ? nextPending.timeInMillis - EXECUTION_ADVANCE_MS - now
+      : Infinity;
+
+    // Juga fast tick jika ada order yang sedang menunggu hasil WS (isExecuted, masih di list)
+    const hasAwaitingResult = this.orders.some(o => o.isExecuted && !o.isSkipped);
+
+    const targetInterval = (timeUntilNext < 10_000 || hasAwaitingResult)
+      ? this.FAST_TICK_MS
+      : this.IDLE_TICK_MS;
+
+    if (this.currentTickInterval !== targetInterval) {
+      this.logger.debug(
+        `[${this.userId}] Tick interval: ${this.currentTickInterval}ms → ${targetInterval}ms ` +
+        `(nextOrder in ${timeUntilNext === Infinity ? '∞' : Math.round(timeUntilNext / 1000)}s)`,
+      );
+      this.startMonitoringLoop(targetInterval);
+    }
   }
 
   private tick() {
@@ -288,11 +352,23 @@ export class ScheduleExecutor {
     }
 
     if (changed) this.callbacks.onOrdersUpdate(this.orders);
+
+    // Sesuaikan kecepatan tick sesuai jarak order berikutnya
+    this.adjustTickInterval(now);
   }
 
   // ── Trade Execution ──────────────────────────
 
   private async executeOrder(order: ScheduledOrder, isScheduledOrder = true) {
+    // FIX: Guard re-entrant — tick() berjalan setiap 50-1000ms tapi executeOrder() adalah async.
+    // Tanpa guard ini, tick berikutnya bisa fire executeOrder untuk order yang sama
+    // sementara placeTrade() masih menunggu respons WS (max 5s).
+    if (this.executingOrderIds.has(order.id)) {
+      this.logger.warn(`[${this.userId}] ⚠️ executeOrder re-entry blocked for ${order.id}`);
+      return;
+    }
+    this.executingOrderIds.add(order.id);
+    try {
     const isAlways = this.config.martingale.isEnabled && this.config.martingale.isAlwaysSignal;
     const lossState = this.alwaysSignalLossState;
     const hasLoss = isAlways && lossState?.hasOutstandingLoss;
@@ -387,6 +463,11 @@ export class ScheduleExecutor {
       note: result.error === 'duplicate' ? 'Duplicate deal — menunggu hasil via WS' : undefined,
       isDemoAccount: this.config.isDemoAccount,
     });
+    } finally {
+      // FIX: Selalu hapus dari executingOrderIds setelah selesai (success atau error),
+      // agar order yang sama bisa di-execute lagi jika perlu (e.g. setelah stop+start)
+      this.executingOrderIds.delete(order.id);
+    }
   }
 
   // ── Deal Result ──────────────────────────────
@@ -713,7 +794,11 @@ export class ScheduleExecutor {
 
   private completeOrder(orderIdx: number, result: 'WIN' | 'LOSE' | 'DRAW', dealId?: string) {
     const order = this.orders[orderIdx];
-    const finalResult = result === 'WIN' ? 'WIN' : result === 'DRAW' ? 'DRAW' : 'LOSS';
+    // FIX: Sebelumnya 'LOSE' → 'LOSS' yang menyebabkan:
+    //   1. today-profit filter `log.result !== 'LOSE'` miss semua loss dari mode schedule
+    //   2. tracking summary `o.trackingStatus === 'LOSE'` tidak match
+    // Gunakan 'LOSE' konsisten dengan type ExecutionLog.result dan OrderTrackingStatus.
+    const finalResult = result; // WIN | LOSE | DRAW — tidak perlu transform
 
     if (this.activeMartingaleOrderId === order.id) {
       this.activeMartingaleOrderId = undefined;
@@ -878,10 +963,10 @@ export class ScheduleExecutor {
     if (now - this.lastCompletionCheck < 2000) return;
     this.lastCompletionCheck = now;
 
-    // Dengan pendekatan hapus-langsung:
-    //   pending  = order yang belum dieksekusi sama sekali (!isExecuted)
-    //   awaiting = order yang sudah dieksekusi tapi belum dapat hasil WS (isExecuted, masih di list)
-    const hasPending = this.orders.some(o => !o.isExecuted);
+    // FIX: hasPending sebelumnya cek `!o.isExecuted` saja — order yang isSkipped=true
+    // juga memenuhi kondisi ini sehingga bot tidak pernah complete jika ada skipped orders.
+    // Harus exclude isSkipped dari pending count.
+    const hasPending = this.orders.some(o => !o.isExecuted && !o.isSkipped);
 
     // Cek awaiting + tangani timeout
     const timedOut: string[] = [];
@@ -992,17 +1077,19 @@ export class ScheduleExecutor {
   }
 
   getStatus(): object {
-    const pending = this.orders.filter(o => !o.isExecuted);
-    const awaiting = this.orders.filter(o => o.isExecuted);
-    const next    = [...pending].sort((a, b) => a.timeInMillis - b.timeInMillis)[0];
-    const now     = Date.now();
+    // FIX: Pisahkan pending (belum dieksekusi, belum diskip) dari skipped
+    const pending  = this.orders.filter(o => !o.isExecuted && !o.isSkipped);
+    const skipped  = this.orders.filter(o => o.isSkipped);
+    const awaiting = this.orders.filter(o => o.isExecuted && !o.isSkipped);
+    const next     = [...pending].sort((a, b) => a.timeInMillis - b.timeInMillis)[0];
+    const now      = Date.now();
     return {
       botState: this.botState,
       totalOrders: this.orders.length,
       pendingOrders: pending.length,
       awaitingOrders: awaiting.length,
       executedOrders: 0,   // completed orders dihapus dari list — lihat di history logs
-      skippedOrders: 0,
+      skippedOrders: skipped.length,
       activeMartingaleOrderId: this.activeMartingaleOrderId ?? null,
       alwaysSignalActive: !!this.alwaysSignalLossState?.hasOutstandingLoss,
       alwaysSignalStep: this.alwaysSignalLossState?.currentMartingaleStep ?? 0,

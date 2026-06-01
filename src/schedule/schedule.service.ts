@@ -65,6 +65,12 @@ export class ScheduleService implements OnModuleInit, OnModuleDestroy {
   private configs = new Map<string, ScheduleConfig>();
 
   /**
+   * Cache status terakhir per userId agar getStatus() tidak perlu
+   * hit Supabase setiap request saat bot sedang STOPPED.
+   */
+  private statusCache = new Map<string, { botState: string; sessionPnL: number }>();
+
+  /**
    * Debounce timer untuk saveOrders per userId.
    * Menyimpan latest orders + timer handle.
    */
@@ -533,9 +539,39 @@ export class ScheduleService implements OnModuleInit, OnModuleDestroy {
         alwaysSignalLossState: exec.getAlwaysSignalLossState(),
       };
     }
-    const { data: statusDoc, error: statusDocError } = await this.supabaseService.client.from('schedule_status').select('*').eq('user_id', userId).single();
+
+    // Bot tidak aktif: gunakan in-memory statusCache terlebih dahulu
+    // untuk menghindari dua Supabase query per request polling
     const orders = await this.getOrders(userId);
+    const cached = this.statusCache.get(userId);
+
+    if (cached) {
+      return {
+        botState: cached.botState,
+        totalOrders: orders.length,
+        pendingOrders: orders.filter(o => !o.isExecuted && !o.isSkipped).length,
+        executedOrders: orders.filter(o => o.isExecuted).length,
+        skippedOrders: orders.filter(o => o.isSkipped).length,
+        activeMartingaleOrderId: null,
+        wsConnected: false,
+        sessionPnL: cached.sessionPnL,
+        orders,
+      };
+    }
+
+    // Fallback ke Supabase hanya jika cache belum ada (fresh start / restart)
+    const { data: statusDoc, error: statusDocError } = await this.supabaseService.client
+      .from('schedule_status').select('*').eq('user_id', userId).single();
     const statusData = statusDoc && !statusDocError ? statusDoc : null;
+
+    // Isi cache dari Supabase agar request berikutnya tidak perlu query lagi
+    if (statusData) {
+      this.statusCache.set(userId, {
+        botState: statusData.bot_state ?? 'STOPPED',
+        sessionPnL: statusData.session_pnl ?? 0,
+      });
+    }
+
     return {
       botState: statusData?.bot_state ?? 'STOPPED',
       totalOrders: orders.length,
@@ -611,6 +647,12 @@ export class ScheduleService implements OnModuleInit, OnModuleDestroy {
   // ── Firebase helpers ──────────────────────────
 
   private async updateStatus(userId: string, botState: string, sessionPnL?: number) {
+    // Update in-memory cache agar getStatus() tidak perlu query Supabase
+    this.statusCache.set(userId, {
+      botState,
+      sessionPnL: sessionPnL ?? this.statusCache.get(userId)?.sessionPnL ?? 0,
+    });
+
     const extra: any = {};
     if (botState === 'RUNNING') extra.started_at = this.supabaseService.now();
     if (botState === 'STOPPED') {

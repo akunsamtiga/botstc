@@ -323,6 +323,61 @@ export class AuthService {
     // ── Simpan session ke Supabase ────────────────────────────────────────────
     // ✅ FIX: Cek error dari upsert — sebelumnya error diabaikan sehingga JWT
     //    diterbitkan meski session tidak tersimpan → semua request berikutnya 401.
+    // ✅ FIX CURRENCY: Coba baca currency lama dari Supabase ATAU detect langsung
+    //    dari Stockity (platform/private/v2/profile punya field 'currency').
+    //    Prioritas: (1) Stockity API → (2) session lama → (3) default IDR
+    let existingCurrency    = 'IDR';
+    let existingCurrencyIso = 'IDR';
+
+    // ── Prioritas 1: Detect dari Stockity langsung (paling akurat) ───────────
+    // Dari HAR: platform/private/v2/profile → data.currency = "COP" untuk akun Colombia.
+    // Ini lebih reliable dari session lama yang mungkin stale.
+    try {
+      const headers = {
+        'device-id':           deviceId,
+        'device-type':         'web',
+        'user-timezone':       DEFAULT_TIMEZONE,
+        'authorization-token': stockityAuthToken,
+        'User-Agent':          DEFAULT_USER_AGENT,
+        'Accept':              'application/json, text/plain, */*',
+        'Origin':              'https://stockity.id',
+        'Referer':             'https://stockity.id/',
+      };
+      const { curlGet: curlGetFn } = await import('../common/http-utils');
+      const resp = await curlGetFn(`${BASE_URL}/platform/private/v2/profile?locale=id`, headers, 8);
+      const detectedCurrency: string | undefined = resp?.data?.data?.currency;
+      if (detectedCurrency) {
+        existingCurrency    = detectedCurrency;
+        existingCurrencyIso = detectedCurrency; // ISO code — unit/simbol di-resolve frontend
+        this.logger.log(
+          `✅ Currency terdeteksi dari Stockity profile: ${detectedCurrency} untuk userId=${stockityUserId}`,
+        );
+      }
+    } catch (profileErr: any) {
+      // Tidak fatal — fallback ke session lama di bawah
+      this.logger.debug(`[CurrencyDetect] profile fetch gagal: ${profileErr?.message}`);
+    }
+
+    // ── Prioritas 2: Session lama jika detect dari Stockity gagal ────────────
+    if (existingCurrency === 'IDR') {
+      try {
+        const { data: existingSession } = await this.supabaseService.client
+          .from('sessions')
+          .select('currency, currency_iso')
+          .eq('user_id', stockityUserId)
+          .maybeSingle();
+        if (existingSession?.currency && existingSession.currency !== 'IDR') {
+          existingCurrency    = existingSession.currency;
+          existingCurrencyIso = existingSession.currency_iso ?? existingSession.currency;
+          this.logger.log(
+            `✅ Currency dari session lama: ${existingCurrency} untuk userId=${stockityUserId}`,
+          );
+        }
+      } catch {
+        // Tidak fatal — lanjut dengan default IDR
+      }
+    }
+
     const { error: upsertError } = await this.supabaseService.client
       .from('sessions')
       .upsert({
@@ -334,8 +389,9 @@ export class AuthService {
         device_type:    'web',
         user_agent:     DEFAULT_USER_AGENT,
         user_timezone:  DEFAULT_TIMEZONE,
-        currency:       'IDR',
-        currency_iso:   'IDR',
+        // ✅ FIX CURRENCY: Gunakan currency yang terdeteksi (bukan hardcode IDR).
+        currency:       existingCurrency,
+        currency_iso:   existingCurrencyIso,
         updated_at:     this.supabaseService.now(),
         // ✅ FIX: logged_out_at TIDAK di-include di upsert karena beberapa
         //    versi Supabase client skip null saat conflict update.

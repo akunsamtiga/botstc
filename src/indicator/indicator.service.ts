@@ -18,7 +18,6 @@ import {
 
 const BASE_URL = 'https://api.stockity.id';
 const HISTORICAL_CANDLES_COUNT = 180;
-const PRICE_MONITOR_INTERVAL = 3000;
 const MINUTE_BOUNDARY_OFFSET_MS = 100;
 const CANDLE_INTERVAL_MS = 60000;
 const RESULT_TIMEOUT_MS = 90_000;
@@ -52,7 +51,7 @@ export interface IndicatorAlwaysSignalLossState {
 }
 
 export interface IndicatorConfig {
-  asset: { ric: string; name: string } | null;
+  asset: { ric: string; name: string; profitRate?: number } | null;
   settings: IndicatorSettings;
   martingale: {
     isEnabled: boolean;
@@ -120,10 +119,10 @@ export class IndicatorService implements OnModuleDestroy {
     private readonly authService: AuthService,
   ) {}
 
-  onModuleDestroy() {
-    for (const [userId] of this.activeModes) {
-      this.stopIndicatorMode(userId);
-    }
+  async onModuleDestroy() {
+    // Parallel stop: tunggu semua updateStatus selesai sebelum proses mati.
+    // Old: fire-and-forget loop → Supabase botState tetap RUNNING setelah restart.
+    await Promise.all([...this.activeModes.keys()].map(id => this.stopIndicatorMode(id)));
   }
 
   async getConfig(userId: string): Promise<IndicatorConfig> {
@@ -176,10 +175,18 @@ export class IndicatorService implements OnModuleDestroy {
     const updated = { ...current, ...dto };
     this.configs.set(userId, updated);
 
-    const plainCfg = JSON.parse(JSON.stringify(updated));
-    await this.supabaseService.client.from('indicator_configs').upsert(
-      { user_id: userId, ...plainCfg, updated_at: this.supabaseService.now() },
-    );
+    // Petakan ke nama kolom Supabase secara eksplisit (snake_case).
+    // Old: spread plainCfg → kolom 'isDemoAccount' tidak cocok dengan 'is_demo_account'
+    //      → isDemoAccount tidak pernah tersimpan, selalu revert ke default true setelah restart.
+    await this.supabaseService.client.from('indicator_configs').upsert({
+      user_id:         userId,
+      asset:           updated.asset,
+      settings:        updated.settings,
+      martingale:      updated.martingale,
+      is_demo_account: updated.isDemoAccount,
+      currency:        updated.currency,
+      updated_at:      this.supabaseService.now(),
+    });
 
     return updated;
   }
@@ -464,12 +471,15 @@ export class IndicatorService implements OnModuleDestroy {
           fiveSecondCandles.push(...parsed);
         }
 
-        if (fiveSecondCandles.length >= 8000) break;
+        // Break lebih awal: 2500 5-second candles ≈ 208 menit ≥ 180 candle 1m yang dibutuhkan.
+        // Old: break di 8000 → fetch data 3× lebih banyak dari yang diperlukan.
+        if (fiveSecondCandles.length >= 2500) break;
       } catch (err) {
         this.logger.warn(`Error fetching candles for hour ${hoursBack}: ${err}`);
       }
 
-      await this.sleep(200);
+      // Delay minimal hanya untuk menghindari rate-limit — old 200ms tidak perlu.
+      await this.sleep(50);
     }
 
     if (fiveSecondCandles.length < 2160) {
@@ -507,7 +517,8 @@ export class IndicatorService implements OnModuleDestroy {
     const grouped = new Map<number, Candle[]>();
 
     for (const candle of fiveSecondCandles) {
-      const timeMs = new Date(candle.createdAt).getTime();
+      // Date.parse() lebih cepat daripada new Date(str).getTime() di tight loop (2500+ iter).
+      const timeMs = Date.parse(candle.createdAt);
       const minuteMs = Math.floor(timeMs / CANDLE_INTERVAL_MS) * CANDLE_INTERVAL_MS;
 
       if (!grouped.has(minuteMs)) {
@@ -525,8 +536,10 @@ export class IndicatorService implements OnModuleDestroy {
         oneMinuteCandles.push({
           open: candles[0].open,
           close: candles[candles.length - 1].close,
-          high: Math.max(...candles.map((c) => c.high)),
-          low: Math.min(...candles.map((c) => c.low)),
+          // Math.max/min dengan spread operator bisa stack-overflow pada array besar.
+          // reduce: O(n) tanpa alokasi tambahan.
+          high: candles.reduce((max, c) => c.high > max ? c.high : max, candles[0].high),
+          low:  candles.reduce((min, c) => c.low  < min ? c.low  : min, candles[0].low),
           createdAt: new Date(minuteMs).toISOString(),
         });
       }
@@ -551,9 +564,16 @@ export class IndicatorService implements OnModuleDestroy {
   private calculateSMA(candles: Candle[], period: number): IndicatorAnalysisResult {
     const values: number[] = [];
 
-    for (let i = period - 1; i < candles.length; i++) {
-      const sum = candles.slice(i - period + 1, i + 1).reduce((acc, c) => acc + c.close, 0);
-      values.push(sum / period);
+    // O(n) sliding window: initialise first sum in O(period), then slide in O(1) per step.
+    // Old approach: candles.slice().reduce() inside loop → O(n × period) — up to ~2,300 ops
+    // for 180 candles / period-14. New: ~180 ops total.
+    let windowSum = 0;
+    for (let i = 0; i < period; i++) windowSum += candles[i].close;
+    values.push(windowSum / period);
+
+    for (let i = period; i < candles.length; i++) {
+      windowSum += candles[i].close - candles[i - period].close;
+      values.push(windowSum / period);
     }
 
     const finalValue = values[values.length - 1];
@@ -572,12 +592,20 @@ export class IndicatorService implements OnModuleDestroy {
   }
 
   private calculateEMA(candles: Candle[], period: number): IndicatorAnalysisResult {
+    // Guard: fall back to SMA jika data kurang
+    if (candles.length < period) return this.calculateSMA(candles, period);
+
     const values: number[] = [];
     const multiplier = 2 / (period + 1);
-    let ema = candles[0].close;
 
-    for (const candle of candles) {
-      ema = candle.close * multiplier + ema * (1 - multiplier);
+    // Standard EMA initialisation: seed = SMA of first N candles.
+    // Old: seed = candles[0].close → EMA "dingin" butuh puluhan candle untuk konvergen.
+    // New: SMA seed → konvergen langsung dari candle pertama setelah periode awal.
+    let ema = candles.slice(0, period).reduce((sum, c) => sum + c.close, 0) / period;
+    values.push(ema);
+
+    for (let i = period; i < candles.length; i++) {
+      ema = candles[i].close * multiplier + ema * (1 - multiplier);
       values.push(ema);
     }
 
@@ -614,6 +642,11 @@ export class IndicatorService implements OnModuleDestroy {
 
     let avgGain = gains / period;
     let avgLoss = losses / period;
+
+    // Push RSI untuk candles[period] yang sebelumnya tidak ada —
+    // seeding memakai candles[1..period] tapi tidak menghasilkan satu pun nilai.
+    const initRs = avgLoss > 0 ? avgGain / avgLoss : 100;
+    values.push(100 - 100 / (1 + initRs));
 
     for (let i = period + 1; i < candles.length; i++) {
       const change = candles[i].close - candles[i - 1].close;
@@ -759,22 +792,19 @@ export class IndicatorService implements OnModuleDestroy {
         });
       }
     } else {
+      // SMA/EMA: trend-following — satu prediksi sesuai arah analysis.
+      // BULLISH (harga > MA) → CALL; BEARISH (harga < MA) → PUT.
+      // Old: dua prediksi (put + call) dengan confidence identik → sort non-deterministik
+      // → arah trade random 50% dari waktu (bug kritis untuk semua user SMA/EMA!).
+      const trendDir: 'call' | 'put' = analysis.trend === 'BULLISH' ? 'call' : 'put';
+      const targetPrice = trendDir === 'call'
+        ? currentPrice + baseMovement
+        : currentPrice - baseMovement;
       predictions.push({
         id: uuidv4(),
-        targetPrice: currentPrice + baseMovement,
-        predictionType: 'RESISTANCE_TARGET_1',
-        recommendedTrend: 'put',
-        confidence: finalConfidence,
-        isTriggered: false,
-        triggeredAt: 0,
-        createdAt: Date.now(),
-        isDisabled: false,
-      });
-      predictions.push({
-        id: uuidv4(),
-        targetPrice: currentPrice - baseMovement,
-        predictionType: 'SUPPORT_TARGET_1',
-        recommendedTrend: 'call',
+        targetPrice,
+        predictionType: trendDir === 'call' ? 'SUPPORT_TARGET_1' : 'RESISTANCE_TARGET_1',
+        recommendedTrend: trendDir,
         confidence: finalConfidence,
         isTriggered: false,
         triggeredAt: 0,
@@ -784,73 +814,6 @@ export class IndicatorService implements OnModuleDestroy {
     }
 
     return predictions.sort((a, b) => b.confidence - a.confidence);
-  }
-
-  private startPriceMonitoring(userId: string, config: IndicatorConfig, session: any) {
-    const mode = this.activeModes.get(userId);
-    if (!mode) return;
-
-    if (mode.monitoringInterval) {
-      clearInterval(mode.monitoringInterval);
-    }
-
-    mode.monitoringInterval = setInterval(async () => {
-      if (!mode.isActive) {
-        clearInterval(mode.monitoringInterval!);
-        return;
-      }
-
-      if (mode.isTradeExecuted) return;
-
-      try {
-        const currentPrice = await this.getCurrentPrice(config.asset!.ric, session);
-        if (!currentPrice) return;
-
-        for (const prediction of mode.pricePredictions) {
-          if (prediction.isTriggered || prediction.isDisabled) continue;
-
-          const shouldTrigger = prediction.predictionType.includes('RESISTANCE')
-            ? currentPrice >= prediction.targetPrice
-            : currentPrice <= prediction.targetPrice;
-
-          if (shouldTrigger) {
-            prediction.isTriggered = true;
-            prediction.triggeredAt = Date.now();
-
-            this.logger.log(`[${userId}] Prediction triggered: ${prediction.predictionType} at ${currentPrice}`);
-
-            await this.executeTrade(userId, config, session, prediction);
-            break;
-          }
-        }
-      } catch (err) {
-        this.logger.error(`[${userId}] Error in price monitoring: ${err}`);
-      }
-    }, PRICE_MONITOR_INTERVAL);
-  }
-
-  private async getCurrentPrice(symbol: string, session: any): Promise<number | null> {
-    try {
-      const encodedSymbol = symbol.replace('/', '%2F');
-      const now = new Date();
-      const dateForApi = now.toISOString().slice(0, 13) + ':00:00';
-
-      const headers = this.buildStockityHeaders(session);
-      const response = await curlGet(
-        `${BASE_URL}/candles/v1/${encodedSymbol}/${dateForApi}/5`,
-        headers,
-        5000,
-      );
-
-      if (response?.data?.data?.length > 0) {
-        const lastCandle = response.data.data[response.data.data.length - 1];
-        return parseFloat(lastCandle.close);
-      }
-      return null;
-    } catch (err) {
-      this.logger.error(`Error getting current price: ${err}`);
-      return null;
-    }
   }
 
   private async executeTrade(
@@ -913,23 +876,14 @@ export class IndicatorService implements OnModuleDestroy {
     };
 
     mode.indicatorOrders.push(order);
+    // Cap ukuran indicatorOrders agar getStatus tidak return ribuan entry.
+    if (mode.indicatorOrders.length > 100) mode.indicatorOrders.splice(0, mode.indicatorOrders.length - 100);
+
     mode.activeOrderId = orderId;
     mode.activeOrderTrend = prediction.recommendedTrend;
     mode.activeOrderAmount = amount;
     mode.activeOrderExecutedAt = Date.now();
     mode.totalExecutions++;
-
-    this.writeLog(userId, {
-      id: `${orderId}_s0`,
-      orderId,
-      trend: prediction.recommendedTrend,
-      amount,
-      martingaleStep: 0,
-      executedAt: Date.now(),
-      indicatorType: mode.analysisResult?.indicatorType ?? 'UNKNOWN',
-      cycleNumber: mode.cycleNumber,
-      note: `${prediction.predictionType} triggered`,
-    });
 
     this.logger.log(`[${userId}] Executing trade: ${prediction.recommendedTrend} at ${prediction.targetPrice}`);
 
@@ -937,8 +891,25 @@ export class IndicatorService implements OnModuleDestroy {
       this.buildTradePayload(session, config, amount, prediction.recommendedTrend),
     );
 
+    // Guard: bot bisa di-stop saat menunggu konfirmasi placeTrade (~5s).
+    if (!mode.isActive) return;
+
     if (!tradeResult?.dealId) {
       this.logger.error(`[${userId}] Trade placement failed: ${tradeResult?.error}`);
+      // Catat kegagalan agar log tidak kosong untuk trade ini.
+      this.writeLog(userId, {
+        id: `${orderId}_s0`,
+        orderId,
+        trend: prediction.recommendedTrend,
+        amount,
+        martingaleStep: 0,
+        executedAt: Date.now(),
+        result: 'FAILED',
+        indicatorType: mode.analysisResult?.indicatorType ?? 'UNKNOWN',
+        cycleNumber: mode.cycleNumber,
+        note: `Trade placement failed: ${tradeResult?.error ?? 'unknown'}`,
+        isDemoAccount: config.isDemoAccount,
+      });
       mode.isTradeExecuted = false;
       mode.activeOrderId = null;
       mode.activeDealId = null;
@@ -947,6 +918,22 @@ export class IndicatorService implements OnModuleDestroy {
 
     mode.activeDealId = tradeResult.dealId;
     this.logger.log(`[${userId}] Trade placed: orderId=${orderId} dealId=${tradeResult.dealId}`);
+
+    // Log ditulis SETELAH konfirmasi dealId — tidak ada orphan log jika placeTrade gagal.
+    // Old: writeLog sebelum placeTrade → log tanpa result tersimpan permanen jika trade gagal.
+    this.writeLog(userId, {
+      id: `${orderId}_s0`,
+      orderId,
+      trend: prediction.recommendedTrend,
+      amount,
+      martingaleStep: 0,
+      dealId: tradeResult.dealId,
+      executedAt: Date.now(),
+      indicatorType: mode.analysisResult?.indicatorType ?? 'UNKNOWN',
+      cycleNumber: mode.cycleNumber,
+      note: `${prediction.predictionType} triggered`,
+      isDemoAccount: config.isDemoAccount,
+    });
 
     this.startResultTimeout(userId, orderId, session, config, 0);
   }
@@ -1016,19 +1003,23 @@ export class IndicatorService implements OnModuleDestroy {
 
     const config = await this.getConfig(userId);
     const session = await this.authService.getSession(userId);
-    if (!session) return;
+    // Re-check setelah await — stopIndicatorMode mungkin dipanggil saat getConfig/getSession berjalan.
+    // Old: tanpa guard ini, martingale/log bisa dieksekusi di atas bot yang sudah di-stop.
+    if (!session || !mode.isActive) return;
 
     const result = isWin ? 'WIN' : isDraw ? 'DRAW' : 'LOSE';
     this.logger.log(`[${userId}] Trade result: ${result} (step=${step})`);
 
-    const profitRate = 0.85;
+    // Gunakan profitRate dari config asset (konsisten dengan schedule-executor.ts).
+    // Old: hardcoded 0.85 → salah jika profitRate asset berbeda (e.g. 0.84, 0.92).
+    const profitRate = (config.asset?.profitRate ?? 85) / 100;
     let tradePnL = 0;
     if (isWin) tradePnL = Math.floor(mode.activeOrderAmount * profitRate);
     else if (!isDraw) tradePnL = -mode.activeOrderAmount;
     mode.sessionPnL += tradePnL;
 
     // ── Stop Loss / Stop Profit check ─────────────────────────────────────
-    if (this.checkStopConditions(userId, mode, config)) return;
+    if (await this.checkStopConditions(userId, mode, config)) return;
 
     const resultLogId = `${mode.activeOrderId}_s${step}`;
     this.writeLog(userId, {
@@ -1057,6 +1048,9 @@ export class IndicatorService implements OnModuleDestroy {
         mode.consecutiveWins++;
         mode.consecutiveLosses = 0;
         mode.totalWins++;
+        // Reset restart counter on WIN agar bot tidak berhenti setelah 50 siklus campuran.
+        // Old: consecutiveRestarts tidak pernah di-reset → bot pasti berhenti setelah 50 siklus.
+        mode.consecutiveRestarts = 0;
         // Clear Always Signal loss on WIN
         if (mode.alwaysSignalLossState) {
           this.logger.log(`[${userId}] ✅ Always Signal: Loss cleared (WIN)`);
@@ -1319,11 +1313,20 @@ export class IndicatorService implements OnModuleDestroy {
       mode.pricePredictions = [];
 
       const config = await this.getConfig(userId);
+      // Guard setelah await — stopIndicatorMode bisa dipanggil saat getConfig berjalan.
+      if (!mode.isActive) return;
+
       const session = await this.authService.getSession(userId);
+      if (!mode.isActive) return;
 
       if (session) {
         await this.sleep(500);
+        if (!mode.isActive) return;
         await this.executeIndicatorCycle(userId, config, session);
+      } else {
+        // Old: session null → bot diam (tanpa log/stop) → status Supabase tetap RUNNING selamanya.
+        this.logger.error(`[${userId}] Session expired atau tidak ditemukan — bot dihentikan otomatis`);
+        await this.stopIndicatorMode(userId);
       }
     } else {
       await this.stopIndicatorMode(userId);
@@ -1436,7 +1439,7 @@ export class IndicatorService implements OnModuleDestroy {
    * Menghentikan bot secara otomatis jika ya.
    * @returns true jika bot dihentikan, false jika tidak
    */
-  private checkStopConditions(userId: string, mode: ActiveMode, config: IndicatorConfig): boolean {
+  private async checkStopConditions(userId: string, mode: ActiveMode, config: IndicatorConfig): Promise<boolean> {
     const { stopLoss, stopProfit } = config.martingale;
 
     if (stopLoss && stopLoss > 0 && mode.sessionPnL <= -stopLoss) {
@@ -1453,7 +1456,7 @@ export class IndicatorService implements OnModuleDestroy {
         note: `⛔ Stop Loss triggered: sessionPnL=${mode.sessionPnL} ≤ -${stopLoss}`,
         isDemoAccount: config.isDemoAccount,
       });
-      this.stopIndicatorMode(userId);
+      await this.stopIndicatorMode(userId); // await agar updateStatus selesai
       return true;
     }
 
@@ -1471,7 +1474,7 @@ export class IndicatorService implements OnModuleDestroy {
         note: `🎯 Stop Profit triggered: sessionPnL=${mode.sessionPnL} ≥ ${stopProfit}`,
         isDemoAccount: config.isDemoAccount,
       });
-      this.stopIndicatorMode(userId);
+      await this.stopIndicatorMode(userId); // await agar updateStatus selesai
       return true;
     }
 

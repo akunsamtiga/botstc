@@ -453,18 +453,23 @@ export class OrderTrackingService {
     // Sort by time
     orders.sort((a, b) => a.timeInMillis - b.timeInMillis);
 
-    const summary = {
-      total: orders.length,
-      pending: orders.filter(o => o.trackingStatus === 'PENDING').length,
-      monitoring: orders.filter(o => o.trackingStatus === 'MONITORING').length,
-      martingaleActive: orders.filter(o => o.trackingStatus.startsWith('MARTINGALE_STEP')).length,
-      completed: orders.filter(o => ['WIN', 'LOSE', 'DRAW'].includes(o.trackingStatus)).length,
-      win: orders.filter(o => o.trackingStatus === 'WIN').length,
-      lose: orders.filter(o => o.trackingStatus === 'LOSE').length,
-      draw: orders.filter(o => o.trackingStatus === 'DRAW').length,
-      failed: orders.filter(o => o.trackingStatus === 'FAILED').length,
-      skipped: orders.filter(o => o.trackingStatus === 'SKIPPED').length,
-    };
+    // Single-pass summary — lebih efisien dari 9× .filter() terpisah
+    const summary = orders.reduce(
+      (acc, o) => {
+        acc.total++;
+        const s = o.trackingStatus;
+        if (s === 'PENDING')           { acc.pending++; }
+        else if (s === 'MONITORING')   { acc.monitoring++; }
+        else if (s.startsWith('MARTINGALE_STEP')) { acc.martingaleActive++; }
+        else if (s === 'WIN')          { acc.win++;  acc.completed++; }
+        else if (s === 'LOSE')         { acc.lose++; acc.completed++; }
+        else if (s === 'DRAW')         { acc.draw++; acc.completed++; }
+        else if (s === 'FAILED')       { acc.failed++; }
+        else if (s === 'SKIPPED')      { acc.skipped++; }
+        return acc;
+      },
+      { total: 0, pending: 0, monitoring: 0, martingaleActive: 0, completed: 0, win: 0, lose: 0, draw: 0, failed: 0, skipped: 0 },
+    );
 
     return {
       userId,
@@ -555,24 +560,29 @@ export class OrderTrackingService {
 
   /**
    * Archive tracking data ke history collection.
-   * Flush cache terlebih dahulu sebelum archive.
+   * Gunakan data dari cache sebelum dihapus — tidak perlu fetch ulang dari Supabase
+   * karena data baru saja di-flush oleh flushCache(force=true).
    */
   async archiveTracking(userId: string): Promise<void> {
-    // Flush cache dulu agar data di Firestore up-to-date
+    // Ambil data dari cache SEBELUM di-flush dan dihapus
+    const cachedEntry = this.cache.get(userId);
+    const cachedData  = cachedEntry?.data ?? null;
+
+    // Flush agar Supabase up-to-date
     await this.flushCache(userId, true);
     this.cache.delete(userId);
 
-    const { data: trackData, error: trackError } = await this.supabaseService.client.from('order_tracking').select('*').eq('user_id', userId).single();
-    if (trackError || !trackData) return;
+    // Gunakan data cache yang sudah kita simpan tadi — tidak perlu fetch ulang
+    if (!cachedData) return;
 
-    const archiveData = {
-      ...trackData,
-      archived_at: this.supabaseService.now(),
-    };
     const historyId = `${userId}_${Date.now()}`;
     await this.supabaseService.client
       .from('order_tracking_history')
-      .upsert({ id: historyId, user_id: userId, data: archiveData });
+      .upsert({
+        id: historyId,
+        user_id: userId,
+        data: { ...cachedData, archived_at: this.supabaseService.now() },
+      });
 
     this.logger.log(`[${userId}] Tracking archived to ${historyId}`);
   }

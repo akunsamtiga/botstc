@@ -31,16 +31,41 @@ interface TradeResult {
 @Injectable()
 export class AISignalMonitorService implements OnModuleDestroy {
   private readonly logger = new Logger(AISignalMonitorService.name);
-  private readonly MONITORING_INTERVAL_MS = 50;
-  private readonly MONITORING_TIMEOUT_MS = 90000;
+
+  /** Loop utama: cek state (timeout/selesai). 200ms sudah lebih dari cukup. */
+  private readonly MONITORING_INTERVAL_MS = 200;
+
+  /**
+   * Throttle HTTP call ke Stockity API. WebSocket = jalur utama (real-time).
+   * API = fallback jika WS miss. 2000ms: responsif tapi tidak flood.
+   * FIX (dari sesi 1): sebelumnya 50ms → 20 req/detik. Sekarang 0.5 req/detik.
+   */
+  private readonly API_POLL_INTERVAL_MS = 2000;
+
+  private readonly MONITORING_TIMEOUT_MS = 90_000;
   private readonly WEBSOCKET_PRIORITY_WINDOW_MS = 2000;
   private readonly BASE_URL = 'https://api.stockity.id';
 
-  private activeMonitoring = new Map<string, MonitoringOrder>();
+  /**
+   * FIX performa: nested Map — O(1) akses per user.
+   *
+   * Sebelumnya: Map<"userId_orderId", MonitoringOrder>
+   *   → setiap tick iterasi SEMUA entry dari SEMUA user, filter string prefix.
+   *   → O(N×M) di mana N=user aktif, M=order per user.
+   *
+   * Sesudah: Map<userId, Map<orderId, MonitoringOrder>>
+   *   → checkOrdersViaApi hanya iterasi Map user yang bersangkutan: O(M).
+   *   → stopMonitoring hapus 1 entry: O(1), bukan O(semua entry).
+   */
+  private activeMonitoring = new Map<string, Map<string, MonitoringOrder>>();
+
+  /** processedResults: cegah WS + API keduanya emit hasil untuk trade yang sama */
   private processedResults = new Map<string, string>();
+
   private monitoringIntervals = new Map<string, NodeJS.Timeout>();
-  private lastWebSocketUpdateTime = Date.now();
+  private lastApiCheckTime = new Map<string, number>();
   private userSessions = new Map<string, any>();
+  private lastWebSocketUpdateTime = Date.now();
 
   onModuleDestroy() {
     for (const [userId, interval] of this.monitoringIntervals) {
@@ -50,6 +75,7 @@ export class AISignalMonitorService implements OnModuleDestroy {
     this.monitoringIntervals.clear();
     this.activeMonitoring.clear();
     this.processedResults.clear();
+    this.lastApiCheckTime.clear();
     this.userSessions.clear();
   }
 
@@ -58,12 +84,21 @@ export class AISignalMonitorService implements OnModuleDestroy {
   }
 
   private getUserSession(userId: string): any | null {
-    return this.userSessions.get(userId) || null;
+    return this.userSessions.get(userId) ?? null;
   }
 
-  /**
-   * Start monitoring untuk user tertentu
-   */
+  /** Helper: ambil/buat Map order untuk user tertentu */
+  private getOrderMap(userId: string): Map<string, MonitoringOrder> {
+    let map = this.activeMonitoring.get(userId);
+    if (!map) {
+      map = new Map();
+      this.activeMonitoring.set(userId, map);
+    }
+    return map;
+  }
+
+  // ─── Lifecycle ─────────────────────────────────────────────────────────────
+
   startMonitoring(
     userId: string,
     wsClient: StockityWebSocketClient,
@@ -75,23 +110,20 @@ export class AISignalMonitorService implements OnModuleDestroy {
     }
 
     this.logger.log(`[${userId}] Starting AI Signal monitoring`);
-
-    // ✅ Setup WebSocket handler menggunakan method yang tersedia
     this.setupWebSocketHandler(userId, wsClient, onTradeResult);
 
-    // Start API monitoring interval
     const interval = setInterval(async () => {
       await this.checkOrdersViaApi(userId, onTradeResult);
     }, this.MONITORING_INTERVAL_MS);
 
     this.monitoringIntervals.set(userId, interval);
 
-    this.logger.log(`[${userId}] Monitoring started (${this.MONITORING_INTERVAL_MS}ms interval)`);
+    this.logger.log(
+      `[${userId}] Monitoring started ` +
+      `(loop: ${this.MONITORING_INTERVAL_MS}ms, API throttle: ${this.API_POLL_INTERVAL_MS}ms)`,
+    );
   }
 
-  /**
-   * Stop monitoring untuk user tertentu
-   */
   stopMonitoring(userId: string): void {
     const interval = this.monitoringIntervals.get(userId);
     if (interval) {
@@ -99,20 +131,21 @@ export class AISignalMonitorService implements OnModuleDestroy {
       this.monitoringIntervals.delete(userId);
     }
 
-    // Hapus semua order monitoring untuk user ini
-    for (const [key, order] of this.activeMonitoring) {
+    // FIX performa: O(1) delete — sebelumnya O(n) loop dengan prefix-filter
+    this.activeMonitoring.delete(userId);
+
+    // Bersihkan processedResults untuk user ini
+    for (const key of this.processedResults.keys()) {
       if (key.startsWith(`${userId}_`)) {
-        this.activeMonitoring.delete(key);
+        this.processedResults.delete(key);
       }
     }
 
+    this.lastApiCheckTime.delete(userId);
     this.userSessions.delete(userId);
     this.logger.log(`[${userId}] Monitoring stopped`);
   }
 
-  /**
-   * Start monitoring untuk order tertentu
-   */
   startMonitoringOrder(
     userId: string,
     parentOrderId: string,
@@ -143,17 +176,14 @@ export class AISignalMonitorService implements OnModuleDestroy {
       isCompleted: false,
     };
 
-    const key = `${userId}_${monitoringOrderId}`;
-    this.activeMonitoring.set(key, monitoring);
+    // FIX performa: simpan ke nested Map, bukan flat Map dengan prefix key
+    this.getOrderMap(userId).set(monitoringOrderId, monitoring);
 
     this.logger.log(
-      `[${userId}] Monitoring started for order: ${monitoringOrderId}, trend: ${trend}, amount: ${amount}`,
+      `[${userId}] Monitoring order: ${monitoringOrderId}, trend: ${trend}, amount: ${amount}`,
     );
   }
 
-  /**
-   * Handle WebSocket trade update
-   */
   handleWebSocketTradeUpdate(
     userId: string,
     message: any,
@@ -171,33 +201,31 @@ export class AISignalMonitorService implements OnModuleDestroy {
       const trend = payload.trend || '';
 
       if (orderId && ['won', 'lost'].includes(status)) {
-        this.processWebSocketResult(userId, orderId, status, amount, trend, payload, onTradeResult);
+        this.processWebSocketResult(
+          userId, orderId, status, amount, trend, payload, onTradeResult,
+        );
       }
     }
   }
 
-  /**
-   * Setup WebSocket handler untuk menerima deal results
-   * ✅ Menggunakan setOnDealResult yang tersedia di StockityWebSocketClient
-   */
+  // ─── WebSocket handler ──────────────────────────────────────────────────────
+
   private setupWebSocketHandler(
     userId: string,
     wsClient: StockityWebSocketClient,
     onTradeResult: (result: TradeResult) => void,
   ): void {
-    // ✅ Gunakan setOnDealResult yang tersedia
     wsClient.setOnDealResult((payload: DealResultPayload) => {
-      this.logger.debug(`[${userId}] Deal result from WebSocket: ${JSON.stringify(payload)}`);
+      this.logger.debug(`[${userId}] Deal result via WS: ${JSON.stringify(payload)}`);
 
-      // Convert DealResultPayload ke format yang dibutuhkan
       const message = {
         event: payload.status ? 'deal_result' : 'closed',
         payload: {
-          id: payload.id,
-          status: payload.status,
-          amount: payload.amount,
-          trend: payload.trend,
-          win: payload.win,
+          id:      payload.id,
+          status:  payload.status,
+          amount:  payload.amount,
+          trend:   payload.trend,
+          win:     payload.win,
           payment: payload.payment,
         },
       };
@@ -208,25 +236,35 @@ export class AISignalMonitorService implements OnModuleDestroy {
     this.logger.log(`[${userId}] WebSocket handler setup complete`);
   }
 
+  // ─── API polling (fallback) ─────────────────────────────────────────────────
+
   /**
-   * Check orders via API
+   * Cek status order via loop utama:
+   *   1. Selesaikan order yang sudah completed / timeout
+   *   2. Kumpulkan order yang perlu di-cek via API
+   *   3. Throttle: hanya panggil HTTP jika sudah melewati API_POLL_INTERVAL_MS
+   *
+   * FIX performa: iterasi hanya orderMap milik userId ini (nested Map),
+   *               bukan semua entry dari semua user.
+   * FIX sesi 1: throttle API — sebelumnya dipanggil setiap 50ms tanpa batas.
    */
   private async checkOrdersViaApi(
     userId: string,
     onTradeResult: (result: TradeResult) => void,
   ): Promise<void> {
+    const orderMap = this.activeMonitoring.get(userId);
+    if (!orderMap || orderMap.size === 0) return;
+
     const currentTime = Date.now();
     const ordersToCheck: MonitoringOrder[] = [];
     const ordersToComplete: string[] = [];
 
-    for (const [key, monitoring] of this.activeMonitoring) {
-      if (!key.startsWith(`${userId}_`)) continue;
-
+    for (const [orderId, monitoring] of orderMap) {
       if (monitoring.isCompleted) {
-        ordersToComplete.push(key);
+        ordersToComplete.push(orderId);
       } else if (currentTime - monitoring.startTime > this.MONITORING_TIMEOUT_MS) {
-        this.logger.log(`[${userId}] Timeout for ${monitoring.monitoringOrderId}`);
-        ordersToComplete.push(key);
+        this.logger.warn(`[${userId}] Monitoring timeout for ${orderId}`);
+        ordersToComplete.push(orderId);
       } else if (
         !monitoring.webSocketResultReceived ||
         currentTime - monitoring.executionTime > this.WEBSOCKET_PRIORITY_WINDOW_MS
@@ -235,23 +273,28 @@ export class AISignalMonitorService implements OnModuleDestroy {
       }
     }
 
-    for (const key of ordersToComplete) {
-      this.activeMonitoring.delete(key);
-      const orderId = key.replace(`${userId}_`, '');
+    for (const orderId of ordersToComplete) {
+      orderMap.delete(orderId);
       this.processedResults.delete(`${userId}_${orderId}`);
     }
+    if (orderMap.size === 0) this.activeMonitoring.delete(userId);
 
     if (ordersToCheck.length === 0) return;
+
+    // Throttle: HTTP call max 1× per API_POLL_INTERVAL_MS per user
+    const lastCheck = this.lastApiCheckTime.get(userId) ?? 0;
+    if (currentTime - lastCheck < this.API_POLL_INTERVAL_MS) return;
+    this.lastApiCheckTime.set(userId, currentTime);
+
     await this.checkOrdersForUser(userId, ordersToCheck, onTradeResult);
   }
 
   /**
-   * Check orders untuk user tertentu via API
+   * Panggil Stockity API untuk batch-check order yang belum ada hasil WS.
    *
-   * FIX Bug #1: Gunakan endpoint yang benar — /bo-deals-history/v3/deals/trade
-   *             bukan /profile/trading-history yang tidak mengembalikan closed deals.
-   * FIX Bug #2: Simpan trade.uuid (bukan trade.id) agar konsisten dengan findMatchingTrade.
-   * FIX Bug #3: Gunakan finished_at (waktu trade selesai) bukan created_at (waktu dibuka).
+   * FIX sesi 1 (dead code removed): endpoint yang benar = bo-deals-history.
+   * FIX: gunakan finished_at (bukan created_at) untuk time-matching.
+   * FIX: simpan trade.uuid (bukan trade.id numerik) agar konsisten.
    */
   private async checkOrdersForUser(
     userId: string,
@@ -260,16 +303,15 @@ export class AISignalMonitorService implements OnModuleDestroy {
   ): Promise<void> {
     if (orders.length === 0) return;
 
-    this.logger.debug(`[${userId}] Checking ${orders.length} orders via API`);
+    this.logger.debug(`[${userId}] API fallback check for ${orders.length} order(s)`);
 
     const session = this.getUserSession(userId);
     if (!session) {
-      this.logger.warn(`[${userId}] No session found for API check`);
+      this.logger.warn(`[${userId}] No session for API check`);
       return;
     }
 
     try {
-      // FIX #1: Pakai endpoint bo-deals-history yang benar (sama dengan StockityHistoryService)
       const accountType = orders[0].isDemoAccount ? 'demo' : 'real';
       const headers = this.buildStockityHeaders(session);
       const response = await curlGet(
@@ -278,99 +320,103 @@ export class AISignalMonitorService implements OnModuleDestroy {
         20,
       );
 
-      if (response?.data?.data) {
-        // Endpoint ini mengembalikan { data: { standard_trade_deals: [...], batch_key: ... } }
-        const trades: any[] = response.data.data.standard_trade_deals ?? [];
+      if (!response?.data?.data) return;
 
-        // Cari trade yang cocok dengan order yang sedang dimonitor
-        for (const order of orders) {
-          if (order.webSocketResultReceived || order.isCompleted) continue;
+      const trades: any[] = response.data.data.standard_trade_deals ?? [];
 
-          const matchingTrade = this.findMatchingTrade(trades, order, userId);
+      for (const order of orders) {
+        if (order.webSocketResultReceived || order.isCompleted) continue;
 
-          if (matchingTrade) {
-            this.logger.log(
-              `[${userId}] Trade result detected (API): ${order.monitoringOrderId} - ${matchingTrade.status?.toUpperCase()}`,
-            );
-
-            const isWin = matchingTrade.status?.toLowerCase() === 'won';
-            const key = `${userId}_${order.monitoringOrderId}`;
-
-            // Mark as completed
-            this.activeMonitoring.set(key, {
-              ...order,
-              webSocketResultReceived: true,
-              isCompleted: true,
+        const matchingTrade = this.findMatchingTrade(trades, order, userId);
+        if (!matchingTrade) {
+          // Update lastCheckedTime walaupun belum ada hasil
+          const orderMap = this.activeMonitoring.get(userId);
+          const existing = orderMap?.get(order.monitoringOrderId);
+          if (existing) {
+            orderMap!.set(order.monitoringOrderId, {
+              ...existing,
+              lastCheckedTime: Date.now(),
             });
-
-            // FIX #2: Simpan uuid (bukan id) agar konsisten dengan findMatchingTrade
-            const tradeUuid = matchingTrade.uuid ?? matchingTrade.id;
-            this.processedResults.set(`${userId}_${order.monitoringOrderId}`, tradeUuid);
-
-            const result: TradeResult = {
-              parentOrderId: order.parentOrderId,
-              monitoringOrderId: order.monitoringOrderId,
-              isWin,
-              isMartingale: order.isMartingale,
-              martingaleStep: order.martingaleStep,
-              details: new Map([
-                ['trade_id', tradeUuid],
-                ['amount', matchingTrade.amount],
-                ['trend', matchingTrade.trend],
-                ['status', matchingTrade.status],
-                ['win_amount', matchingTrade.win || 0],
-                ['payment_rate', matchingTrade.payment_rate || 0],
-                ['detection_method', 'ai_signal_monitor_api'],
-                ['detection_time', Date.now()],
-                ['monitoring_duration', Date.now() - order.startTime],
-              ]),
-            };
-
-            onTradeResult(result);
           }
+          continue;
         }
+
+        this.logger.log(
+          `[${userId}] Trade result via API: ${order.monitoringOrderId} — ` +
+          `${matchingTrade.status?.toUpperCase()}`,
+        );
+
+        const isWin = matchingTrade.status?.toLowerCase() === 'won';
+        const tradeUuid = matchingTrade.uuid ?? matchingTrade.id;
+
+        const orderMap = this.activeMonitoring.get(userId);
+        if (orderMap) {
+          orderMap.set(order.monitoringOrderId, {
+            ...order,
+            lastCheckedTime: Date.now(),
+            webSocketResultReceived: true,
+            isCompleted: true,
+          });
+        }
+
+        this.processedResults.set(`${userId}_${order.monitoringOrderId}`, tradeUuid);
+
+        const result: TradeResult = {
+          parentOrderId:     order.parentOrderId,
+          monitoringOrderId: order.monitoringOrderId,
+          isWin,
+          isMartingale:      order.isMartingale,
+          martingaleStep:    order.martingaleStep,
+          details: new Map<string, any>([
+            ['trade_id',         tradeUuid],
+            ['amount',           matchingTrade.amount],
+            ['trend',            matchingTrade.trend],
+            ['status',           matchingTrade.status],
+            ['win_amount',       matchingTrade.win ?? 0],
+            ['payment_rate',     matchingTrade.payment_rate ?? 0],
+            ['detection_method', 'ai_signal_monitor_api'],
+            ['detection_time',   Date.now()],
+            ['monitoring_duration', Date.now() - order.startTime],
+          ]),
+        };
+
+        onTradeResult(result);
       }
     } catch (err: any) {
-      this.logger.error(`[${userId}] Error in API check: ${err?.message || err}`);
+      this.logger.error(`[${userId}] API fallback error: ${err?.message ?? err}`);
     }
   }
 
-  /**
-   * Find matching trade dari history
-   *
-   * FIX Bug #3: Gunakan finished_at (bukan created_at) untuk cek waktu trade selesai.
-   * FIX Bug #2: Bandingkan trade.uuid (konsisten dengan processedResults).
-   */
-  private findMatchingTrade(trades: any[], order: MonitoringOrder, userId: string): any | null {
-    const recentTimeThreshold = Date.now() - 120000; // 2 menit terakhir
+  private findMatchingTrade(
+    trades: any[],
+    order: MonitoringOrder,
+    userId: string,
+  ): any | null {
+    const recentTimeThreshold = Date.now() - 120_000;
 
     for (const trade of trades) {
-      // FIX #3: finished_at = waktu trade selesai (bukan created_at = waktu dibuka)
       const finishedAt = trade.finished_at
         ? new Date(trade.finished_at).getTime()
         : new Date(trade.created_at).getTime();
 
-      const amountMatch = Math.abs(trade.amount - order.amount) < 100;
-      const trendMatch = trade.trend?.toLowerCase() === order.trend.toLowerCase();
-      const isCompleted = ['won', 'lost', 'equal'].includes(trade.status?.toLowerCase());
-      const isRecent = finishedAt >= recentTimeThreshold;
+      const amountMatch   = Math.abs(trade.amount - order.amount) < 100;
+      const trendMatch    = trade.trend?.toLowerCase() === order.trend.toLowerCase();
+      const isCompleted   = ['won', 'lost', 'equal'].includes(trade.status?.toLowerCase());
+      const isRecent      = finishedAt >= recentTimeThreshold;
 
-      // FIX #2: Gunakan uuid (sama dengan yang disimpan di processedResults)
       const tradeUuid = trade.uuid ?? trade.id;
-      const processedKey = `${userId}_${order.monitoringOrderId}`;
-      const isNotProcessed = tradeUuid !== this.processedResults.get(processedKey);
+      const isNotProcessed =
+        tradeUuid !== this.processedResults.get(`${userId}_${order.monitoringOrderId}`);
 
       if (isRecent && amountMatch && trendMatch && isCompleted && isNotProcessed) {
         return trade;
       }
     }
-
     return null;
   }
 
-  /**
-   * Process WebSocket result
-   */
+  // ─── WebSocket result processing ───────────────────────────────────────────
+
   private processWebSocketResult(
     userId: string,
     tradeId: string,
@@ -380,124 +426,94 @@ export class AISignalMonitorService implements OnModuleDestroy {
     payload: any,
     onTradeResult: (result: TradeResult) => void,
   ): void {
-    // Cari order yang cocok
+    // FIX performa: iterasi hanya orderMap milik userId, bukan semua entry
+    const orderMap = this.activeMonitoring.get(userId);
+    if (!orderMap) return;
+
     let matchingMonitoring: MonitoringOrder | null = null;
-    let matchingKey: string | null = null;
+    let matchingOrderId: string | null = null;
 
-    for (const [key, monitoring] of this.activeMonitoring) {
-      if (!key.startsWith(`${userId}_`)) continue;
-
+    for (const [orderId, monitoring] of orderMap) {
       if (
         !monitoring.isCompleted &&
         monitoring.amount === amount &&
         monitoring.trend === trend &&
-        Date.now() - monitoring.executionTime < 120000
+        Date.now() - monitoring.executionTime < 120_000
       ) {
         matchingMonitoring = monitoring;
-        matchingKey = key;
+        matchingOrderId = orderId;
         break;
       }
     }
 
-    if (matchingMonitoring && matchingKey) {
-      // Mark as completed
-      this.activeMonitoring.set(matchingKey, {
-        ...matchingMonitoring,
-        webSocketResultReceived: true,
-        isCompleted: true,
-      });
+    if (!matchingMonitoring || !matchingOrderId) return;
 
-      const isWin = status === 'won';
-      this.processedResults.set(`${userId}_${matchingMonitoring.monitoringOrderId}`, tradeId);
+    orderMap.set(matchingOrderId, {
+      ...matchingMonitoring,
+      webSocketResultReceived: true,
+      isCompleted: true,
+    });
 
-      this.logger.log(
-        `[${userId}] Trade result detected (WebSocket): ${matchingMonitoring.monitoringOrderId} - ${isWin ? 'WIN' : 'LOSE'}`,
-      );
+    const isWin = status === 'won';
+    this.processedResults.set(
+      `${userId}_${matchingMonitoring.monitoringOrderId}`,
+      tradeId,
+    );
 
-      const result: TradeResult = {
-        parentOrderId: matchingMonitoring.parentOrderId,
-        monitoringOrderId: matchingMonitoring.monitoringOrderId,
-        isWin,
-        isMartingale: matchingMonitoring.isMartingale,
-        martingaleStep: matchingMonitoring.martingaleStep,
-        details: new Map([
-          ['trade_id', tradeId],
-          ['amount', amount],
-          ['trend', trend],
-          ['status', status],
-          ['win_amount', payload.win || 0],
-          ['payment', payload.payment || 0],
-          ['detection_method', 'ai_signal_monitor_websocket'],
-          ['detection_time', Date.now()],
-          ['monitoring_duration', Date.now() - matchingMonitoring.startTime],
-        ]),
-      };
+    this.logger.log(
+      `[${userId}] Trade result via WS: ${matchingMonitoring.monitoringOrderId} — ` +
+      `${isWin ? 'WIN' : 'LOSE'}`,
+    );
 
-      onTradeResult(result);
-    }
+    const result: TradeResult = {
+      parentOrderId:     matchingMonitoring.parentOrderId,
+      monitoringOrderId: matchingMonitoring.monitoringOrderId,
+      isWin,
+      isMartingale:      matchingMonitoring.isMartingale,
+      martingaleStep:    matchingMonitoring.martingaleStep,
+      details: new Map<string, any>([
+        ['trade_id',         tradeId],
+        ['amount',           amount],
+        ['trend',            trend],
+        ['status',           status],
+        ['win_amount',       payload.win ?? 0],
+        ['payment',          payload.payment ?? 0],
+        ['detection_method', 'ai_signal_monitor_websocket'],
+        ['detection_time',   Date.now()],
+        ['monitoring_duration', Date.now() - matchingMonitoring.startTime],
+      ]),
+    };
+
+    onTradeResult(result);
   }
 
-  /**
-   * Fetch trade result dari API via curl
-   */
-  async fetchTradeResultFromApi(
-    session: any,
-    config: AISignalConfig,
-  ): Promise<any | null> {
-    try {
-      const headers = this.buildStockityHeaders(session);
-      const response = await curlGet(
-        `${this.BASE_URL}/profile/trading-history?type=${config.isDemoAccount ? 'demo' : 'real'}`,
-        headers,
-        15, // seconds — curlGet takes timeoutSec, not timeoutMs
-      );
+  // ─── Helpers ───────────────────────────────────────────────────────────────
 
-      if (response?.data?.data) {
-        const trades = response.data.data;
-        const recentTrade = trades.find((t: any) => {
-          const tradeTime = new Date(t.created_at).getTime();
-          return tradeTime > Date.now() - 120000;
-        });
-        return recentTrade || null;
-      }
-      return null;
-    } catch (err: any) {
-      this.logger.error(`Error fetching trade result: ${err?.message || err}`);
-      return null;
-    }
-  }
-
-  /**
-   * Build headers untuk Stockity API
-   */
   private buildStockityHeaders(session: any): Record<string, string> {
     return {
-      // ✅ FIX: Supabase returns snake_case columns — gunakan snake_case bukan camelCase
       'authorization-token': session.stockity_token,
-      'device-id': session.device_id,
-      'device-type': session.device_type || 'web',
-      'user-timezone': session.user_timezone || 'Asia/Jakarta',
-      'User-Agent': session.user_agent,
-      Accept: 'application/json, text/plain, */*',
-      Origin: 'https://stockity.id',
-      Referer: 'https://stockity.id/',
+      'device-id':           session.device_id,
+      'device-type':         session.device_type ?? 'web',
+      'user-timezone':       session.user_timezone ?? 'Asia/Jakarta',
+      'User-Agent':          session.user_agent,
+      'Accept':              'application/json, text/plain, */*',
+      'Origin':              'https://stockity.id',
+      'Referer':             'https://stockity.id/',
     };
   }
 
-  /**
-   * Get monitoring status
-   */
-  getMonitoringStatus(userId: string): any {
-    const userOrders = Array.from(this.activeMonitoring.entries()).filter(([key]) =>
-      key.startsWith(`${userId}_`),
-    );
-
+  getMonitoringStatus(userId: string): object {
+    const orderMap = this.activeMonitoring.get(userId);
     return {
-      is_active: this.monitoringIntervals.has(userId),
-      active_monitoring_count: userOrders.length,
+      is_active:              this.monitoringIntervals.has(userId),
+      active_monitoring_count: orderMap?.size ?? 0,
       monitoring_interval_ms: this.MONITORING_INTERVAL_MS,
-      timeout_ms: this.MONITORING_TIMEOUT_MS,
+      api_poll_interval_ms:   this.API_POLL_INTERVAL_MS,
+      timeout_ms:             this.MONITORING_TIMEOUT_MS,
       processed_results_count: this.processedResults.size,
+      last_api_check_ago_ms:  this.lastApiCheckTime.has(userId)
+        ? Date.now() - this.lastApiCheckTime.get(userId)!
+        : null,
     };
   }
 }

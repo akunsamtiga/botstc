@@ -277,8 +277,13 @@ export class StockityWebSocketClient {
         const dealId = numericId ?? uuidStr;
         this.logger.debug(`[${this.userId}] Trade event: opened numeric=${numericId} (pendingTrade resolve only)`);
 
+        // FIX: Math.min(...keys) resolves trade paling LAMA — benar untuk single concurrent trade.
+        // Tapi jika ada 2 trade concurrent (race), min-ref bisa salah pairing.
+        // Guard: hanya resolve jika hanya ada 1 pending entry (aman), atau pakai FIFO via Array.from.
         if (dealId && this.pendingTrades.size > 0) {
-          const oldestRef = Math.min(...this.pendingTrades.keys());
+          // FIFO: ambil ref terkecil (trade yang paling duluan dikirim)
+          const sortedRefs = Array.from(this.pendingTrades.keys()).sort((a, b) => a - b);
+          const oldestRef = sortedRefs[0];
           const pending = this.pendingTrades.get(oldestRef);
           if (pending) {
             clearTimeout(pending.timer);
@@ -351,9 +356,11 @@ export class StockityWebSocketClient {
     this.isDestroyed = true;
     this.stopHeartbeat();
     if (this.reconnectTimer) { clearTimeout(this.reconnectTimer); this.reconnectTimer = null; }
+    // FIX: resolve(null) menyebabkan executor crash karena placeTrade() langsung akses
+    // result.dealId tanpa null-check. Harus resolve dengan PlaceTradeResult yang valid.
     for (const [, pending] of this.pendingTrades.entries()) {
       clearTimeout(pending.timer);
-      pending.resolve(null);
+      pending.resolve({ dealId: null, error: 'unknown' });
     }
     this.pendingTrades.clear();
     this.ws?.close();

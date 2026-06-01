@@ -5,6 +5,7 @@ import {
   Put,
   Body,
   Request,
+  Query,
   UseGuards,
   HttpCode,
   Headers,
@@ -128,6 +129,18 @@ export class AISignalController {
     @Body() body: { trend: string; delayMs?: number },
   ) {
     return this.svc.injectTestSignal(req.user.userId, body.trend, body.delayMs);
+  }
+
+  // ==================== LOGS ====================
+
+  /**
+   * GET /aisignal/logs
+   * Ambil riwayat eksekusi AI Signal dari database.
+   * Query param: limit (default 100)
+   */
+  @Get('logs')
+  async getLogs(@Request() req, @Query('limit') limit?: string) {
+    return this.svc.getLogs(req.user.userId, limit ? parseInt(limit) : 100);
   }
 
   // ==================== STATUS ====================

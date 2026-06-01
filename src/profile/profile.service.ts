@@ -51,19 +51,60 @@ export class ProfileService {
     };
   }
 
+  /**
+   * ✅ FIX CURRENCY: getProfile sekarang pakai dua endpoint secara paralel:
+   *   1. platform/private/v2/profile  → punya field 'currency' + 'country' (confirmed dari HAR)
+   *   2. passport/v1/user_profile     → fallback, tidak punya field currency
+   *
+   * Dari HAR (akun Colombia/COP):
+   *   - passport/v1/user_profile   → TIDAK ada field 'currency', hanya 'country': 'CO'
+   *   - platform/private/v2/profile → ADA 'currency': 'COP', 'country': 'CO'
+   *
+   * Setelah dapat profile, jika currency di session masih 'IDR' tapi profile
+   * menunjukkan currency berbeda → auto-update session di Supabase.
+   */
   async getProfile(userId: string) {
     const session = await this.getSession(userId);
-    try {
-      const resp = await curlGet(
-        `${BASE_URL}/passport/v1/user_profile?locale=id`,
-        this.buildHeaders(session),
-        10, // timeout 10s
-      );
-      return resp.data?.data || resp.data;
-    } catch (err: any) {
-      this.logger.error(`getProfile error: ${err.message}`);
+    const headers = this.buildHeaders(session);
+
+    // ── Fetch kedua endpoint paralel ──────────────────────────────────────
+    const [v2Result, v1Result] = await Promise.allSettled([
+      curlGet(`${BASE_URL}/platform/private/v2/profile?locale=id`, headers, 10),
+      curlGet(`${BASE_URL}/passport/v1/user_profile?locale=id`, headers, 10),
+    ]);
+
+    // Ambil data dari v2 (lebih lengkap), fallback ke v1
+    let profileData: any = null;
+    if (v2Result.status === 'fulfilled') {
+      profileData = v2Result.value?.data?.data || v2Result.value?.data;
+    }
+    if (!profileData && v1Result.status === 'fulfilled') {
+      profileData = v1Result.value?.data?.data || v1Result.value?.data;
+    }
+    if (!profileData) {
+      this.logger.error(`getProfile error: kedua endpoint gagal`);
       throw new Error('Gagal mengambil profil dari Stockity');
     }
+
+    // ── Auto-sync currency ke session jika masih IDR ──────────────────────
+    // platform/private/v2/profile punya field 'currency' (e.g. 'COP').
+    // Jika session masih 'IDR' padahal profil menunjukkan currency lain → update.
+    const profileCurrency: string | undefined = profileData.currency;
+    if (profileCurrency && profileCurrency !== 'IDR' &&
+        (session.currency === 'IDR' || !session.currency)) {
+      this.logger.log(
+        `✅ Auto-sync currency dari profile: ${session.currency ?? 'null'} → ${profileCurrency} ` +
+        `untuk userId=${userId}`,
+      );
+      // Update Supabase & invalidate cache
+      await this.supabaseService.client
+        .from('sessions')
+        .update({ currency: profileCurrency, currency_iso: profileCurrency, updated_at: this.supabaseService.now() })
+        .eq('user_id', userId);
+      this.sessionCache.delete(userId);
+    }
+
+    return profileData;
   }
 
   async getBalance(userId: string) {
@@ -77,11 +118,30 @@ export class ProfileService {
       const data: any[] = resp.data?.data || [];
       const real = data.find((d) => d.account_type === 'real');
       const demo = data.find((d) => d.account_type === 'demo');
+
+      // ✅ FIX CURRENCY: Prioritaskan currency dari bank/v1/read (source of truth dari Stockity).
+      // Dari HAR: bank/v1/read mengembalikan currency: "COP" langsung dari Stockity.
+      // Jangan fallback ke session.currency (mungkin masih 'IDR').
+      const detectedCurrency = real?.currency ?? demo?.currency ?? session.currency ?? 'IDR';
+
+      // Auto-sync ke session jika berbeda
+      if (detectedCurrency !== 'IDR' && detectedCurrency !== session.currency) {
+        this.logger.log(
+          `✅ Auto-sync currency dari balance: ${session.currency} → ${detectedCurrency} ` +
+          `untuk userId=${userId}`,
+        );
+        await this.supabaseService.client
+          .from('sessions')
+          .update({ currency: detectedCurrency, currency_iso: detectedCurrency, updated_at: this.supabaseService.now() })
+          .eq('user_id', userId);
+        this.sessionCache.delete(userId);
+      }
+
       return {
         real_balance: real?.balance ?? 0,
         demo_balance: demo?.balance ?? 0,
         balance: real?.balance ?? 0,
-        currency: real?.currency ?? session.currency ?? 'IDR',
+        currency: detectedCurrency,
       };
     } catch (err: any) {
       this.logger.error(`getBalance error: ${err.message}`);

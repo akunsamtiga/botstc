@@ -72,19 +72,21 @@ export class TodayProfitService {
 
   /**
    * In-memory per-user cache for Stockity API results.
-   * TTL: 25s — avoids hammering Stockity on every /realtime poll.
+   * TTL: 45s — must be LONGER than frontend's 30s polling interval to prevent
+   * cache miss during /realtime calls, which causes flicker to 0.
    * Cache invalidated when day changes or accountType changes.
    */
   private readonly stockityCache = new Map<string, StockityCache>();
-  private readonly STOCKITY_CACHE_TTL_MS = 20_000; // ✅ sedikit diturunkan dari 25s
+  private readonly STOCKITY_CACHE_TTL_MS = 45_000; // ✅ FIX flicker: naikkan dari 20s ke 45s (> 30s frontend polling)
 
   /**
    * In-memory per-user-per-day cache for Supabase mode logs.
-   * TTL: 10s — drastically reduces Supabase reads when frontend polls /realtime.
+   * TTL: 8s — balance between freshness and cache hit rate.
+   * Too short (3s) = frequent cache misses = race conditions = flicker to 0.
    * Each day has separate cache key so day changes auto-miss.
    */
   private readonly supabaseTradesCache = new Map<string, SupabaseTradesCache>();
-  private readonly SUPABASE_CACHE_TTL_MS = 3_000; // ✅ FIX delay: diturunkan dari 10s → 3s agar trade selesai langsung terlihat
+  private readonly SUPABASE_CACHE_TTL_MS = 8_000; // ✅ FIX flicker: naikkan dari 3s ke 8s (kurangi cache misses)
 
   /**
    * In-memory cache for Stockity credentials (sessions/{userId}).
@@ -219,8 +221,11 @@ export class TodayProfitService {
 
   /**
    * Realtime proxy — uses CACHED Stockity data + fresh Supabase data.
-   * This is fast (~200ms) because it skips the slow Stockity API fetch.
-   * Cache is populated/refreshed by getTodayProfit() every 25s or on demand.
+   * This is fast (~200ms) because it skips the slow Stockity API fetch when cache is valid.
+   * 
+   * ✅ FIX flicker: When Stockity cache is expired/missing, fall back to live API fetch
+   * instead of returning empty stockityTrades (which causes totalPnL = 0 flicker).
+   * Cache is populated/refreshed by getTodayProfit() or by this fallback fetch.
    */
   async getRealtimeProfit(
     userId: string,
@@ -232,8 +237,7 @@ export class TodayProfitService {
     const { supabaseTrades, knownUuids, knownNumericIds } =
       await this.collectSupabaseTrades(userId, startOfDay, endOfDay, targetDate, accountType);
 
-    // Use cached Stockity data if available — skip live API call
-    // Validasi cache: tanggal sama DAN accountType kompatibel
+    // Check cached Stockity data validity
     const cached = this.stockityCache.get(userId);
     const cacheAccountTypeOk =
       cached &&
@@ -246,7 +250,13 @@ export class TodayProfitService {
       (Date.now() - cached.fetchedAt) < this.STOCKITY_CACHE_TTL_MS;
 
     let stockityTrades: MergedTrade[] = [];
+    let meta: Omit<DataSourceMeta, 'supabaseTrades' | 'stockityOnlyTrades'> = {
+      stockityCredentialsFound: !!cached,
+      stockityApiError: cached?.hadErrors ?? false,
+    };
+
     if (cacheValid && cached) {
+      // ✅ Cache hit: use cached data (fast path ~200ms)
       this.logger.debug(`[${userId}] /realtime using cached Stockity data (age=${Math.round((Date.now()-cached.fetchedAt)/1000)}s)`);
       for (const deal of cached.deals) {
         // Filter by accountType jika bukan 'both'
@@ -261,20 +271,33 @@ export class TodayProfitService {
           profit: StockityHistoryService.netProfit(deal),
           ric: deal.asset_ric,
           assetName: deal.asset_name,
-          // Gunakan deal_type aktual, bukan hardcode 'real'
           mode: `stockity_${deal.deal_type}`,
           dealUuid: deal.uuid,
           dealNumericId: String(deal.id),
         });
       }
+    } else {
+      // ✅ FIX flicker: Cache miss → fall back to live Stockity API fetch
+      //    (jangan biarkan stockityTrades kosong yang menyebabkan totalPnL = 0)
+      this.logger.log(`[${userId}] /realtime Stockity cache miss — falling back to live API fetch`);
+      const liveResult = await this.collectStockityTrades(
+        userId,
+        accountType,
+        startOfDay,
+        endOfDay,
+        knownUuids,
+        knownNumericIds,
+      );
+      stockityTrades = liveResult.stockityTrades;
+      meta = liveResult.meta;
     }
 
     const allTrades: MergedTrade[] = [...supabaseTrades, ...stockityTrades];
     return this.buildSummary(targetDate, allTrades, {
       supabaseTrades: supabaseTrades.length,
       stockityOnlyTrades: stockityTrades.length,
-      stockityCredentialsFound: !!cached,
-      stockityApiError: cached?.hadErrors ?? false,
+      stockityCredentialsFound: meta.stockityCredentialsFound,
+      stockityApiError: meta.stockityApiError,
     });
   }
 
@@ -284,7 +307,7 @@ export class TodayProfitService {
    * Pull all mode logs from Supabase for the given day,
    * returning normalized MergedTrade entries plus dedup key sets.
    *
-   * OPTIMASI: Gunakan in-memory cache 10s agar polling /realtime tidak menghantam Firestore.
+   * OPTIMASI: Gunakan in-memory cache 8s agar polling /realtime tidak menghantam Supabase.
    */
   private async collectSupabaseTrades(
     userId: string,

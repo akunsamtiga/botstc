@@ -328,7 +328,6 @@ export class AuthService {
     //    Prioritas: (1) Stockity API → (2) session lama → (3) default IDR
     let existingCurrency    = 'IDR';
     let existingCurrencyIso = 'IDR';
-    let existingCountry     = '';
 
     // ── Prioritas 1: Detect dari Stockity langsung (paling akurat) ───────────
     // Dari HAR: platform/private/v2/profile → data.currency = "COP" untuk akun Colombia.
@@ -346,17 +345,7 @@ export class AuthService {
       };
       const { curlGet: curlGetFn } = await import('../common/http-utils');
       const resp = await curlGetFn(`${BASE_URL}/platform/private/v2/profile?locale=id`, headers, 8);
-      const profilePayload = resp?.data?.data ?? resp?.data ?? {};
-      const detectedCurrency: string | undefined = profilePayload.currency;
-      // ✅ FIX LANGUAGE: Ekstrak country dari profil Stockity untuk deteksi bahasa di frontend
-      const detectedCountryRaw: string | undefined =
-        profilePayload.country ?? profilePayload.registration_country_iso ?? profilePayload.registrationCountryIso;
-      if (detectedCountryRaw) {
-        existingCountry = detectedCountryRaw.toUpperCase();
-        this.logger.log(
-          `✅ Country terdeteksi dari Stockity profile: ${existingCountry} untuk userId=${stockityUserId}`,
-        );
-      }
+      const detectedCurrency: string | undefined = resp?.data?.data?.currency;
       if (detectedCurrency) {
         existingCurrency    = detectedCurrency;
         existingCurrencyIso = detectedCurrency; // ISO code — unit/simbol di-resolve frontend
@@ -403,8 +392,6 @@ export class AuthService {
         // ✅ FIX CURRENCY: Gunakan currency yang terdeteksi (bukan hardcode IDR).
         currency:       existingCurrency,
         currency_iso:   existingCurrencyIso,
-        // ✅ FIX LANGUAGE: simpan country agar dashboard/profile bisa deteksi bahasa
-        ...(existingCountry ? { country: existingCountry } : {}),
         updated_at:     this.supabaseService.now(),
         // ✅ FIX: logged_out_at TIDAK di-include di upsert karena beberapa
         //    versi Supabase client skip null saat conflict update.
@@ -460,9 +447,6 @@ export class AuthService {
       userId:      stockityUserId,
       email,
       deviceId,
-      // ✅ FIX LANGUAGE: kirim country ke frontend agar runSplash bisa deteksi bahasa
-      // tanpa perlu extra round-trip ke api.getProfile()
-      country: existingCountry,
     };
   }
 

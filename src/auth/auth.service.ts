@@ -203,10 +203,15 @@ export class AuthService {
     return { status: statusCode, data: parsed };
   }
 
-  // ── PATCH: proxyUrl parameter ditambahkan ─────────────────────────────────
-  // proxyUrl dikirim dari frontend saat user login, berisi URL chisel tunnel
-  // yang sudah running di PC user, contoh: socks5h://127.0.0.1:2001
-  // Jika tidak dikirim → fallback ke LOGIN_PROXY global dari .env
+  // ── v2: Pendekatan A — Backend Auto-Assign Proxy ──────────────────────────
+  // Frontend TIDAK perlu kirim proxyUrl. Backend auto-lookup dari tabel
+  // user_proxy_config di Supabase berdasarkan email user.
+  //
+  // Prioritas proxy:
+  //   (1) proxyUrl dari request body   ← override manual jika dibutuhkan
+  //   (2) user_proxy_config di Supabase ← per-email, dikelola admin
+  //   (3) LOGIN_PROXY dari .env         ← fallback global
+  //   (4) tanpa proxy                   ← pakai IP VPS langsung
   async login(email: string, password: string, proxyUrl?: string) {
     this.logger.log(`Login attempt: ${email}`);
 
@@ -230,9 +235,37 @@ export class AuthService {
       this.logger.warn(`Gagal ambil deviceId lama, pakai baru: ${e}`);
     }
 
-    // ── PATCH: Tentukan proxy yang akan dipakai untuk semua request Stockity ──
-    // Prioritas: (1) proxyUrl dari user → (2) LOGIN_PROXY global → (3) tidak pakai proxy
-    const effectiveProxy = proxyUrl || LOGIN_PROXY || undefined;
+    // ── Pendekatan A: Resolve proxy — auto-lookup dari Supabase ─────────────
+    // (1) Cek request body dulu (override manual oleh admin/frontend)
+    let resolvedProxy: string | undefined = proxyUrl || undefined;
+
+    // (2) Tidak ada di body → auto-lookup dari tabel user_proxy_config
+    if (!resolvedProxy) {
+      try {
+        const { data: proxyCfg } = await this.supabaseService.client
+          .from('user_proxy_config')
+          .select('proxy_url')
+          .eq('email', email)
+          .eq('is_active', true)
+          .maybeSingle();
+
+        if (proxyCfg?.proxy_url) {
+          resolvedProxy = proxyCfg.proxy_url;
+          this.logger.log(
+            `🔍 Proxy auto-assigned dari DB untuk ${email}: ` +
+            `${resolvedProxy.replace(/:\/\/.*@/, '://***@')}`,
+          );
+        }
+      } catch (e: any) {
+        // Tidak fatal — lanjut ke fallback global di bawah
+        this.logger.warn(
+          `⚠️ Gagal lookup user_proxy_config untuk ${email}: ${e?.message ?? e}`,
+        );
+      }
+    }
+
+    // (3) Fallback ke LOGIN_PROXY global → (4) tanpa proxy
+    const effectiveProxy = resolvedProxy || LOGIN_PROXY || undefined;
     if (effectiveProxy) {
       this.logger.log(
         `🔀 Login ${email} via proxy: ${effectiveProxy.replace(/:\/\/.*@/, '://***@')}`,
@@ -413,11 +446,10 @@ export class AuthService {
         // ✅ FIX CURRENCY: Gunakan currency yang terdeteksi (bukan hardcode IDR).
         currency:       existingCurrency,
         currency_iso:   existingCurrencyIso,
-        // ✅ PATCH: Simpan proxy_url per user ke session.
-        // Semua request ke Stockity berikutnya (balance, assets, trading, dll)
-        // akan membaca field ini dan meneruskannya ke curlGet/curlPost.
-        // null jika user tidak pakai proxy (fallback ke IP VPS).
-        proxy_url:      proxyUrl ?? null,
+        // ✅ PATCH A: Simpan resolvedProxy (sudah include hasil lookup DB).
+        // Sebelumnya: proxyUrl ?? null (hanya dari request body).
+        // Sekarang:   resolvedProxy ?? null (request body → DB → null).
+        proxy_url:      resolvedProxy ?? null,
         updated_at:     this.supabaseService.now(),
         // ✅ FIX: logged_out_at TIDAK di-include di upsert karena beberapa
         //    versi Supabase client skip null saat conflict update.

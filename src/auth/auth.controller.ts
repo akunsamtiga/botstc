@@ -13,7 +13,9 @@ export class AuthController {
   @Post('login')
   @HttpCode(200)
   login(@Body() dto: LoginDto) {
-    return this.authService.login(dto.email, dto.password);
+    // Teruskan proxyUrl dari request body ke service.
+    // Jika frontend tidak kirim proxyUrl, nilainya undefined → service fallback ke LOGIN_PROXY global.
+    return this.authService.login(dto.email, dto.password, dto.proxyUrl);
   }
 
   @UseGuards(JwtAuthGuard)

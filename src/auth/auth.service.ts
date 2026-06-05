@@ -449,7 +449,7 @@ export class AuthService {
         // ✅ PATCH A: Simpan resolvedProxy (sudah include hasil lookup DB).
         // Sebelumnya: proxyUrl ?? null (hanya dari request body).
         // Sekarang:   resolvedProxy ?? null (request body → DB → null).
-        proxy_url:      resolvedProxy ?? null,
+        proxy_url: effectiveProxy ?? null,
         updated_at:     this.supabaseService.now(),
         // ✅ FIX: logged_out_at TIDAK di-include di upsert karena beberapa
         //    versi Supabase client skip null saat conflict update.

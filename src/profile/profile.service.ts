@@ -8,6 +8,10 @@ const BASE_URL = 'https://api.stockity.id';
 export class ProfileService {
   private readonly logger = new Logger(ProfileService.name);
 
+  /**
+   * In-memory cache untuk session data agar tidak read Firestore berkali-kali.
+   * TTL: 30 detik — selaras dengan AuthService session cache.
+   */
   private sessionCache = new Map<string, { data: any; expiresAt: number }>();
   private readonly SESSION_CACHE_TTL_MS = 30_000;
 
@@ -48,24 +52,28 @@ export class ProfileService {
   }
 
   /**
-   * ✅ PER-USER PROXY: Baca proxy_url dari session.
-   * Jika user punya proxy sendiri → pakai itu.
-   * Jika tidak → undefined (curl tidak pakai proxy, atau fallback ke env di level OS).
+   * ✅ FIX CURRENCY: getProfile sekarang pakai dua endpoint secara paralel:
+   *   1. platform/private/v2/profile  → punya field 'currency' + 'country' (confirmed dari HAR)
+   *   2. passport/v1/user_profile     → fallback, tidak punya field currency
+   *
+   * Dari HAR (akun Colombia/COP):
+   *   - passport/v1/user_profile   → TIDAK ada field 'currency', hanya 'country': 'CO'
+   *   - platform/private/v2/profile → ADA 'currency': 'COP', 'country': 'CO'
+   *
+   * Setelah dapat profile, jika currency di session masih 'IDR' tapi profile
+   * menunjukkan currency berbeda → auto-update session di Supabase.
    */
-  private getProxy(session: any): string | undefined {
-    return session.proxy_url || undefined;
-  }
-
   async getProfile(userId: string) {
     const session = await this.getSession(userId);
     const headers = this.buildHeaders(session);
-    const proxy   = this.getProxy(session);   // ✅ per-user proxy
 
+    // ── Fetch kedua endpoint paralel ──────────────────────────────────────
     const [v2Result, v1Result] = await Promise.allSettled([
-      curlGet(`${BASE_URL}/platform/private/v2/profile?locale=id`, headers, 10, proxy),
-      curlGet(`${BASE_URL}/passport/v1/user_profile?locale=id`, headers, 10, proxy),
+      curlGet(`${BASE_URL}/platform/private/v2/profile?locale=id`, headers, 10),
+      curlGet(`${BASE_URL}/passport/v1/user_profile?locale=id`, headers, 10),
     ]);
 
+    // Ambil data dari v2 (lebih lengkap), fallback ke v1
     let profileData: any = null;
     if (v2Result.status === 'fulfilled') {
       profileData = v2Result.value?.data?.data || v2Result.value?.data;
@@ -78,6 +86,9 @@ export class ProfileService {
       throw new Error('Gagal mengambil profil dari Stockity');
     }
 
+    // ── Auto-sync currency ke session jika masih IDR ──────────────────────
+    // platform/private/v2/profile punya field 'currency' (e.g. 'COP').
+    // Jika session masih 'IDR' padahal profil menunjukkan currency lain → update.
     const profileCurrency: string | undefined = profileData.currency;
     if (profileCurrency && profileCurrency !== 'IDR' &&
         (session.currency === 'IDR' || !session.currency)) {
@@ -85,6 +96,7 @@ export class ProfileService {
         `✅ Auto-sync currency dari profile: ${session.currency ?? 'null'} → ${profileCurrency} ` +
         `untuk userId=${userId}`,
       );
+      // Update Supabase & invalidate cache
       await this.supabaseService.client
         .from('sessions')
         .update({ currency: profileCurrency, currency_iso: profileCurrency, updated_at: this.supabaseService.now() })
@@ -97,20 +109,22 @@ export class ProfileService {
 
   async getBalance(userId: string) {
     const session = await this.getSession(userId);
-    const proxy   = this.getProxy(session);   // ✅ per-user proxy
     try {
       const resp = await curlGet(
         `${BASE_URL}/bank/v1/read?locale=id`,
         { ...this.buildHeaders(session), 'Cache-Control': 'no-cache' },
-        10,
-        proxy,   // ✅
+        10, // timeout 10s
       );
       const data: any[] = resp.data?.data || [];
       const real = data.find((d) => d.account_type === 'real');
       const demo = data.find((d) => d.account_type === 'demo');
 
+      // ✅ FIX CURRENCY: Prioritaskan currency dari bank/v1/read (source of truth dari Stockity).
+      // Dari HAR: bank/v1/read mengembalikan currency: "COP" langsung dari Stockity.
+      // Jangan fallback ke session.currency (mungkin masih 'IDR').
       const detectedCurrency = real?.currency ?? demo?.currency ?? session.currency ?? 'IDR';
 
+      // Auto-sync ke session jika berbeda
       if (detectedCurrency !== 'IDR' && detectedCurrency !== session.currency) {
         this.logger.log(
           `✅ Auto-sync currency dari balance: ${session.currency} → ${detectedCurrency} ` +
@@ -137,13 +151,11 @@ export class ProfileService {
 
   async getCurrencies(userId: string) {
     const session = await this.getSession(userId);
-    const proxy   = this.getProxy(session);   // ✅ per-user proxy
     try {
       const resp = await curlGet(
         `${BASE_URL}/platform/private/v2/currencies?locale=id`,
         { ...this.buildHeaders(session), 'cache-control': 'no-cache' },
-        10,
-        proxy,   // ✅
+        10, // timeout 10s
       );
       return resp.data?.data || resp.data;
     } catch (err: any) {
@@ -153,13 +165,11 @@ export class ProfileService {
 
   async getAssets(userId: string) {
     const session = await this.getSession(userId);
-    const proxy   = this.getProxy(session);   // ✅ per-user proxy
     try {
       const resp = await curlGet(
         `${BASE_URL}/bo-assets/v6/assets?locale=id`,
         this.buildHeaders(session),
-        15,
-        proxy,   // ✅
+        15, // timeout 15s
       );
       const raw: any[] = resp.data?.data?.assets || [];
       return raw
@@ -185,6 +195,7 @@ export class ProfileService {
   }
 
   async updateCurrency(userId: string, currencyIso: string) {
+    // Invalidate cache agar read berikutnya fresh
     this.sessionCache.delete(userId);
     await this.supabaseService.client
       .from('sessions')

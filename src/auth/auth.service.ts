@@ -16,12 +16,11 @@ const DEFAULT_USER_AGENT =
 const DEFAULT_TIMEZONE = 'Asia/Bangkok';
 
 /**
- * Proxy GLOBAL fallback untuk request login ke Stockity.
- * Dipakai hanya jika user tidak mengirimkan proxyUrl sendiri saat login.
+ * Proxy untuk request login ke Stockity.
  * Isi di .env:
  *   Cara A (SSH SOCKS5) : LOGIN_PROXY=socks5://127.0.0.1:1080
  *   Cara B (Tinyproxy)  : LOGIN_PROXY=http://IP_VPS_BERSIH:8888
- * Kosongkan / hapus untuk tidak pakai proxy global.
+ * Kosongkan / hapus untuk tidak pakai proxy.
  */
 const LOGIN_PROXY = process.env.LOGIN_PROXY ?? '';
 
@@ -169,7 +168,7 @@ export class AuthService {
 
     // Tambahkan --proxy hanya jika proxy diisi
     const proxyArgs: string[] = proxy ? ['--proxy', proxy] : [];
-    if (proxy) this.logger.debug(`curlPost via proxy: ${proxy.replace(/:\/\/.*@/, '://***@')} → ${url}`);
+    if (proxy) this.logger.debug(`curlPost via proxy: ${proxy} → ${url}`);
 
     const { stdout } = await execFileAsync('curl', [
       '-s',
@@ -203,16 +202,7 @@ export class AuthService {
     return { status: statusCode, data: parsed };
   }
 
-  // ── v2: Pendekatan A — Backend Auto-Assign Proxy ──────────────────────────
-  // Frontend TIDAK perlu kirim proxyUrl. Backend auto-lookup dari tabel
-  // user_proxy_config di Supabase berdasarkan email user.
-  //
-  // Prioritas proxy:
-  //   (1) proxyUrl dari request body   ← override manual jika dibutuhkan
-  //   (2) user_proxy_config di Supabase ← per-email, dikelola admin
-  //   (3) LOGIN_PROXY dari .env         ← fallback global
-  //   (4) tanpa proxy                   ← pakai IP VPS langsung
-  async login(email: string, password: string, proxyUrl?: string) {
+  async login(email: string, password: string) {
     this.logger.log(`Login attempt: ${email}`);
 
     // ── FIX: Cek rate limit & cooldown sebelum menyentuh Stockity ────────────
@@ -235,45 +225,6 @@ export class AuthService {
       this.logger.warn(`Gagal ambil deviceId lama, pakai baru: ${e}`);
     }
 
-    // ── Pendekatan A: Resolve proxy — auto-lookup dari Supabase ─────────────
-    // (1) Cek request body dulu (override manual oleh admin/frontend)
-    let resolvedProxy: string | undefined = proxyUrl || undefined;
-
-    // (2) Tidak ada di body → auto-lookup dari tabel user_proxy_config
-    if (!resolvedProxy) {
-      try {
-        const { data: proxyCfg } = await this.supabaseService.client
-          .from('user_proxy_config')
-          .select('proxy_url')
-          .eq('email', email)
-          .eq('is_active', true)
-          .maybeSingle();
-
-        if (proxyCfg?.proxy_url) {
-          resolvedProxy = proxyCfg.proxy_url;
-          this.logger.log(
-            `🔍 Proxy auto-assigned dari DB untuk ${email}: ` +
-            `${resolvedProxy.replace(/:\/\/.*@/, '://***@')}`,
-          );
-        }
-      } catch (e: any) {
-        // Tidak fatal — lanjut ke fallback global di bawah
-        this.logger.warn(
-          `⚠️ Gagal lookup user_proxy_config untuk ${email}: ${e?.message ?? e}`,
-        );
-      }
-    }
-
-    // (3) Fallback ke LOGIN_PROXY global → (4) tanpa proxy
-    const effectiveProxy = resolvedProxy || LOGIN_PROXY || undefined;
-    if (effectiveProxy) {
-      this.logger.log(
-        `🔀 Login ${email} via proxy: ${effectiveProxy.replace(/:\/\/.*@/, '://***@')}`,
-      );
-    } else {
-      this.logger.warn(`⚠️  Login ${email} tanpa proxy — memakai IP VPS langsung`);
-    }
-
     let stockityAuthToken: string;
     let stockityUserId: string;
 
@@ -281,6 +232,7 @@ export class AuthService {
       // Catat waktu attempt tepat sebelum request dikirim
       this.recordLoginAttempt(email);
 
+      // LOGIN_PROXY dari .env digunakan di sini saja — request lain tidak lewat proxy
       const result = await this.curlPost(
         `${BASE_URL}/passport/v2/sign_in?locale=id`,
         { email, password },
@@ -293,7 +245,7 @@ export class AuthService {
           'Origin':        'https://stockity.id',
           'Referer':       'https://stockity.id/',
         },
-        effectiveProxy,   // ← PATCH: per-user proxy
+        LOGIN_PROXY || undefined,
       );
 
       if (result.status >= 400) {
@@ -392,13 +344,7 @@ export class AuthService {
         'Referer':             'https://stockity.id/',
       };
       const { curlGet: curlGetFn } = await import('../common/http-utils');
-      // ← PATCH: pass effectiveProxy agar currency detect juga lewat IP user
-      const resp = await curlGetFn(
-        `${BASE_URL}/platform/private/v2/profile?locale=id`,
-        headers,
-        8,
-        effectiveProxy,
-      );
+      const resp = await curlGetFn(`${BASE_URL}/platform/private/v2/profile?locale=id`, headers, 8);
       const detectedCurrency: string | undefined = resp?.data?.data?.currency;
       if (detectedCurrency) {
         existingCurrency    = detectedCurrency;
@@ -446,10 +392,6 @@ export class AuthService {
         // ✅ FIX CURRENCY: Gunakan currency yang terdeteksi (bukan hardcode IDR).
         currency:       existingCurrency,
         currency_iso:   existingCurrencyIso,
-        // ✅ PATCH A: Simpan resolvedProxy (sudah include hasil lookup DB).
-        // Sebelumnya: proxyUrl ?? null (hanya dari request body).
-        // Sekarang:   resolvedProxy ?? null (request body → DB → null).
-        proxy_url: effectiveProxy ?? null,
         updated_at:     this.supabaseService.now(),
         // ✅ FIX: logged_out_at TIDAK di-include di upsert karena beberapa
         //    versi Supabase client skip null saat conflict update.

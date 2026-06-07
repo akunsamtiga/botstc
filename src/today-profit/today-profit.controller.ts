@@ -58,6 +58,7 @@ export class TodayProfitController {
     @Request() req,
     @Query('startDate') startDate: string,
     @Query('endDate') endDate: string,
+    @Query('accountType') accountType?: 'real' | 'demo' | 'both',
   ) {
     if (!startDate || !endDate) {
       return {
@@ -69,6 +70,7 @@ export class TodayProfitController {
       req.user.userId,
       startDate,
       endDate,
+      accountType ?? 'real',
     );
     return { success: true, data: result };
   }
@@ -98,7 +100,7 @@ export class TodayProfitController {
 
   /**
    * GET /today-profit/by-mode/:mode
-   * Placeholder for mode-specific detailed view.
+   * Get profit summary untuk mode trading tertentu (schedule, fastrade, aisignal, indicator, momentum).
    */
   @Get('by-mode/:mode')
   @HttpCode(200)
@@ -106,10 +108,39 @@ export class TodayProfitController {
     @Request() req,
     @Param('mode') mode: string,
     @Query('date') date?: string,
+    @Query('accountType') accountType?: 'real' | 'demo' | 'both',
   ) {
+    const summary = await this.todayProfitService.getTodayProfit(
+      req.user.userId,
+      date,
+      accountType ?? 'real',
+    );
+    const modeData = summary.byMode[mode] ?? {
+      mode,
+      pnl: 0,
+      trades: 0,
+      wins: 0,
+      losses: 0,
+      draws: 0,
+    };
+    const byAsset: Record<string, any> = {};
+    for (const [ric, asset] of Object.entries(summary.byAsset)) {
+      byAsset[ric] = asset;
+    }
     return {
       success: true,
-      data: { mode, date: date || 'today' },
+      data: {
+        ...summary,
+        byMode: { [mode]: modeData },
+        totalPnL: modeData.pnl,
+        totalTrades: modeData.trades,
+        totalWins: modeData.wins,
+        totalLosses: modeData.losses,
+        totalDraws: modeData.draws,
+        winRate: modeData.trades > 0
+          ? Math.round((modeData.wins / modeData.trades) * 100)
+          : 0,
+      },
     };
   }
 }

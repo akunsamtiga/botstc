@@ -1,6 +1,7 @@
 import { Controller, Get, Put, Body, Request, UseGuards } from '@nestjs/common';
 import { ProfileService } from './profile.service';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
+import { UpdateCurrencyDto } from './dto/update-currency.dto';
 
 @UseGuards(JwtAuthGuard)
 @Controller('profile')
@@ -38,7 +39,7 @@ export class ProfileController {
   }
 
   @Put('currency')
-  updateCurrency(@Request() req, @Body('currencyIso') currencyIso: string) {
-    return this.profileService.updateCurrency(req.user.userId, currencyIso);
+  updateCurrency(@Request() req, @Body() dto: UpdateCurrencyDto) {
+    return this.profileService.updateCurrency(req.user.userId, dto.currencyIso);
   }
 }

@@ -163,6 +163,7 @@ export class TodayProfitService {
     userId: string,
     startDate: string,
     endDate: string,
+    accountType: 'real' | 'demo' | 'both' = 'real',
   ): Promise<TodayProfitSummary[]> {
     const results: TodayProfitSummary[] = [];
     // FIX: Parse dates as WIB (+07:00) agar iterasi hari sesuai tanggal lokal WIB
@@ -204,7 +205,7 @@ export class TodayProfitService {
         await this.collectSupabaseTrades(userId, startOfDay, endOfDay, dateStr);
 
       const { stockityTrades, meta } = await this.collectStockityTrades(
-        userId, 'real', startOfDay, endOfDay, knownUuids, knownNumericIds,
+        userId, accountType, startOfDay, endOfDay, knownUuids, knownNumericIds,
       );
 
       const allTrades: MergedTrade[] = [...dayTrades, ...stockityTrades];

@@ -112,15 +112,15 @@ export class FastradeService implements OnModuleDestroy {
         }
         if (arr.length > 500) arr.splice(0, arr.length - 500);
         this.logs.set(userId, arr);
-        this.appendLogToSupabase(userId, enriched).catch(() => {});
+        this.appendLogToSupabase(userId, enriched).catch(err => this.logger.warn(`[${userId}] appendLogToSupabase failed: ${err?.message}`));
       },
       onStatusChange: (status) => {
         this.logger.debug(`[${userId}] ${status}`);
-        this.updateSupabaseStatus(userId, { lastStatus: status }).catch(() => {});
+        this.updateSupabaseStatus(userId, { lastStatus: status }).catch(err => this.logger.warn(`[${userId}] updateSupabaseStatus failed: ${err?.message}`));
       },
       onStopped: () => {
         this.logger.log(`[${userId}] Fastrade stopped`);
-        this.updateSupabaseStatus(userId, { botState: 'STOPPED' }).catch(() => {});
+        this.updateSupabaseStatus(userId, { botState: 'STOPPED' }).catch(err => this.logger.warn(`[${userId}] updateSupabaseStatus(STOPPED) failed: ${err?.message}`));
         this.cleanup(userId);
       },
     };
@@ -198,6 +198,7 @@ export class FastradeService implements OnModuleDestroy {
       totalLosses: 0,
       activeOrderId: null,
       wsConnected: false,
+      phase: 'IDLE',
     };
   }
 

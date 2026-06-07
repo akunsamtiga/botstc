@@ -72,6 +72,22 @@ export class MomentumController {
     return this.svc.updateConfig(req.user.userId, { asset: body });
   }
 
+  @Put('config/martingale')
+  async setMartingale(@Request() req, @Body() body: {
+    isEnabled?: boolean;
+    maxSteps?: number;
+    baseAmount?: number;
+    multiplierValue?: number;
+    multiplierType?: 'FIXED' | 'PERCENTAGE';
+    isAlwaysSignal?: boolean;
+    stopLoss?: number;
+    stopProfit?: number;
+  }) {
+    const config = await this.svc.getConfig(req.user.userId);
+    const updatedMartingale = { ...config.martingale, ...body };
+    return this.svc.updateConfig(req.user.userId, { martingale: updatedMartingale });
+  }
+
   @Put('config/account')
   async setAccountType(@Request() req, @Body() body: { isDemoAccount: boolean }) {
     return this.svc.updateConfig(req.user.userId, { isDemoAccount: body.isDemoAccount });

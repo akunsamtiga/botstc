@@ -52,6 +52,49 @@ export class ProfileService {
   }
 
   /**
+   * mapProfileData — konversi snake_case Stockity → camelCase yang diexpect frontend.
+   *
+   * Root cause data kosong: Stockity API return snake_case (first_name, email_verified, dst),
+   * tapi frontend baca camelCase (firstName, emailVerified, dst) → semua undefined → tampil "—".
+   *
+   * v2 (platform/private/v2/profile): first_name, last_name, email_verified, phone_verified,
+   *                                   docs_verified, registered_at, country, currency, avatar
+   * v1 (passport/v1/user_profile):    registration_country_iso, personal_data_locked
+   */
+  private mapProfileData(v2Data: any, v1Data: any): Record<string, unknown> {
+    // Gunakan v2 sebagai sumber utama; v1 sebagai suplemen untuk field yang tidak ada di v2
+    const src = v2Data ?? v1Data ?? {};
+    const sup = v2Data ? (v1Data ?? {}) : {};
+
+    return {
+      id:                     src.id,
+      email:                  src.email,
+      firstName:              src.first_name  ?? null,
+      lastName:               src.last_name   ?? null,
+      nickname:               src.nickname    ?? null,
+      phone:                  src.phone       ?? null,
+      gender:                 src.gender      ?? null,
+      country:                src.country     ?? null,
+      birthday:               src.birthday    || null,
+      currency:               src.currency    ?? null,
+      avatar:                 src.avatar      ?? null,
+      emailVerified:          src.email_verified   ?? false,
+      phoneVerified:          src.phone_verified   ?? false,
+      docsVerified:           src.docs_verified    ?? false,
+      registeredAt:           src.registered_at    ?? null,
+      // registration_country_iso hanya ada di v1
+      registrationCountryIso: src.registration_country_iso
+                                ?? sup.registration_country_iso
+                                ?? src.country
+                                ?? null,
+      // personal_data_locked hanya ada di v1
+      personalDataLocked:     src.personal_data_locked
+                                ?? sup.personal_data_locked
+                                ?? false,
+    };
+  }
+
+  /**
    * ✅ FIX CURRENCY: getProfile sekarang pakai dua endpoint secara paralel:
    *   1. platform/private/v2/profile  → punya field 'currency' + 'country' (confirmed dari HAR)
    *   2. passport/v1/user_profile     → fallback, tidak punya field currency
@@ -73,30 +116,28 @@ export class ProfileService {
       curlGet(`${BASE_URL}/passport/v1/user_profile?locale=id`, headers, 10),
     ]);
 
-    // Ambil data dari v2 (lebih lengkap), fallback ke v1
-    let profileData: any = null;
-    if (v2Result.status === 'fulfilled') {
-      profileData = v2Result.value?.data?.data || v2Result.value?.data;
-    }
-    if (!profileData && v1Result.status === 'fulfilled') {
-      profileData = v1Result.value?.data?.data || v1Result.value?.data;
-    }
-    if (!profileData) {
+    // Ambil data mentah dari masing-masing endpoint (keduanya perlu untuk merge)
+    const v2Data: any = v2Result.status === 'fulfilled'
+      ? (v2Result.value?.data?.data ?? v2Result.value?.data ?? null)
+      : null;
+    const v1Data: any = v1Result.status === 'fulfilled'
+      ? (v1Result.value?.data?.data ?? v1Result.value?.data ?? null)
+      : null;
+
+    if (!v2Data && !v1Data) {
       this.logger.error(`getProfile error: kedua endpoint gagal`);
       throw new Error('Gagal mengambil profil dari Stockity');
     }
 
     // ── Auto-sync currency ke session jika masih IDR ──────────────────────
     // platform/private/v2/profile punya field 'currency' (e.g. 'COP').
-    // Jika session masih 'IDR' padahal profil menunjukkan currency lain → update.
-    const profileCurrency: string | undefined = profileData.currency;
+    const profileCurrency: string | undefined = v2Data?.currency;
     if (profileCurrency && profileCurrency !== 'IDR' &&
         (session.currency === 'IDR' || !session.currency)) {
       this.logger.log(
         `✅ Auto-sync currency dari profile: ${session.currency ?? 'null'} → ${profileCurrency} ` +
         `untuk userId=${userId}`,
       );
-      // Update Supabase & invalidate cache
       await this.supabaseService.client
         .from('sessions')
         .update({ currency: profileCurrency, currency_iso: profileCurrency, updated_at: this.supabaseService.now() })
@@ -104,7 +145,9 @@ export class ProfileService {
       this.sessionCache.delete(userId);
     }
 
-    return profileData;
+    // ── Map snake_case → camelCase sebelum return ke frontend ────────────
+    // Stockity API return snake_case; frontend baca camelCase → tanpa ini semua field "—"
+    return this.mapProfileData(v2Data, v1Data);
   }
 
   async getBalance(userId: string) {

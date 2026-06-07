@@ -52,16 +52,54 @@ export class ProfileService {
   }
 
   /**
-   * ✅ FIX CURRENCY: getProfile sekarang pakai dua endpoint secara paralel:
-   *   1. platform/private/v2/profile  → punya field 'currency' + 'country' (confirmed dari HAR)
-   *   2. passport/v1/user_profile     → fallback, tidak punya field currency
+   * Map raw Stockity snake_case profile data → camelCase shape yang diexpect frontend.
    *
-   * Dari HAR (akun Colombia/COP):
-   *   - passport/v1/user_profile   → TIDAK ada field 'currency', hanya 'country': 'CO'
-   *   - platform/private/v2/profile → ADA 'currency': 'COP', 'country': 'CO'
+   * Root cause: Stockity API mengembalikan snake_case (first_name, email_verified, dst).
+   * Backend selama ini return raw data → frontend baca undefined karena key tidak cocok.
    *
-   * Setelah dapat profile, jika currency di session masih 'IDR' tapi profile
-   * menunjukkan currency berbeda → auto-update session di Supabase.
+   * Merge v2 + v1 data:
+   *   - v2 (platform/private/v2/profile) → sumber utama: currency, first_name, email_verified, dll
+   *   - v1 (passport/v1/user_profile)    → suplemen: registration_country_iso, personal_data_locked
+   */
+  private mapProfileData(v2Data: any, v1Data: any): Record<string, unknown> {
+    const src = v2Data ?? v1Data ?? {};
+    const sup = (!v2Data && v1Data) ? {} : (v1Data ?? {}); // supplement dari v1
+
+    return {
+      id:                     src.id,
+      email:                  src.email,
+      firstName:              src.first_name  ?? null,
+      lastName:               src.last_name   ?? null,
+      nickname:               src.nickname    ?? null,
+      phone:                  src.phone       ?? null,
+      gender:                 src.gender      ?? null,
+      country:                src.country     ?? null,
+      birthday:               src.birthday    || null,
+      currency:               src.currency    ?? null,
+      avatar:                 src.avatar      ?? null,
+      emailVerified:          src.email_verified          ?? false,
+      phoneVerified:          src.phone_verified          ?? false,
+      docsVerified:           src.docs_verified           ?? false,
+      registeredAt:           src.registered_at           ?? null,
+      // registration_country_iso hanya ada di v1 — suplemen dari v1 jika tersedia
+      registrationCountryIso: src.registration_country_iso
+                                ?? sup.registration_country_iso
+                                ?? src.country
+                                ?? null,
+      // personal_data_locked hanya ada di v1
+      personalDataLocked:     src.personal_data_locked
+                                ?? sup.personal_data_locked
+                                ?? false,
+    };
+  }
+
+  /**
+   * ✅ FIX CURRENCY + FIX SNAKE_CASE: getProfile sekarang pakai dua endpoint secara paralel:
+   *   1. platform/private/v2/profile  → sumber utama: currency, first_name, email_verified, dll
+   *   2. passport/v1/user_profile     → suplemen: registration_country_iso, personal_data_locked
+   *
+   * Setelah dapat profile, data di-map ke camelCase sebelum dikembalikan ke frontend,
+   * agar frontend bisa baca firstName, emailVerified, dst tanpa undefined.
    */
   async getProfile(userId: string) {
     const session = await this.getSession(userId);
@@ -73,30 +111,27 @@ export class ProfileService {
       curlGet(`${BASE_URL}/passport/v1/user_profile?locale=id`, headers, 10),
     ]);
 
-    // Ambil data dari v2 (lebih lengkap), fallback ke v1
-    let profileData: any = null;
-    if (v2Result.status === 'fulfilled') {
-      profileData = v2Result.value?.data?.data || v2Result.value?.data;
-    }
-    if (!profileData && v1Result.status === 'fulfilled') {
-      profileData = v1Result.value?.data?.data || v1Result.value?.data;
-    }
-    if (!profileData) {
+    // Ambil data mentah dari masing-masing endpoint
+    const v2Data: any = v2Result.status === 'fulfilled'
+      ? (v2Result.value?.data?.data ?? v2Result.value?.data ?? null)
+      : null;
+    const v1Data: any = v1Result.status === 'fulfilled'
+      ? (v1Result.value?.data?.data ?? v1Result.value?.data ?? null)
+      : null;
+
+    if (!v2Data && !v1Data) {
       this.logger.error(`getProfile error: kedua endpoint gagal`);
       throw new Error('Gagal mengambil profil dari Stockity');
     }
 
     // ── Auto-sync currency ke session jika masih IDR ──────────────────────
-    // platform/private/v2/profile punya field 'currency' (e.g. 'COP').
-    // Jika session masih 'IDR' padahal profil menunjukkan currency lain → update.
-    const profileCurrency: string | undefined = profileData.currency;
+    const profileCurrency: string | undefined = v2Data?.currency;
     if (profileCurrency && profileCurrency !== 'IDR' &&
         (session.currency === 'IDR' || !session.currency)) {
       this.logger.log(
         `✅ Auto-sync currency dari profile: ${session.currency ?? 'null'} → ${profileCurrency} ` +
         `untuk userId=${userId}`,
       );
-      // Update Supabase & invalidate cache
       await this.supabaseService.client
         .from('sessions')
         .update({ currency: profileCurrency, currency_iso: profileCurrency, updated_at: this.supabaseService.now() })
@@ -104,7 +139,8 @@ export class ProfileService {
       this.sessionCache.delete(userId);
     }
 
-    return profileData;
+    // ── Map snake_case → camelCase sebelum return ke frontend ────────────
+    return this.mapProfileData(v2Data, v1Data);
   }
 
   async getBalance(userId: string) {

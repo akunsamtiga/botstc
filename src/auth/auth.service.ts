@@ -1,11 +1,8 @@
-import { Injectable, Logger, UnauthorizedException, HttpException, HttpStatus } from '@nestjs/common';
+import { Injectable, Logger, UnauthorizedException, HttpException, HttpStatus, BadRequestException, OnModuleDestroy } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import { SupabaseService } from '../supabase/supabase.service';
 import { execFile } from 'child_process';
-import { promisify } from 'util';
 import { v4 as uuidv4 } from 'uuid';
-
-const execFileAsync = promisify(execFile);
 
 const BASE_URL = 'https://api.stockity.id';
 
@@ -40,8 +37,16 @@ const LOGIN_COOLDOWN_MS = 15_000;
 const RATE_LIMIT_BLOCK_MS = 5 * 60_000;
 
 @Injectable()
-export class AuthService {
+export class AuthService implements OnModuleDestroy {
   private readonly logger = new Logger(AuthService.name);
+
+  /**
+   * Interval pembersih Map in-memory agar tidak bocor memori (H3).
+   * sessionCache/loginCooldown/rateLimitBlockUntil sebelumnya hanya dihapus
+   * pada path sukses — email yang terus gagal (mis. brute-force) menumpuk
+   * selamanya hingga OOM. Cleanup berkala membuang entri yang sudah kedaluwarsa.
+   */
+  private readonly cleanupTimer: NodeJS.Timeout;
 
   /**
    * In-memory session cache untuk mengurangi read Supabase.
@@ -67,7 +72,49 @@ export class AuthService {
   constructor(
     private jwtService: JwtService,
     private supabaseService: SupabaseService,
-  ) {}
+  ) {
+    // Purge entri kedaluwarsa setiap 5 menit. unref() agar timer tidak
+    // menahan proses keluar saat shutdown.
+    this.cleanupTimer = setInterval(() => this.cleanupExpired(), 5 * 60_000);
+    this.cleanupTimer.unref?.();
+  }
+
+  onModuleDestroy() {
+    clearInterval(this.cleanupTimer);
+  }
+
+  /**
+   * Buang entri kedaluwarsa dari semua Map in-memory (H3 — cegah memory leak).
+   */
+  private cleanupExpired() {
+    const now = Date.now();
+    let purged = 0;
+
+    for (const [userId, entry] of this.sessionCache.entries()) {
+      if (now >= entry.expiresAt) { this.sessionCache.delete(userId); purged++; }
+    }
+    for (const [email, ts] of this.loginCooldown.entries()) {
+      if (now - ts >= LOGIN_COOLDOWN_MS) { this.loginCooldown.delete(email); purged++; }
+    }
+    for (const [email, until] of this.rateLimitBlockUntil.entries()) {
+      if (now >= until) { this.rateLimitBlockUntil.delete(email); purged++; }
+    }
+
+    if (purged > 0) {
+      this.logger.debug(`[cleanup] ${purged} entri cache/cooldown kedaluwarsa dibuang`);
+    }
+  }
+
+  /**
+   * Redaksi data sensitif sebelum masuk log (M6): token, UUID, email, password.
+   * Mencegah PII/kredensial bocor ke logs/out.log.
+   */
+  private redact(s: string): string {
+    return s
+      .replace(/("?(?:authtoken|authorization-token|stockity_token|token|password|PK)"?\s*[:=]\s*)"?[^",}\s]+"?/gi, '$1"<REDACTED>"')
+      .replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi, '<UUID>')
+      .replace(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g, '<EMAIL>');
+  }
 
   // ── Cache helpers ─────────────────────────────────────────────────────────
 
@@ -155,36 +202,53 @@ export class AuthService {
   // blocking. Node.js/axios memiliki TLS fingerprint berbeda dari browser/curl,
   // sehingga Cloudflare silently hang koneksinya (ETIMEDOUT, no response).
   // curl dari VPS ini terbukti lolos (HTTP 422 pada test dengan kredensial salah).
+  //
+  // ── Keamanan (H2) ─────────────────────────────────────────────────────────
+  // URL, header, dan body (PASSWORD!) dikirim via config curl lewat STDIN
+  // (`curl -K -`), BUKAN argumen CLI — kredensial tidak bocor ke `ps aux`.
   private async curlPost(
     url: string,
     body: object,
     headers: Record<string, string>,
     proxy?: string,
   ): Promise<{ status: number; data: any }> {
-    const headerArgs: string[] = [];
+    const esc = (v: string) => v.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+    const lines: string[] = [
+      'silent',
+      'show-error',
+      'request = "POST"',
+      `url = "${esc(url)}"`,
+    ];
     for (const [k, v] of Object.entries(headers)) {
-      headerArgs.push('-H', `${k}: ${v}`);
+      lines.push(`header = "${esc(`${k}: ${v}`)}"`);
     }
+    lines.push('header = "Content-Type: application/json"');
+    lines.push(`data-raw = "${esc(JSON.stringify(body))}"`);
+    lines.push('max-time = 15');
+    if (proxy) {
+      lines.push(`proxy = "${esc(proxy)}"`);
+      this.logger.debug(`curlPost via proxy → ${url}`);
+    }
+    lines.push('write-out = "__HTTP_STATUS__%{http_code}"');
+    const config = lines.join('\n') + '\n';
 
-    // Tambahkan --proxy hanya jika proxy diisi
-    const proxyArgs: string[] = proxy ? ['--proxy', proxy] : [];
-    if (proxy) this.logger.debug(`curlPost via proxy: ${proxy} → ${url}`);
+    const stdout = await new Promise<string>((resolve, reject) => {
+      const cp = execFile(
+        'curl',
+        ['-K', '-'],
+        { maxBuffer: 20 * 1024 * 1024, timeout: 20_000 },
+        (err, out) => {
+          if (out) return resolve(out);
+          if (err) return reject(err);
+          resolve(out ?? '');
+        },
+      );
+      cp.stdin?.end(config);
+    });
 
-    const { stdout } = await execFileAsync('curl', [
-      '-s',
-      '-X', 'POST',
-      url,
-      ...headerArgs,
-      '-H', 'Content-Type: application/json',
-      '-d', JSON.stringify(body),
-      '--max-time', '15',
-      ...proxyArgs,
-      '-w', '\n__HTTP_STATUS__%{http_code}',
-    ]);
-
-    const parts      = stdout.split('\n__HTTP_STATUS__');
-    const statusCode = parseInt(parts[1]?.trim() ?? '0', 10);
-    const rawBody    = parts[0].trim();
+    const idx        = stdout.lastIndexOf('__HTTP_STATUS__');
+    const rawBody    = (idx >= 0 ? stdout.slice(0, idx) : stdout).trim();
+    const statusCode = idx >= 0 ? parseInt(stdout.slice(idx + '__HTTP_STATUS__'.length).trim(), 10) : 0;
 
     if (!rawBody || statusCode === 0) {
       const err: any = new Error('');
@@ -252,7 +316,7 @@ export class AuthService {
         const body = result.data;
         this.logger.error(
           `Stockity login error [HTTP ${result.status}]: ` +
-          `${JSON.stringify(body).slice(0, 500)}`,
+          `${this.redact(JSON.stringify(body)).slice(0, 500)}`,
         );
 
         // ── FIX: Handle 429 secara khusus — aktifkan blokir panjang ─────────
@@ -290,7 +354,7 @@ export class AuthService {
       if (!stockityAuthToken) {
         this.logger.error(
           `Token kosong. Response keys: [${Object.keys(d).join(', ')}] | ` +
-          `Body: ${JSON.stringify(d).slice(0, 300)}`,
+          `Body: ${this.redact(JSON.stringify(d)).slice(0, 300)}`,
         );
         throw new UnauthorizedException('Email atau password salah');
       }
@@ -439,6 +503,18 @@ export class AuthService {
     this.rateLimitBlockUntil.delete(email);
     this.loginCooldown.delete(email);
 
+    // ── C2: update last_login whitelist di server (service_role) ──────────────
+    // Menggantikan updateLastLogin() yang dulu dipanggil frontend via anon key
+    // (kini diblokir RLS). Best-effort — kegagalan tidak menggagalkan login.
+    try {
+      await this.supabaseService.client
+        .from('whitelist_users')
+        .update({ last_login: this.supabaseService.now() })
+        .eq('email', email.toLowerCase().trim());
+    } catch (e: any) {
+      this.logger.warn(`Gagal update last_login untuk login ${email}: ${e?.message}`);
+    }
+
     const jwt = this.jwtService.sign({ sub: stockityUserId, email });
     this.logger.log(`✅ Login berhasil: ${email} (userId: ${stockityUserId})`);
 
@@ -448,6 +524,76 @@ export class AuthService {
       email,
       deviceId,
     };
+  }
+
+  /**
+   * Registrasi whitelist tervalidasi token (C2).
+   * Dipakai alur registrasi (manual & webview) yang sebelumnya menulis
+   * whitelist_users langsung dari browser. Token Stockity divalidasi ke
+   * Stockity profile (membuktikan kepemilikan akun) → lalu tulis via service_role.
+   * Idempoten: jika email sudah ada → hanya update last_login.
+   */
+  async registerWhitelistFromToken(
+    authToken: string,
+    deviceId: string,
+    payload: { name?: string; isPrimary?: boolean; addedBy?: string },
+  ): Promise<{ email: string; userId: string; isActive: boolean; exists: boolean }> {
+    if (!authToken) throw new UnauthorizedException('Token Stockity diperlukan');
+
+    let email = '';
+    let userId = '';
+    let fullName = (payload?.name ?? '').trim();
+    try {
+      const { curlGet } = await import('../common/http-utils');
+      const headers = {
+        'device-id':           deviceId || '',
+        'device-type':         'web',
+        'user-timezone':       DEFAULT_TIMEZONE,
+        'authorization-token': authToken,
+        'User-Agent':          DEFAULT_USER_AGENT,
+        'Accept':              'application/json, text/plain, */*',
+        'Origin':              'https://stockity.id',
+        'Referer':             'https://stockity.id/',
+      };
+      const resp = await curlGet(`${BASE_URL}/platform/private/v2/profile?locale=id`, headers, 8);
+      const d = resp?.data?.data ?? {};
+      email  = String(d.email ?? '').toLowerCase().trim();
+      userId = String(d.id ?? '');
+      if (!fullName) fullName = [d.first_name, d.last_name].filter(Boolean).join(' ') || (d.nickname ?? '');
+    } catch (e: any) {
+      this.logger.warn(`registerWhitelist: validasi token gagal: ${e?.message}`);
+      throw new UnauthorizedException('Token Stockity tidak valid');
+    }
+    if (!email || !userId) throw new UnauthorizedException('Gagal memvalidasi akun Stockity');
+
+    const { data: existing } = await this.supabaseService.client
+      .from('whitelist_users')
+      .select('email, is_active')
+      .eq('email', email)
+      .maybeSingle();
+
+    if (existing) {
+      await this.supabaseService.client
+        .from('whitelist_users')
+        .update({ last_login: this.supabaseService.now() })
+        .eq('email', email);
+      return { email, userId, isActive: existing.is_active ?? false, exists: true };
+    }
+
+    const { error } = await this.supabaseService.client.from('whitelist_users').insert({
+      email,
+      is_active:  true,
+      is_primary: payload?.isPrimary ?? false,
+      added_at:   this.supabaseService.now(),
+      added_by:   payload?.addedBy ?? 'system',
+      name:       fullName || null,
+      user_id:    userId,
+      device_id:  deviceId || userId,
+      last_login: this.supabaseService.now(),
+    });
+    if (error) throw new BadRequestException('Gagal mendaftarkan whitelist: ' + error.message);
+
+    return { email, userId, isActive: true, exists: false };
   }
 
   async logout(userId: string) {

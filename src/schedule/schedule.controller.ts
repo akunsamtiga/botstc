@@ -83,7 +83,9 @@ export class ScheduleController {
 
   @Get('logs')
   logs(@Request() req, @Query('limit') limit?: string) {
-    return this.svc.getLogs(req.user.userId, limit ? parseInt(limit) : 100);
+    const parsed = limit ? parseInt(limit, 10) : 100;
+    const safeLimit = Number.isFinite(parsed) ? Math.min(Math.max(parsed, 1), 1000) : 100;
+    return this.svc.getLogs(req.user.userId, safeLimit);
   }
 
   @Post('parse')

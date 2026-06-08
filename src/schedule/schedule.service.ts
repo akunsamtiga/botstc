@@ -183,11 +183,15 @@ export class ScheduleService implements OnModuleInit, OnModuleDestroy {
     const headers = this.buildStockityHeaders(session);
 
     try {
-      const resp = await curlGet(
-        `${BASE_URL}/bo-assets/v6/assets?locale=id`,
-        headers,
-        15,
-      );
+      // FIX (audit): profit rate harus sesuai TIER status user (free/standard/
+      // gold/vip), bukan selalu 'vip'. Ambil status_group dari profil — paralel
+      // dengan assets agar tidak menambah latensi. Fallback 'standard' jika gagal.
+      const [resp, profileResp] = await Promise.all([
+        curlGet(`${BASE_URL}/bo-assets/v6/assets?locale=id`, headers, 15),
+        curlGet(`${BASE_URL}/platform/private/v2/profile?locale=id`, headers, 10).catch(() => null),
+      ]);
+
+      const statusGroup: string = profileResp?.data?.data?.status_group ?? 'standard';
 
       const rawAssets: any[] = resp.data?.data?.assets || [];
       const processed: StockityAsset[] = [];
@@ -214,8 +218,11 @@ export class ScheduleService implements OnModuleInit, OnModuleDestroy {
 
         if (profitRate === null) {
           const settings = asset.trading_tools_settings;
+          const tiers = settings?.ftt?.user_statuses;
+          // Prioritas: tier user yang sebenarnya → fallback vip → bo → root.
           profitRate =
-            settings?.ftt?.user_statuses?.vip?.payment_rate_turbo ??
+            tiers?.[statusGroup]?.payment_rate_turbo ??
+            tiers?.vip?.payment_rate_turbo ??
             settings?.bo?.payment_rate_turbo ??
             settings?.payment_rate_turbo ??
             null;

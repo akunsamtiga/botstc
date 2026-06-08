@@ -6,7 +6,12 @@ dist/
 
 # Environment - JANGAN PERNAH PUSH KE GIT!
 .env
+.env.*
 firebase-service-account.json
+*-service-account.json
+
+# HAR captures — berisi token & kredensial LIVE, jangan pernah commit/deploy
+*.har
 
 # Logs
 logs/

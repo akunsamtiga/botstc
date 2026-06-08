@@ -13,13 +13,12 @@ const DEFAULT_USER_AGENT =
 const DEFAULT_TIMEZONE = 'Asia/Bangkok';
 
 /**
- * Proxy untuk request login ke Stockity.
+ * Proxy untuk request login ke Stockity (dibaca per-request via resolveLoginProxy).
  * Isi di .env:
- *   Cara A (SSH SOCKS5) : LOGIN_PROXY=socks5://127.0.0.1:1080
- *   Cara B (Tinyproxy)  : LOGIN_PROXY=http://IP_VPS_BERSIH:8888
- * Kosongkan / hapus untuk tidak pakai proxy.
+ *   LOGIN_PROXY=socks5h://user:pass@host:port   (proxy residensial ID)
+ *   LOGIN_PROXY_STICKY_RANGE=10001-20000        (opsional → IP sticky per-user)
+ * Kosongkan LOGIN_PROXY untuk tidak pakai proxy.
  */
-const LOGIN_PROXY = process.env.LOGIN_PROXY ?? '';
 
 /**
  * Durasi cooldown antar percobaan login per email (ms).
@@ -197,6 +196,45 @@ export class AuthService implements OnModuleDestroy {
     );
   }
 
+  // ── Proxy login per-user (sticky IP) ──────────────────────────────────────
+  /**
+   * Hash deterministik (FNV-1a 32-bit) untuk memetakan email → port sticky.
+   * Stabil lintas restart/proses, sehingga 1 user selalu dapat IP yang sama.
+   */
+  private stickyHash(s: string): number {
+    let h = 0x811c9dc5;
+    for (let i = 0; i < s.length; i++) {
+      h ^= s.charCodeAt(i);
+      h = Math.imul(h, 0x01000193);
+    }
+    return h >>> 0;
+  }
+
+  /**
+   * Tentukan proxy untuk login user ini.
+   * - Env dibaca SAAT REQUEST (bukan module-load) agar `pm2 reload` langsung terpakai.
+   * - LOGIN_PROXY kosong  → tanpa proxy (undefined).
+   * - LOGIN_PROXY_STICKY_RANGE="10001-20000" → port di-replace per-email
+   *   (tiap user = port tetap = IP residensial sticky sendiri).
+   * - Tanpa range → pakai LOGIN_PROXY apa adanya (port rotating dari provider).
+   */
+  private resolveLoginProxy(email: string): string | undefined {
+    const base = (process.env.LOGIN_PROXY ?? '').trim();
+    if (!base) return undefined;
+
+    const range = (process.env.LOGIN_PROXY_STICKY_RANGE ?? '').trim();
+    const m = range.match(/^(\d+)\s*-\s*(\d+)$/);
+    if (!m) return base;
+
+    const start = parseInt(m[1], 10);
+    const end = parseInt(m[2], 10);
+    if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) return base;
+
+    const port = start + (this.stickyHash(email.toLowerCase().trim()) % (end - start + 1));
+    // Ganti port di akhir URL (scheme://[user:pass@]host:PORT) → port sticky per-user.
+    return /:\d+$/.test(base) ? base.replace(/:\d+$/, `:${port}`) : `${base}:${port}`;
+  }
+
   // ── curlPost ──────────────────────────────────────────────────────────────
   // Gunakan curl binary (bukan axios) untuk bypass Cloudflare JA3/JA4 fingerprint
   // blocking. Node.js/axios memiliki TLS fingerprint berbeda dari browser/curl,
@@ -296,7 +334,8 @@ export class AuthService implements OnModuleDestroy {
       // Catat waktu attempt tepat sebelum request dikirim
       this.recordLoginAttempt(email);
 
-      // LOGIN_PROXY dari .env digunakan di sini saja — request lain tidak lewat proxy
+      // Proxy login per-user (sticky IP). Hanya request login yang lewat proxy.
+      const loginProxy = this.resolveLoginProxy(email);
       const result = await this.curlPost(
         `${BASE_URL}/passport/v2/sign_in?locale=id`,
         { email, password },
@@ -309,7 +348,7 @@ export class AuthService implements OnModuleDestroy {
           'Origin':        'https://stockity.id',
           'Referer':       'https://stockity.id/',
         },
-        LOGIN_PROXY || undefined,
+        loginProxy,
       );
 
       if (result.status >= 400) {

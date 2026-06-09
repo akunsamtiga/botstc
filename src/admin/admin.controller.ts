@@ -135,18 +135,28 @@ export class AdminController {
     return this.svc.upsertConfig(body.key, body.value);
   }
 
-  // ── Chat antar admin/super-admin (semua admin boleh) ───────────────────────
+  // ── Chat DM antar admin/super-admin ────────────────────────────────────────
+  /** Daftar kontak: super→semua admin, admin→super-admin saja. */
+  @UseGuards(AdminGuard)
+  @Get('chat/contacts')
+  async chatContacts(@Request() req) {
+    const { isSuperAdmin } = await this.svc.getMe(req.user.email);
+    return this.svc.listChatContacts({ email: req.user.email, isSuper: isSuperAdmin });
+  }
+
+  /** Pesan dalam percakapan dengan ?with=<email> (&after=<id> untuk polling). */
   @UseGuards(AdminGuard)
   @Get('chat')
-  listChat(@Query('after') after?: string) {
-    return this.svc.listChat(after ? parseInt(after, 10) || 0 : 0);
+  chatConversation(@Request() req, @Query('with') withEmail: string, @Query('after') after?: string) {
+    return this.svc.getConversation(req.user.email, withEmail ?? '', after ? parseInt(after, 10) || 0 : 0);
   }
 
   @UseGuards(AdminGuard)
   @Post('chat')
   @HttpCode(200)
-  sendChat(@Request() req, @Body() body: { content: string }) {
-    return this.svc.sendChat(req.user.email, body.content);
+  async sendChat(@Request() req, @Body() body: { to: string; content: string }) {
+    const { isSuperAdmin } = await this.svc.getMe(req.user.email);
+    return this.svc.sendDm({ email: req.user.email, isSuper: isSuperAdmin }, body.to, body.content);
   }
 
   @UseGuards(AdminGuard)
@@ -155,5 +165,13 @@ export class AdminController {
   async deleteChat(@Request() req, @Param('id') id: string) {
     const { isSuperAdmin } = await this.svc.getMe(req.user.email);
     return this.svc.deleteChat(parseInt(id, 10), { email: req.user.email, isSuper: isSuperAdmin });
+  }
+
+  // ── Masa aktif admin (super-admin only) ────────────────────────────────────
+  @UseGuards(SuperAdminGuard)
+  @Post('period')
+  @HttpCode(200)
+  setPeriod(@Body() body: { email: string; days: number }) {
+    return this.svc.setUserPeriod(body.email, Number(body.days) || 0);
   }
 }

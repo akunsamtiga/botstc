@@ -542,6 +542,28 @@ export class AuthService implements OnModuleDestroy {
     this.rateLimitBlockUntil.delete(email);
     this.loginCooldown.delete(email);
 
+    // ── Masa aktif: tolak login jika expires_at sudah lewat (+ nonaktifkan) ───
+    try {
+      const emailLc = email.toLowerCase().trim();
+      const { data: wl } = await this.supabaseService.client
+        .from('whitelist_users')
+        .select('expires_at')
+        .eq('email', emailLc)
+        .maybeSingle();
+      if (wl?.expires_at && new Date(wl.expires_at).getTime() < Date.now()) {
+        await this.supabaseService.client
+          .from('whitelist_users')
+          .update({ is_active: false })
+          .eq('email', emailLc);
+        throw new UnauthorizedException(
+          'Masa aktif akun Anda telah habis. Silakan hubungi super-admin untuk perpanjangan.',
+        );
+      }
+    } catch (e: any) {
+      if (e instanceof UnauthorizedException) throw e;
+      // error non-fatal lain: abaikan, jangan blokir login
+    }
+
     // ── C2: update last_login whitelist di server (service_role) ──────────────
     // Menggantikan updateLastLogin() yang dulu dipanggil frontend via anon key
     // (kini diblokir RLS). Best-effort — kegagalan tidak menggagalkan login.

@@ -1,4 +1,5 @@
 import { Injectable, Logger, BadRequestException, ForbiddenException, NotFoundException } from '@nestjs/common';
+import { Cron, CronExpression } from '@nestjs/schedule';
 import { SupabaseService } from '../supabase/supabase.service';
 
 /** Konteks pemanggil untuk enforcement kepemilikan. */
@@ -196,7 +197,19 @@ export class AdminService {
   async listAdmins(): Promise<any[]> {
     const { data, error } = await this.db.from('admin_users').select('*').order('created_at', { ascending: false });
     if (error) throw new BadRequestException('Gagal memuat admin: ' + error.message);
-    return data ?? [];
+    const admins = data ?? [];
+    // Gabungkan masa aktif (expires_at) + status whitelist per admin
+    const emails = admins.map((a: any) => (a.email || '').toLowerCase());
+    if (emails.length) {
+      const { data: wl } = await this.db.from('whitelist_users')
+        .select('email, expires_at, is_active').in('email', emails);
+      const map = new Map((wl ?? []).map((w: any) => [(w.email || '').toLowerCase(), w]));
+      return admins.map((a: any) => {
+        const w = map.get((a.email || '').toLowerCase());
+        return { ...a, expires_at: w?.expires_at ?? null, whitelist_active: w?.is_active ?? null };
+      });
+    }
+    return admins;
   }
 
   /**
@@ -289,39 +302,75 @@ export class AdminService {
     if (error) throw new BadRequestException('Gagal mengupdate config: ' + error.message);
   }
 
-  // ── Admin chat (antar admin/super-admin) ───────────────────────────────────────
+  // ── Admin chat — Direct Message (1-on-1) ───────────────────────────────────────
+  private convoKey(a: string, b: string): string {
+    return [a.toLowerCase().trim(), b.toLowerCase().trim()].sort().join('|');
+  }
+
   /**
-   * Daftar pesan. afterId>0 → pesan baru setelah id itu (untuk polling, urut naik).
-   * afterId=0 → ambil `limit` pesan terbaru (lalu dibalik jadi urut naik).
+   * Daftar kontak yang boleh diajak chat:
+   * - super-admin → SEMUA admin (kecuali dirinya).
+   * - admin biasa → hanya super-admin.
    */
-  async listChat(afterId = 0, limit = 50): Promise<any[]> {
+  async listChatContacts(requester: RequesterCtx): Promise<any[]> {
+    const me = requester.email.toLowerCase().trim();
+    if (requester.isSuper) {
+      const { data, error } = await this.db.from('admin_users')
+        .select('email, name, role, is_active').neq('email', me).order('name', { ascending: true });
+      if (error) throw new BadRequestException('Gagal memuat kontak: ' + error.message);
+      return data ?? [];
+    }
+    // admin biasa → super-admin saja (ambil nama dari admin_users role super_admin)
+    const { data, error } = await this.db.from('admin_users')
+      .select('email, name, role, is_active').eq('role', 'super_admin').neq('email', me).order('name', { ascending: true });
+    if (error) throw new BadRequestException('Gagal memuat kontak: ' + error.message);
+    return data ?? [];
+  }
+
+  /** Validasi: apakah `requester` boleh chat dengan `target`? */
+  private async assertCanChat(requester: RequesterCtx, target: string): Promise<void> {
+    const t = target.toLowerCase().trim();
+    if (!t || t === requester.email.toLowerCase().trim()) throw new BadRequestException('Tujuan tidak valid');
+    if (requester.isSuper) {
+      const { data } = await this.db.from('admin_users').select('email').eq('email', t).maybeSingle();
+      if (!data) throw new ForbiddenException('Tujuan bukan admin');
+    } else {
+      const { data } = await this.db.from('super_admins').select('email').eq('email', t).maybeSingle();
+      if (!data) throw new ForbiddenException('Admin biasa hanya bisa chat super-admin');
+    }
+  }
+
+  /** Pesan dalam satu percakapan (me ↔ withEmail). afterId>0 = incremental (polling). */
+  async getConversation(me: string, withEmail: string, afterId = 0, limit = 50): Promise<any[]> {
+    const key = this.convoKey(me, withEmail);
     const lim = Math.min(Math.max(limit, 1), 100);
     if (afterId > 0) {
-      const { data, error } = await this.db
-        .from('admin_chat').select('*')
-        .gt('id', afterId).order('id', { ascending: true }).limit(lim);
+      const { data, error } = await this.db.from('admin_chat').select('*')
+        .eq('conversation_key', key).gt('id', afterId).order('id', { ascending: true }).limit(lim);
       if (error) throw new BadRequestException('Gagal memuat chat: ' + error.message);
       return data ?? [];
     }
-    const { data, error } = await this.db
-      .from('admin_chat').select('*')
-      .order('id', { ascending: false }).limit(lim);
+    const { data, error } = await this.db.from('admin_chat').select('*')
+      .eq('conversation_key', key).order('id', { ascending: false }).limit(lim);
     if (error) throw new BadRequestException('Gagal memuat chat: ' + error.message);
     return (data ?? []).reverse();
   }
 
-  async sendChat(email: string, content: string): Promise<any> {
+  async sendDm(requester: RequesterCtx, to: string, content: string): Promise<any> {
     const text = (content ?? '').trim();
     if (!text) throw new BadRequestException('Pesan kosong');
     if (text.length > 2000) throw new BadRequestException('Pesan terlalu panjang (maks 2000 karakter)');
+    await this.assertCanChat(requester, to);
 
-    const e = email.toLowerCase().trim();
-    const { data: adm } = await this.db.from('admin_users').select('name').eq('email', e).maybeSingle();
-    const name = adm?.name || e.split('@')[0];
+    const me = requester.email.toLowerCase().trim();
+    const recipient = to.toLowerCase().trim();
+    const { data: adm } = await this.db.from('admin_users').select('name').eq('email', me).maybeSingle();
+    const name = adm?.name || me.split('@')[0];
 
-    const { data, error } = await this.db.from('admin_chat')
-      .insert({ sender_email: e, sender_name: name, content: text })
-      .select().single();
+    const { data, error } = await this.db.from('admin_chat').insert({
+      sender_email: me, sender_name: name, recipient_email: recipient,
+      conversation_key: this.convoKey(me, recipient), content: text,
+    }).select().single();
     if (error) throw new BadRequestException('Gagal mengirim pesan: ' + error.message);
     return data;
   }
@@ -338,5 +387,50 @@ export class AdminService {
     }
     const { error } = await this.db.from('admin_chat').delete().eq('id', id);
     if (error) throw new BadRequestException('Gagal menghapus pesan: ' + error.message);
+  }
+
+  // ── Masa aktif (expiry) ─────────────────────────────────────────────────────────
+  /**
+   * Super-admin set masa aktif user (dalam hari). days<=0 → permanen (hapus expiry).
+   * Sekaligus mengaktifkan kembali (is_active=true).
+   */
+  async setUserPeriod(email: string, days: number): Promise<{ email: string; expires_at: string | null }> {
+    const e = email.toLowerCase().trim();
+    if (!e) throw new BadRequestException('Email kosong');
+    const expires_at = days && days > 0
+      ? new Date(Date.now() + days * 86_400_000).toISOString()
+      : null;
+
+    const { data: exist } = await this.db.from('whitelist_users').select('id').eq('email', e).maybeSingle();
+    if (!exist) {
+      const { error } = await this.db.from('whitelist_users').insert({
+        email: e, is_active: true, is_primary: false,
+        added_at: new Date().toISOString(), added_by: 'admin-auto', expires_at,
+      });
+      if (error) throw new BadRequestException('Gagal set masa aktif: ' + error.message);
+    } else {
+      const { error } = await this.db.from('whitelist_users')
+        .update({ expires_at, is_active: true }).eq('email', e);
+      if (error) throw new BadRequestException('Gagal set masa aktif: ' + error.message);
+    }
+    return { email: e, expires_at };
+  }
+
+  /** Nonaktifkan akun yang masa aktifnya sudah lewat (expires_at < now & masih aktif). */
+  async deactivateExpired(): Promise<number> {
+    const { data, error } = await this.db.from('whitelist_users')
+      .update({ is_active: false })
+      .lt('expires_at', new Date().toISOString())
+      .eq('is_active', true)
+      .select('email');
+    if (error) { this.logger.warn('deactivateExpired gagal: ' + error.message); return 0; }
+    const n = (data ?? []).length;
+    if (n) this.logger.log(`⏳ ${n} akun nonaktif (masa aktif habis): ${(data ?? []).map((r: any) => r.email).join(', ')}`);
+    return n;
+  }
+
+  @Cron(CronExpression.EVERY_30_MINUTES)
+  async cronDeactivateExpired() {
+    await this.deactivateExpired();
   }
 }

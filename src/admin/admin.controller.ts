@@ -174,4 +174,42 @@ export class AdminController {
   setPeriod(@Body() body: { email: string; days: number }) {
     return this.svc.setUserPeriod(body.email, Number(body.days) || 0);
   }
+
+  // ── Standing & reaktivasi ──────────────────────────────────────────────────
+  /** Standing admin saat ini (masa aktif, jumlah user, biaya, request pending). */
+  @UseGuards(AdminGuard)
+  @Get('standing')
+  standing(@Request() req) {
+    return this.svc.getMyStanding(req.user.email);
+  }
+
+  /** Admin biasa mengajukan reaktivasi (paket 7/14/30 hari). */
+  @UseGuards(AdminGuard)
+  @Post('reactivation/request')
+  @HttpCode(200)
+  requestReactivation(@Request() req, @Body() body: { days: number }) {
+    return this.svc.requestReactivation(req.user.email, Number(body.days) || 0);
+  }
+
+  /** Super-admin: daftar permintaan reaktivasi. */
+  @UseGuards(SuperAdminGuard)
+  @Get('reactivation/requests')
+  listReactivation() {
+    return this.svc.listReactivationRequests();
+  }
+
+  /** Super-admin ACCEPT (setelah dibayar via DM). */
+  @UseGuards(SuperAdminGuard)
+  @Post('reactivation/approve')
+  @HttpCode(200)
+  approveReactivation(@Request() req, @Body() body: { id: number }) {
+    return this.svc.approveReactivation(Number(body.id), req.user.email);
+  }
+
+  @UseGuards(SuperAdminGuard)
+  @Post('reactivation/reject')
+  @HttpCode(200)
+  rejectReactivation(@Request() req, @Body() body: { id: number }) {
+    return this.svc.rejectReactivation(Number(body.id), req.user.email);
+  }
 }

@@ -268,4 +268,55 @@ export class AdminService {
     );
     if (error) throw new BadRequestException('Gagal mengupdate config: ' + error.message);
   }
+
+  // ── Admin chat (antar admin/super-admin) ───────────────────────────────────────
+  /**
+   * Daftar pesan. afterId>0 → pesan baru setelah id itu (untuk polling, urut naik).
+   * afterId=0 → ambil `limit` pesan terbaru (lalu dibalik jadi urut naik).
+   */
+  async listChat(afterId = 0, limit = 50): Promise<any[]> {
+    const lim = Math.min(Math.max(limit, 1), 100);
+    if (afterId > 0) {
+      const { data, error } = await this.db
+        .from('admin_chat').select('*')
+        .gt('id', afterId).order('id', { ascending: true }).limit(lim);
+      if (error) throw new BadRequestException('Gagal memuat chat: ' + error.message);
+      return data ?? [];
+    }
+    const { data, error } = await this.db
+      .from('admin_chat').select('*')
+      .order('id', { ascending: false }).limit(lim);
+    if (error) throw new BadRequestException('Gagal memuat chat: ' + error.message);
+    return (data ?? []).reverse();
+  }
+
+  async sendChat(email: string, content: string): Promise<any> {
+    const text = (content ?? '').trim();
+    if (!text) throw new BadRequestException('Pesan kosong');
+    if (text.length > 2000) throw new BadRequestException('Pesan terlalu panjang (maks 2000 karakter)');
+
+    const e = email.toLowerCase().trim();
+    const { data: adm } = await this.db.from('admin_users').select('name').eq('email', e).maybeSingle();
+    const name = adm?.name || e.split('@')[0];
+
+    const { data, error } = await this.db.from('admin_chat')
+      .insert({ sender_email: e, sender_name: name, content: text })
+      .select().single();
+    if (error) throw new BadRequestException('Gagal mengirim pesan: ' + error.message);
+    return data;
+  }
+
+  /** Hapus pesan — hanya pengirim sendiri atau super-admin. */
+  async deleteChat(id: number, requester: RequesterCtx): Promise<void> {
+    if (!Number.isFinite(id)) throw new BadRequestException('ID tidak valid');
+    if (!requester.isSuper) {
+      const { data } = await this.db.from('admin_chat').select('sender_email').eq('id', id).maybeSingle();
+      if (!data) throw new NotFoundException('Pesan tidak ditemukan');
+      if ((data.sender_email ?? '').toLowerCase().trim() !== requester.email.toLowerCase().trim()) {
+        throw new ForbiddenException('Hanya bisa menghapus pesan sendiri');
+      }
+    }
+    const { error } = await this.db.from('admin_chat').delete().eq('id', id);
+    if (error) throw new BadRequestException('Gagal menghapus pesan: ' + error.message);
+  }
 }

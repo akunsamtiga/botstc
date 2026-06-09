@@ -134,4 +134,26 @@ export class AdminController {
   upsertConfig(@Body() body: { key: string; value: unknown }) {
     return this.svc.upsertConfig(body.key, body.value);
   }
+
+  // ── Chat antar admin/super-admin (semua admin boleh) ───────────────────────
+  @UseGuards(AdminGuard)
+  @Get('chat')
+  listChat(@Query('after') after?: string) {
+    return this.svc.listChat(after ? parseInt(after, 10) || 0 : 0);
+  }
+
+  @UseGuards(AdminGuard)
+  @Post('chat')
+  @HttpCode(200)
+  sendChat(@Request() req, @Body() body: { content: string }) {
+    return this.svc.sendChat(req.user.email, body.content);
+  }
+
+  @UseGuards(AdminGuard)
+  @Delete('chat/:id')
+  @HttpCode(200)
+  async deleteChat(@Request() req, @Param('id') id: string) {
+    const { isSuperAdmin } = await this.svc.getMe(req.user.email);
+    return this.svc.deleteChat(parseInt(id, 10), { email: req.user.email, isSuper: isSuperAdmin });
+  }
 }

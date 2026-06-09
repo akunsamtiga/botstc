@@ -1,5 +1,8 @@
-import { Injectable, Logger, BadRequestException } from '@nestjs/common';
+import { Injectable, Logger, BadRequestException, ForbiddenException, NotFoundException } from '@nestjs/common';
 import { SupabaseService } from '../supabase/supabase.service';
+
+/** Konteks pemanggil untuk enforcement kepemilikan. */
+export interface RequesterCtx { email: string; isSuper: boolean; }
 
 /**
  * AdminService — semua operasi privileged (whitelist/admin/super-admin/config)
@@ -54,10 +57,29 @@ export class AdminService {
     if (error) throw new BadRequestException('Gagal menambahkan ke whitelist: ' + error.message);
   }
 
+  /**
+   * Enforcement kepemilikan: admin biasa hanya boleh mengelola user yang
+   * dia tambahkan sendiri (added_by === email-nya). Super-admin bypass.
+   * `byId=true` untuk lookup berdasarkan kolom id (dipakai delete fallback).
+   */
+  private async assertOwner(target: string, requester?: RequesterCtx, byId = false): Promise<void> {
+    if (!requester || requester.isSuper) return; // super-admin / konteks internal → bebas
+    const col = byId ? 'id' : 'email';
+    const val = byId ? target : target.toLowerCase().trim();
+    const { data, error } = await this.db
+      .from('whitelist_users').select('added_by').eq(col, val).maybeSingle();
+    if (error) throw new BadRequestException('Gagal memeriksa kepemilikan: ' + error.message);
+    if (!data) throw new NotFoundException('User tidak ditemukan');
+    if ((data.added_by ?? '').toLowerCase().trim() !== requester.email.toLowerCase().trim()) {
+      throw new ForbiddenException('Anda hanya bisa mengelola user yang Anda tambahkan sendiri');
+    }
+  }
+
   async updateWhitelist(oldEmail: string, updates: {
     email?: string; name?: string; userId?: string; deviceId?: string;
     isActive?: boolean; lastLogin?: number | null;
-  }): Promise<void> {
+  }, requester?: RequesterCtx): Promise<void> {
+    await this.assertOwner(oldEmail, requester);
     const data: Record<string, unknown> = {};
     if (updates.name     !== undefined) data.name      = updates.name;
     if (updates.userId   !== undefined) data.user_id   = updates.userId;
@@ -73,19 +95,28 @@ export class AdminService {
     if (error) throw new BadRequestException('Gagal mengupdate whitelist: ' + error.message);
   }
 
-  async toggleWhitelist(email: string, isActive: boolean): Promise<void> {
+  async toggleWhitelist(email: string, isActive: boolean, requester?: RequesterCtx): Promise<void> {
+    await this.assertOwner(email, requester);
     const { error } = await this.db.from('whitelist_users')
       .update({ is_active: isActive }).eq('email', email.toLowerCase().trim());
     if (error) throw new BadRequestException('Gagal mengupdate status: ' + error.message);
   }
 
-  async deleteWhitelist(emailOrId: string): Promise<void> {
+  async deleteWhitelist(emailOrId: string, requester?: RequesterCtx): Promise<void> {
     const normalized = emailOrId.toLowerCase().trim();
-    const { error: emailErr } = await this.db.from('whitelist_users').delete().eq('email', normalized);
-    if (emailErr) {
-      const { error: idErr } = await this.db.from('whitelist_users').delete().eq('id', emailOrId);
-      if (idErr) throw new BadRequestException('Gagal menghapus whitelist: ' + idErr.message);
+    // Tentukan dulu apakah target ada by email atau by id, lalu cek kepemilikan.
+    const { data: byEmail } = await this.db
+      .from('whitelist_users').select('id').eq('email', normalized).maybeSingle();
+    if (byEmail) {
+      await this.assertOwner(normalized, requester);
+      const { error } = await this.db.from('whitelist_users').delete().eq('email', normalized);
+      if (error) throw new BadRequestException('Gagal menghapus whitelist: ' + error.message);
+      return;
     }
+    // Fallback by id
+    await this.assertOwner(emailOrId, requester, true);
+    const { error: idErr } = await this.db.from('whitelist_users').delete().eq('id', emailOrId);
+    if (idErr) throw new BadRequestException('Gagal menghapus whitelist: ' + idErr.message);
   }
 
   async importWhitelist(rows: any[], addedBy: string): Promise<{ success: number; skipped: number }> {

@@ -49,23 +49,26 @@ export class AdminController {
   @UseGuards(AdminGuard)
   @Patch('whitelist')
   @HttpCode(200)
-  updateWhitelist(@Body() body: { oldEmail: string; email?: string; name?: string; userId?: string; deviceId?: string; isActive?: boolean; lastLogin?: number | null }) {
+  async updateWhitelist(@Request() req, @Body() body: { oldEmail: string; email?: string; name?: string; userId?: string; deviceId?: string; isActive?: boolean; lastLogin?: number | null }) {
     const { oldEmail, ...updates } = body;
-    return this.svc.updateWhitelist(oldEmail, updates);
+    const { isSuperAdmin } = await this.svc.getMe(req.user.email);
+    return this.svc.updateWhitelist(oldEmail, updates, { email: req.user.email, isSuper: isSuperAdmin });
   }
 
   @UseGuards(AdminGuard)
   @Post('whitelist/toggle')
   @HttpCode(200)
-  toggleWhitelist(@Body() body: { email: string; isActive: boolean }) {
-    return this.svc.toggleWhitelist(body.email, body.isActive);
+  async toggleWhitelist(@Request() req, @Body() body: { email: string; isActive: boolean }) {
+    const { isSuperAdmin } = await this.svc.getMe(req.user.email);
+    return this.svc.toggleWhitelist(body.email, body.isActive, { email: req.user.email, isSuper: isSuperAdmin });
   }
 
   @UseGuards(AdminGuard)
   @Delete('whitelist')
   @HttpCode(200)
-  deleteWhitelist(@Query('id') id: string, @Body() body?: { id?: string }) {
-    return this.svc.deleteWhitelist(id ?? body?.id ?? '');
+  async deleteWhitelist(@Request() req, @Query('id') id: string, @Body() body?: { id?: string }) {
+    const { isSuperAdmin } = await this.svc.getMe(req.user.email);
+    return this.svc.deleteWhitelist(id ?? body?.id ?? '', { email: req.user.email, isSuper: isSuperAdmin });
   }
 
   @UseGuards(AdminGuard)
@@ -75,8 +78,8 @@ export class AdminController {
     return this.svc.importWhitelist(body.rows ?? [], body.addedBy ?? req.user.email);
   }
 
-  // ── Admin users (super admin) ──────────────────────────────────────────────
-  @UseGuards(AdminGuard)
+  // ── Admin users (super admin only) ─────────────────────────────────────────
+  @UseGuards(SuperAdminGuard)
   @Get('admins')
   listAdmins() {
     return this.svc.listAdmins();
@@ -103,8 +106,8 @@ export class AdminController {
     return this.svc.removeAdmin(id ?? body?.id ?? '');
   }
 
-  // ── Super admins (super admin) ─────────────────────────────────────────────
-  @UseGuards(AdminGuard)
+  // ── Super admins (super admin only) ────────────────────────────────────────
+  @UseGuards(SuperAdminGuard)
   @Get('super-admins')
   listSuperAdmins() {
     return this.svc.listSuperAdmins();
@@ -124,8 +127,8 @@ export class AdminController {
     return this.svc.deleteSuperAdmin(email ?? body?.email ?? '');
   }
 
-  // ── Config (admin) ─────────────────────────────────────────────────────────
-  @UseGuards(AdminGuard)
+  // ── Config (super admin only) ──────────────────────────────────────────────
+  @UseGuards(SuperAdminGuard)
   @Put('config')
   @HttpCode(200)
   upsertConfig(@Body() body: { key: string; value: unknown }) {

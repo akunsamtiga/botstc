@@ -199,6 +199,24 @@ export class AdminService {
     return data ?? [];
   }
 
+  /**
+   * Pastikan email ada di whitelist & aktif — supaya admin bisa login
+   * (whitelist guard tidak memblokirnya). Idempoten.
+   */
+  private async ensureWhitelisted(email: string, name?: string): Promise<void> {
+    const e = email.toLowerCase().trim();
+    const { data } = await this.db.from('whitelist_users').select('id').eq('email', e).maybeSingle();
+    if (data) {
+      await this.db.from('whitelist_users').update({ is_active: true }).eq('email', e);
+    } else {
+      const { error } = await this.db.from('whitelist_users').insert({
+        email: e, name: name || e.split('@')[0], is_active: true, is_primary: false,
+        added_at: new Date().toISOString(), added_by: 'admin-auto',
+      });
+      if (error) throw new BadRequestException('Gagal whitelist admin baru: ' + error.message);
+    }
+  }
+
   async addAdmin(email: string, name?: string, role?: string): Promise<void> {
     const e = email.toLowerCase().trim();
     const { error } = await this.db.from('admin_users').insert({
@@ -213,6 +231,8 @@ export class AdminService {
         throw new BadRequestException('Gagal sync super_admins: ' + saErr.message);
       }
     }
+    // ✅ Admin baru otomatis masuk whitelist (aktif) agar bisa login
+    await this.ensureWhitelisted(e, name);
   }
 
   async updateAdmin(id: string, updates: { name?: string; role?: 'admin' | 'super_admin'; is_active?: boolean }): Promise<void> {

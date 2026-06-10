@@ -659,13 +659,15 @@ export class AuthService implements OnModuleDestroy {
    * string, bukan cookie. sign_up berikutnya dengan device_id yang sama →
    * ter-atribusi ke referral.
    *
-   * Best-effort: error diabaikan (registrasi tetap lanjut).
+   * Mengembalikan `track_token` dari respons (terikat ke afiliasi+device) yang
+   * WAJIB dipakai sebagai track_token saat sign_up agar registrasi ter-atribusi.
+   * Best-effort: null jika gagal (caller fallback ke token generate sendiri).
    */
   private async fireTrafficTracker(
     deviceId: string,
     referral: string,
     proxy?: string,
-  ): Promise<void> {
+  ): Promise<string | null> {
     const url =
       `${BASE_URL}/traffic-tracker/v1/track` +
       `?a=${encodeURIComponent(referral)}&t=0&locale=id`;
@@ -682,12 +684,16 @@ export class AuthService implements OnModuleDestroy {
 
     try {
       const { status, body } = await this.curlTrack(url, {}, headers, proxy);
+      let trackToken: string | null = null;
+      try { trackToken = JSON.parse(body)?.data?.track_token ?? null; } catch { /* non-JSON */ }
       this.logger.log(
         `traffic-tracker resp: status=${status} device=${deviceId} ` +
-        `body=${this.redact(body).slice(0, 200)}`,
+        `track_token=${trackToken ? 'ada' : 'KOSONG'}`,
       );
+      return trackToken;
     } catch (e: any) {
       this.logger.warn(`fireTrafficTracker gagal: ${e?.message}`);
+      return null;
     }
   }
 
@@ -769,17 +775,19 @@ export class AuthService implements OnModuleDestroy {
       const signupProxy = this.resolveLoginProxy(emailLc);
 
       // ── Atribusi afiliasi ─────────────────────────────────────────────────
-      // Stockity mengikat afiliasi ke `device_id` lewat traffic-tracker (kode
-      // afiliasi di query string `?a=`), BUKAN cookie saat sign_up. Tanpa
-      // langkah ini, device baru "dingin" → tidak terhitung pengunjung &
-      // registrasi tidak ter-atribusi. Best-effort: gagal pun register lanjut.
-      if (referral) {
-        await this.fireTrafficTracker(deviceId, referral, signupProxy);
-      }
+      // Traffic-tracker (query string `?a=`) menerbitkan `track_token` yang
+      // terikat ke afiliasi+device. Token INILAH yang harus dipakai saat
+      // sign_up agar registrasi ter-atribusi — bukan token generate sendiri.
+      // Best-effort: kalau gagal, fallback ke buildTrackToken (signup tetap
+      // jalan, hanya tidak ter-atribusi).
+      const affiliateToken = referral
+        ? await this.fireTrafficTracker(deviceId, referral, signupProxy)
+        : null;
+      const trackToken = affiliateToken ?? this.buildTrackToken();
 
       const result = await this.curlPost(
         `${BASE_URL}/passport/v1/sign_up?locale=id`,
-        { email: emailLc, password, currency, i_agree: true, track_token: this.buildTrackToken() },
+        { email: emailLc, password, currency, i_agree: true, track_token: trackToken },
         {
           'device-id':     deviceId,
           'device-type':   'web',

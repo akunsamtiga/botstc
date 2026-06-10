@@ -681,24 +681,27 @@ export class AuthService implements OnModuleDestroy {
     };
 
     try {
-      await this.curlFire(url, {}, headers, proxy);
-      this.logger.log(`traffic-tracker terkirim: a=${referral} device=${deviceId}`);
+      const { status, body } = await this.curlTrack(url, {}, headers, proxy);
+      this.logger.log(
+        `traffic-tracker resp: status=${status} device=${deviceId} ` +
+        `body=${this.redact(body).slice(0, 200)}`,
+      );
     } catch (e: any) {
       this.logger.warn(`fireTrafficTracker gagal: ${e?.message}`);
     }
   }
 
   /**
-   * Versi ringan curlPost untuk "fire-and-forget": POST JSON, abaikan isi
-   * respons (tidak parse JSON, tidak melempar pada body kosong). Dipakai untuk
-   * event clickstream yang tidak butuh hasil.
+   * POST JSON yang MENGEMBALIKAN status + body mentah (tanpa parse JSON, tanpa
+   * melempar pada body kosong). Dipakai untuk traffic-tracker agar kita bisa
+   * melihat apakah Stockity benar-benar menerima (201) atau menolak.
    */
-  private async curlFire(
+  private async curlTrack(
     url: string,
     body: object,
     headers: Record<string, string>,
     proxy?: string,
-  ): Promise<void> {
+  ): Promise<{ status: number; body: string }> {
     const esc = (v: string) => v.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
     const lines: string[] = [
       'silent',
@@ -713,17 +716,23 @@ export class AuthService implements OnModuleDestroy {
     lines.push(`data-raw = "${esc(JSON.stringify(body))}"`);
     lines.push('max-time = 10');
     if (proxy) lines.push(`proxy = "${esc(proxy)}"`);
+    lines.push('write-out = "__HTTP_STATUS__%{http_code}"');
     const config = lines.join('\n') + '\n';
 
-    await new Promise<void>((resolve) => {
+    const stdout = await new Promise<string>((resolve) => {
       const cp = execFile(
         'curl',
         ['-K', '-'],
         { maxBuffer: 4 * 1024 * 1024, timeout: 12_000 },
-        () => resolve(),  // sukses/gagal sama-sama lanjut (best-effort)
+        (_err, out) => resolve(out ?? ''),  // best-effort
       );
       cp.stdin?.end(config);
     });
+
+    const idx    = stdout.lastIndexOf('__HTTP_STATUS__');
+    const body2  = (idx >= 0 ? stdout.slice(0, idx) : stdout).trim();
+    const status = idx >= 0 ? parseInt(stdout.slice(idx + '__HTTP_STATUS__'.length).trim(), 10) : 0;
+    return { status, body: body2 };
   }
 
   async register(email: string, password: string, currency = 'IDR') {
@@ -733,8 +742,10 @@ export class AuthService implements OnModuleDestroy {
     // Reuse cooldown anti-spam yang sama dengan login (per email/IP throttle di controller).
     this.checkLoginRateLimit(emailLc);
 
-    // Akun baru → deviceId baru, kecuali email ini sudah punya session lama.
-    let deviceId = uuidv4();
+    // Akun baru → deviceId baru. Samakan format dengan web Stockity: 32 hex
+    // tanpa strip (mis. e1beefb980624a954ea96efd30d6e705), bukan UUID berstrip,
+    // agar binding traffic-tracker → sign_up konsisten dengan device asli.
+    let deviceId = uuidv4().replace(/-/g, '');
     try {
       const { data: existing } = await this.supabaseService.client
         .from('sessions')

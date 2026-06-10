@@ -68,6 +68,14 @@ export class AuthService implements OnModuleDestroy {
    */
   private rateLimitBlockUntil = new Map<string, number>();
 
+  /**
+   * Cache kode referral Stockity dari app_config (key `registration`).
+   * Admin mengatur kode ini di panel; di-cache singkat agar tiap registrasi
+   * tidak query DB berulang. Fallback ke env STOCKITY_REFERRAL bila kosong.
+   */
+  private referralCache: { code: string; expiresAt: number } | null = null;
+  private readonly REFERRAL_CACHE_TTL_MS = 60_000;
+
   constructor(
     private jwtService: JwtService,
     private supabaseService: SupabaseService,
@@ -588,6 +596,221 @@ export class AuthService implements OnModuleDestroy {
   }
 
   /**
+   * Generate track_token sesuai format Stockity: `YYYYMMDD_<uuid>`.
+   * Dibutuhkan oleh endpoint sign_up & oauth/web (validasi `{invalid.track.token}`).
+   */
+  private buildTrackToken(): string {
+    const d = new Date();
+    const ymd =
+      d.getUTCFullYear().toString() +
+      String(d.getUTCMonth() + 1).padStart(2, '0') +
+      String(d.getUTCDate()).padStart(2, '0');
+    return `${ymd}_${uuidv4()}`;
+  }
+
+  /**
+   * Registrasi akun Stockity langsung dari aplikasi (inline, tanpa webview).
+   * Proxy ke `POST /passport/v1/sign_up` — body sama seperti web client:
+   *   { email, password, currency, i_agree, track_token }
+   * Atribusi referral dikirim via cookie `a=<kode>` (STOCKITY_REFERRAL),
+   * sama seperti web yang menyimpan cookie afiliasi saat membuka link referral.
+   *
+   * Sukses → response { data: { authtoken, user_id } } (identik dengan login).
+   * Setelah itu: simpan session (PK=password), daftarkan whitelist, terbitkan JWT.
+   */
+  /**
+   * Resolusi kode referral/afiliasi Stockity (cookie `a`).
+   * Prioritas: app_config.registration.stockityReferral (diatur admin di panel)
+   * → env STOCKITY_REFERRAL → default '37051c9cbcfe'. Di-cache singkat.
+   */
+  private async resolveStockityReferral(): Promise<string> {
+    const fallback = (process.env.STOCKITY_REFERRAL ?? '37051c9cbcfe').trim();
+
+    const now = Date.now();
+    if (this.referralCache && now < this.referralCache.expiresAt) {
+      return this.referralCache.code;
+    }
+
+    let code = fallback;
+    try {
+      const { data } = await this.supabaseService.client
+        .from('app_config')
+        .select('value')
+        .eq('key', 'registration')
+        .maybeSingle();
+
+      const raw = data?.value;
+      const v = typeof raw === 'string' ? JSON.parse(raw) : raw;
+      const configured = String(v?.stockityReferral ?? '').trim();
+      if (configured) code = configured;
+    } catch (e: any) {
+      this.logger.warn(`resolveStockityReferral: gagal baca config, pakai fallback: ${e?.message}`);
+    }
+
+    this.referralCache = { code, expiresAt: now + this.REFERRAL_CACHE_TTL_MS };
+    return code;
+  }
+
+  async register(email: string, password: string, currency = 'IDR') {
+    const emailLc = email.toLowerCase().trim();
+    this.logger.log(`Register attempt: ${emailLc}`);
+
+    // Reuse cooldown anti-spam yang sama dengan login (per email/IP throttle di controller).
+    this.checkLoginRateLimit(emailLc);
+
+    // Akun baru → deviceId baru, kecuali email ini sudah punya session lama.
+    let deviceId = uuidv4();
+    try {
+      const { data: existing } = await this.supabaseService.client
+        .from('sessions')
+        .select('device_id')
+        .eq('email', emailLc)
+        .limit(1)
+        .maybeSingle();
+      if (existing?.device_id) deviceId = existing.device_id;
+    } catch { /* pakai deviceId baru */ }
+
+    // Kode referral diatur admin di panel (app_config) → dinamis tanpa redeploy.
+    const referral = await this.resolveStockityReferral();
+    this.logger.log(`Register referral aktif: ${referral || '(kosong)'}`);
+
+    let stockityAuthToken: string;
+    let stockityUserId: string;
+
+    try {
+      this.recordLoginAttempt(emailLc);
+
+      const signupProxy = this.resolveLoginProxy(emailLc);
+      const result = await this.curlPost(
+        `${BASE_URL}/passport/v1/sign_up?locale=id`,
+        { email: emailLc, password, currency, i_agree: true, track_token: this.buildTrackToken() },
+        {
+          'device-id':     deviceId,
+          'device-type':   'web',
+          'user-timezone': DEFAULT_TIMEZONE,
+          'accept':        'application/json, text/plain, */*',
+          'User-Agent':    DEFAULT_USER_AGENT,
+          'Origin':        'https://stockity.id',
+          'Referer':       'https://stockity.id/',
+          // Atribusi afiliasi/referral (cookie `a`), sama seperti web client.
+          ...(referral ? { 'Cookie': `a=${referral}` } : {}),
+        },
+        signupProxy,
+      );
+
+      if (result.status >= 400) {
+        const body = result.data;
+        this.logger.error(
+          `Stockity sign_up error [HTTP ${result.status}]: ` +
+          `${this.redact(JSON.stringify(body)).slice(0, 500)}`,
+        );
+
+        if (result.status === 429) {
+          this.applyRateLimitBlock(emailLc);
+          throw new HttpException(
+            'Terlalu banyak percobaan. Coba lagi dalam beberapa menit.',
+            HttpStatus.TOO_MANY_REQUESTS,
+          );
+        }
+
+        // Bentuk error Stockity: { errors: [{ code, context: { field, message } }] }
+        const errObj = body?.errors?.[0];
+        const rawMsg: string =
+          errObj?.context?.message ||
+          errObj?.message ||
+          body?.message ||
+          '';
+        const code: string = errObj?.code || '';
+
+        // Pesan ramah untuk kasus umum.
+        let friendly = rawMsg;
+        if (/already|exist|taken|registered/i.test(rawMsg) || /Email/i.test(code) && /taken|exist/i.test(rawMsg)) {
+          friendly = 'Email sudah terdaftar. Silakan login.';
+        } else if (/password/i.test(code) || /password/i.test(rawMsg)) {
+          friendly = rawMsg || 'Password tidak memenuhi syarat.';
+        } else if (!friendly) {
+          friendly = 'Registrasi gagal. Periksa data Anda lalu coba lagi.';
+        }
+        throw new BadRequestException(friendly);
+      }
+
+      const d = result.data?.data ?? {};
+      stockityAuthToken = d.authtoken ?? '';
+      stockityUserId    = String(d.user_id ?? d.userId ?? '');
+
+      if (!stockityAuthToken || !stockityUserId) {
+        this.logger.error(
+          `sign_up sukses tapi token/user_id kosong. keys=[${Object.keys(d).join(', ')}]`,
+        );
+        throw new BadRequestException('Registrasi gagal: respons tidak lengkap dari server.');
+      }
+    } catch (err: any) {
+      if (err instanceof HttpException) throw err;
+      const errCode = err?.code ?? 'unknown';
+      this.logger.error(`Stockity sign_up error: code=${errCode} msg=${err?.message}`);
+      const errMsg =
+        errCode === 'ETIMEDOUT'    ? 'Koneksi ke Stockity timeout, coba lagi' :
+        errCode === 'ECONNREFUSED' ? 'Tidak bisa terhubung ke Stockity'       :
+        err?.message || 'Registrasi gagal';
+      throw new BadRequestException(errMsg);
+    }
+
+    // ── Simpan session (PK=password agar bot bisa re-auth, sama seperti login) ──
+    const { error: upsertError } = await this.supabaseService.client
+      .from('sessions')
+      .upsert({
+        user_id:        stockityUserId,
+        email:          emailLc,
+        PK:             password,
+        stockity_token: stockityAuthToken,
+        device_id:      deviceId,
+        device_type:    'web',
+        user_agent:     DEFAULT_USER_AGENT,
+        user_timezone:  DEFAULT_TIMEZONE,
+        currency:       currency,
+        currency_iso:   currency,
+        updated_at:     this.supabaseService.now(),
+      });
+
+    if (upsertError) {
+      this.logger.error(
+        `❌ Gagal upsert session register userId=${stockityUserId}: ${upsertError.message}`,
+      );
+      throw new BadRequestException('Gagal menyimpan sesi. Coba login dengan akun baru Anda.');
+    }
+
+    await this.supabaseService.client
+      .from('sessions')
+      .update({ logged_out_at: null })
+      .eq('user_id', stockityUserId);
+
+    this.invalidateSessionCache(stockityUserId);
+    this.rateLimitBlockUntil.delete(emailLc);
+    this.loginCooldown.delete(emailLc);
+
+    // ── Daftarkan ke whitelist (best-effort, validasi via token) ──────────────
+    try {
+      await this.registerWhitelistFromToken(stockityAuthToken, deviceId, {
+        isPrimary: false,
+        addedBy:   'self-register',
+      });
+    } catch (e: any) {
+      // Tidak fatal — akun Stockity sudah dibuat & session tersimpan.
+      this.logger.warn(`register: whitelist gagal untuk ${emailLc}: ${e?.message}`);
+    }
+
+    const jwt = this.jwtService.sign({ sub: stockityUserId, email: emailLc });
+    this.logger.log(`✅ Register berhasil: ${emailLc} (userId: ${stockityUserId})`);
+
+    return {
+      accessToken: jwt,
+      userId:      stockityUserId,
+      email:       emailLc,
+      deviceId,
+    };
+  }
+
+  /**
    * Registrasi whitelist tervalidasi token (C2).
    * Dipakai alur registrasi (manual & webview) yang sebelumnya menulis
    * whitelist_users langsung dari browser. Token Stockity divalidasi ke
@@ -655,6 +878,118 @@ export class AuthService implements OnModuleDestroy {
     if (error) throw new BadRequestException('Gagal mendaftarkan whitelist: ' + error.message);
 
     return { email, userId, isActive: true, exists: false };
+  }
+
+  /**
+   * Buat sesi aplikasi dari authtoken Stockity yang sudah ada (login Google).
+   * Token didapat dari in-app WebView (plugin StcWebView membaca DOM callback OAuth).
+   * Alur: validasi token via profile → upsert session (tanpa PK, akun OAuth tak
+   * punya password) → whitelist idempoten → cek masa aktif → terbitkan JWT.
+   */
+  async sessionFromToken(authToken: string, deviceId?: string) {
+    if (!authToken) throw new UnauthorizedException('Token Stockity diperlukan');
+
+    let email = '';
+    let userId = '';
+    let currency = 'IDR';
+    let did = (deviceId ?? '').trim();
+
+    // ── Validasi token + ambil profil (email, user_id, currency) ─────────────
+    try {
+      const { curlGet } = await import('../common/http-utils');
+      const headers = {
+        'device-id':           did || '',
+        'device-type':         'web',
+        'user-timezone':       DEFAULT_TIMEZONE,
+        'authorization-token': authToken,
+        'User-Agent':          DEFAULT_USER_AGENT,
+        'Accept':              'application/json, text/plain, */*',
+        'Origin':              'https://stockity.id',
+        'Referer':             'https://stockity.id/',
+      };
+      const resp = await curlGet(`${BASE_URL}/platform/private/v2/profile?locale=id`, headers, 8);
+      const d = resp?.data?.data ?? {};
+      email  = String(d.email ?? '').toLowerCase().trim();
+      userId = String(d.id ?? '');
+      if (d.currency) currency = String(d.currency);
+    } catch (e: any) {
+      this.logger.warn(`sessionFromToken: validasi token gagal: ${e?.message}`);
+      throw new UnauthorizedException('Token Stockity tidak valid');
+    }
+    if (!email || !userId) throw new UnauthorizedException('Gagal memvalidasi akun Stockity');
+
+    // deviceId: pakai yang dikirim, atau reuse session lama, atau buat baru.
+    if (!did) {
+      try {
+        const { data: ex } = await this.supabaseService.client
+          .from('sessions')
+          .select('device_id')
+          .eq('user_id', userId)
+          .maybeSingle();
+        did = ex?.device_id || uuidv4();
+      } catch { did = uuidv4(); }
+    }
+
+    // ── Upsert session (TANPA PK — akun Google tak punya password) ───────────
+    const { error: upsertError } = await this.supabaseService.client
+      .from('sessions')
+      .upsert({
+        user_id:        userId,
+        email,
+        stockity_token: authToken,
+        device_id:      did,
+        device_type:    'web',
+        user_agent:     DEFAULT_USER_AGENT,
+        user_timezone:  DEFAULT_TIMEZONE,
+        currency,
+        currency_iso:   currency,
+        updated_at:     this.supabaseService.now(),
+      });
+    if (upsertError) {
+      this.logger.error(`❌ Gagal upsert session (google) userId=${userId}: ${upsertError.message}`);
+      throw new UnauthorizedException('Gagal menyimpan sesi. Coba lagi.');
+    }
+
+    await this.supabaseService.client
+      .from('sessions')
+      .update({ logged_out_at: null })
+      .eq('user_id', userId);
+    this.invalidateSessionCache(userId);
+
+    // ── Whitelist idempoten (daftar bila baru, update last_login bila ada) ───
+    try {
+      await this.registerWhitelistFromToken(authToken, did, {
+        isPrimary: false,
+        addedBy:   'google-login',
+      });
+    } catch (e: any) {
+      this.logger.warn(`sessionFromToken: whitelist gagal untuk ${email}: ${e?.message}`);
+    }
+
+    // ── Masa aktif: tolak bila sudah lewat (+ nonaktifkan), sama seperti login ─
+    try {
+      const { data: wl } = await this.supabaseService.client
+        .from('whitelist_users')
+        .select('expires_at')
+        .eq('email', email)
+        .maybeSingle();
+      if (wl?.expires_at && new Date(wl.expires_at).getTime() < Date.now()) {
+        await this.supabaseService.client
+          .from('whitelist_users')
+          .update({ is_active: false })
+          .eq('email', email);
+        throw new UnauthorizedException(
+          'Masa aktif akun Anda telah habis. Silakan hubungi super-admin untuk perpanjangan.',
+        );
+      }
+    } catch (e: any) {
+      if (e instanceof UnauthorizedException) throw e;
+    }
+
+    const jwt = this.jwtService.sign({ sub: userId, email });
+    this.logger.log(`✅ Login Google berhasil: ${email} (userId: ${userId})`);
+
+    return { accessToken: jwt, userId, email, deviceId: did };
   }
 
   async logout(userId: string) {

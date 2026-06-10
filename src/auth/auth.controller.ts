@@ -5,6 +5,7 @@ import {
 import { Throttle } from '@nestjs/throttler';
 import { AuthService } from './auth.service';
 import { LoginDto } from './dto/login.dto';
+import { RegisterDto } from './dto/register.dto';
 import { JwtAuthGuard } from './jwt-auth.guard';
 
 @Controller('auth')
@@ -19,6 +20,28 @@ export class AuthController {
   @HttpCode(200)
   login(@Body() dto: LoginDto) {
     return this.authService.login(dto.email, dto.password);
+  }
+
+  /**
+   * Registrasi akun Stockity langsung (inline, tanpa webview).
+   * Proxy ke Stockity sign_up + simpan session + whitelist + terbitkan JWT.
+   * Throttle ketat: maksimal 5 pendaftaran / menit / IP.
+   */
+  @Throttle({ default: { ttl: 60_000, limit: 5 } })
+  @Post('register')
+  @HttpCode(200)
+  register(@Body() dto: RegisterDto) {
+    return this.authService.register(dto.email, dto.password, dto.currency ?? 'IDR');
+  }
+
+  /**
+   * Login Google: tukar authtoken Stockity (dari in-app WebView OAuth) → sesi+JWT.
+   */
+  @Throttle({ default: { ttl: 60_000, limit: 10 } })
+  @Post('session-from-token')
+  @HttpCode(200)
+  sessionFromToken(@Body() body: { authToken: string; deviceId?: string }) {
+    return this.authService.sessionFromToken(body.authToken, body.deviceId);
   }
 
   /**

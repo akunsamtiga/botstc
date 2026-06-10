@@ -402,6 +402,7 @@ export class AdminService {
     emails?: string[];
     subject: string;
     message: string;
+    html?: boolean;
   }): Promise<{ sent: number; failed: number; total: number; errors: string[] }> {
     const subject = (params.subject ?? '').trim();
     const message = (params.message ?? '').trim();
@@ -442,19 +443,28 @@ export class AdminService {
 
     if (recipients.length === 0) throw new BadRequestException('Tidak ada penerima');
 
-    const html = this.buildEmailHtml(subject, message);
-    const res = await this.mail.sendBulk(recipients, subject, html, message);
+    const isHtml = params.html === true;
+    const html = this.buildEmailHtml(subject, message, isHtml);
+    // Versi teks (fallback klien non-HTML): kalau mode HTML, strip tag kasar.
+    const text = isHtml
+      ? message.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim()
+      : message;
+    const res = await this.mail.sendBulk(recipients, subject, html, text);
     this.logger.log(
       `Broadcast email "${subject}" → sent=${res.sent} failed=${res.failed} total=${recipients.length}`,
     );
     return { ...res, total: recipients.length };
   }
 
-  /** Bungkus pesan teks dalam template HTML sederhana ber-brand STC. */
-  private buildEmailHtml(subject: string, message: string): string {
+  /**
+   * Bungkus pesan dalam template HTML ber-brand STC.
+   * isHtml=false → escape + nl2br (pesan teks biasa).
+   * isHtml=true  → pesan dipakai sebagai HTML mentah (super-admin tepercaya).
+   */
+  private buildEmailHtml(subject: string, message: string, isHtml = false): string {
     const esc = (s: string) =>
       s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-    const body = esc(message).replace(/\n/g, '<br>');
+    const body = isHtml ? message : esc(message).replace(/\n/g, '<br>');
     return `<!doctype html><html><body style="margin:0;background:#f2f2f7;padding:24px;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;">
   <div style="max-width:560px;margin:0 auto;background:#ffffff;border-radius:16px;overflow:hidden;box-shadow:0 2px 16px rgba(0,0,0,0.06);">
     <div style="background:#0a1e0f;padding:20px 24px;">

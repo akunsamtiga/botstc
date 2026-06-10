@@ -139,7 +139,7 @@ export class AdminController {
   @UseGuards(SuperAdminGuard)
   @Post('email/send')
   @HttpCode(200)
-  sendEmail(@Body() body: { target: 'one' | 'all' | 'custom'; email?: string; emails?: string[]; subject: string; message: string }) {
+  sendEmail(@Body() body: { target: 'one' | 'all' | 'custom'; email?: string; emails?: string[]; subject: string; message: string; html?: boolean }) {
     return this.svc.sendBroadcastEmail(body);
   }
 

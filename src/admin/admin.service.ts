@@ -397,8 +397,9 @@ export class AdminService {
    * target='one' → kirim ke `email`. target='all' → kirim ke semua whitelist_users.
    */
   async sendBroadcastEmail(params: {
-    target: 'one' | 'all';
+    target: 'one' | 'all' | 'custom';
     email?: string;
+    emails?: string[];
     subject: string;
     message: string;
   }): Promise<{ sent: number; failed: number; total: number; errors: string[] }> {
@@ -423,6 +424,16 @@ export class AdminService {
             .filter((e: string) => e.includes('@')),
         ),
       ];
+    } else if (params.target === 'custom') {
+      // Email bebas (boleh di luar whitelist), bisa banyak sekaligus.
+      recipients = [
+        ...new Set(
+          (params.emails ?? [])
+            .map((e) => String(e ?? '').toLowerCase().trim())
+            .filter((e) => e.includes('@')),
+        ),
+      ];
+      if (recipients.length === 0) throw new BadRequestException('Tidak ada email custom yang valid');
     } else {
       const e = (params.email ?? '').toLowerCase().trim();
       if (!e.includes('@')) throw new BadRequestException('Email tujuan tidak valid');

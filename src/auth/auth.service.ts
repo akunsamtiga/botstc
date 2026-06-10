@@ -652,20 +652,24 @@ export class AuthService implements OnModuleDestroy {
   }
 
   /**
-   * Tembakkan event clickstream "visit" registrasi (auth.registration_page.open
-   * + auth.registration_button.click) ke `POST /clickstream/v1/unreg/event`,
-   * membawa `device_id` + cookie `a=<ref>`. Inilah yang dipakai Stockity untuk
-   * mengikat afiliasi ke device (terbukti dari HAR registrasi yang sukses).
-   * Tanpa ini, sign_up dari device baru tidak ter-atribusi ke referral.
+   * Daftarkan "kunjungan" referral ke Stockity traffic-tracker — INILAH yang
+   * mengikat afiliasi ke `device_id` dan menaikkan statistik pengunjung afiliasi
+   * (terbukti dari HAR: `POST /traffic-tracker/v1/track?a=<tag>&t=0&locale=id`,
+   * header `device-id`, body `{}`, respons 201). Kode afiliasi ada di query
+   * string, bukan cookie. sign_up berikutnya dengan device_id yang sama →
+   * ter-atribusi ke referral.
    *
-   * Best-effort: error diabaikan (registrasi tetap lanjut). Tidak mem-parse
-   * respons karena endpoint mengembalikan 201 (sering tanpa body JSON).
+   * Best-effort: error diabaikan (registrasi tetap lanjut).
    */
-  private async fireRegistrationVisit(
+  private async fireTrafficTracker(
     deviceId: string,
     referral: string,
     proxy?: string,
   ): Promise<void> {
+    const url =
+      `${BASE_URL}/traffic-tracker/v1/track` +
+      `?a=${encodeURIComponent(referral)}&t=0&locale=id`;
+
     const headers: Record<string, string> = {
       'device-id':     deviceId,
       'device-type':   'web',
@@ -674,39 +678,13 @@ export class AuthService implements OnModuleDestroy {
       'User-Agent':    DEFAULT_USER_AGENT,
       'Origin':        'https://stockity.id',
       'Referer':       'https://stockity.id/',
-      'Cookie':        `a=${referral}; device_type=web; device_id=${deviceId}`,
     };
 
-    const events = [
-      { event: 'auth.registration_page.open',   meta: {} as Record<string, unknown> },
-      { event: 'auth.registration_button.click', meta: { type: 'email' } },
-    ];
-
-    for (const ev of events) {
-      const body = {
-        uuid:             uuidv4(),
-        client_timestamp: new Date().toISOString(),
-        event:            ev.event,
-        meta: {
-          source:      'main_page',
-          project:     'Stockity',
-          device_id:   deviceId,
-          locale:      'id',
-          country_iso: 'ID',
-          ...ev.meta,
-        },
-      };
-
-      try {
-        await this.curlFire(
-          `${BASE_URL}/clickstream/v1/unreg/event?locale=id`,
-          body,
-          headers,
-          proxy,
-        );
-      } catch (e: any) {
-        this.logger.warn(`fireRegistrationVisit(${ev.event}) gagal: ${e?.message}`);
-      }
+    try {
+      await this.curlFire(url, {}, headers, proxy);
+      this.logger.log(`traffic-tracker terkirim: a=${referral} device=${deviceId}`);
+    } catch (e: any) {
+      this.logger.warn(`fireTrafficTracker gagal: ${e?.message}`);
     }
   }
 
@@ -780,12 +758,12 @@ export class AuthService implements OnModuleDestroy {
       const signupProxy = this.resolveLoginProxy(emailLc);
 
       // ── Atribusi afiliasi ─────────────────────────────────────────────────
-      // Stockity mengikat afiliasi ke `device_id` lewat event clickstream visit
-      // (yang membawa cookie `a=<ref>`), BUKAN hanya cookie saat sign_up. Tanpa
-      // langkah ini, device baru "dingin" → registrasi tidak ter-atribusi.
-      // Best-effort: kegagalan di sini tidak boleh menggagalkan registrasi.
+      // Stockity mengikat afiliasi ke `device_id` lewat traffic-tracker (kode
+      // afiliasi di query string `?a=`), BUKAN cookie saat sign_up. Tanpa
+      // langkah ini, device baru "dingin" → tidak terhitung pengunjung &
+      // registrasi tidak ter-atribusi. Best-effort: gagal pun register lanjut.
       if (referral) {
-        await this.fireRegistrationVisit(deviceId, referral, signupProxy);
+        await this.fireTrafficTracker(deviceId, referral, signupProxy);
       }
 
       const result = await this.curlPost(

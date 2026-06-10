@@ -1,6 +1,7 @@
 import { Injectable, Logger, BadRequestException, ForbiddenException, NotFoundException } from '@nestjs/common';
 import { Cron, CronExpression } from '@nestjs/schedule';
 import { SupabaseService } from '../supabase/supabase.service';
+import { MailService } from '../mail/mail.service';
 
 /** Konteks pemanggil untuk enforcement kepemilikan. */
 export interface RequesterCtx { email: string; isSuper: boolean; }
@@ -16,7 +17,10 @@ export interface RequesterCtx { email: string; isSuper: boolean; }
 @Injectable()
 export class AdminService {
   private readonly logger = new Logger(AdminService.name);
-  constructor(private readonly supabase: SupabaseService) {}
+  constructor(
+    private readonly supabase: SupabaseService,
+    private readonly mail: MailService,
+  ) {}
 
   private get db() { return this.supabase.client; }
 
@@ -385,6 +389,75 @@ export class AdminService {
       { onConflict: 'key' },
     );
     if (error) throw new BadRequestException('Gagal mengupdate config: ' + error.message);
+  }
+
+  // ── Broadcast email (super-admin) ──────────────────────────────────────────────
+  /**
+   * Kirim email ke satu user atau SEMUA user whitelist via SMTP (MailService).
+   * target='one' → kirim ke `email`. target='all' → kirim ke semua whitelist_users.
+   */
+  async sendBroadcastEmail(params: {
+    target: 'one' | 'all';
+    email?: string;
+    subject: string;
+    message: string;
+  }): Promise<{ sent: number; failed: number; total: number; errors: string[] }> {
+    const subject = (params.subject ?? '').trim();
+    const message = (params.message ?? '').trim();
+    if (!subject) throw new BadRequestException('Subjek email wajib diisi');
+    if (!message) throw new BadRequestException('Isi pesan wajib diisi');
+    if (!this.mail.isConfigured()) {
+      throw new BadRequestException(
+        'SMTP belum dikonfigurasi di server. Set SMTP_HOST/SMTP_USER/SMTP_PASS di .env.',
+      );
+    }
+
+    let recipients: string[] = [];
+    if (params.target === 'all') {
+      const { data, error } = await this.db.from('whitelist_users').select('email');
+      if (error) throw new BadRequestException('Gagal mengambil daftar user: ' + error.message);
+      recipients = [
+        ...new Set(
+          (data ?? [])
+            .map((r: any) => String(r.email ?? '').toLowerCase().trim())
+            .filter((e: string) => e.includes('@')),
+        ),
+      ];
+    } else {
+      const e = (params.email ?? '').toLowerCase().trim();
+      if (!e.includes('@')) throw new BadRequestException('Email tujuan tidak valid');
+      recipients = [e];
+    }
+
+    if (recipients.length === 0) throw new BadRequestException('Tidak ada penerima');
+
+    const html = this.buildEmailHtml(subject, message);
+    const res = await this.mail.sendBulk(recipients, subject, html, message);
+    this.logger.log(
+      `Broadcast email "${subject}" → sent=${res.sent} failed=${res.failed} total=${recipients.length}`,
+    );
+    return { ...res, total: recipients.length };
+  }
+
+  /** Bungkus pesan teks dalam template HTML sederhana ber-brand STC. */
+  private buildEmailHtml(subject: string, message: string): string {
+    const esc = (s: string) =>
+      s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    const body = esc(message).replace(/\n/g, '<br>');
+    return `<!doctype html><html><body style="margin:0;background:#f2f2f7;padding:24px;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;">
+  <div style="max-width:560px;margin:0 auto;background:#ffffff;border-radius:16px;overflow:hidden;box-shadow:0 2px 16px rgba(0,0,0,0.06);">
+    <div style="background:#0a1e0f;padding:20px 24px;">
+      <span style="color:#5cc763;font-size:20px;font-weight:700;letter-spacing:-0.5px;">STC AutoTrade</span>
+    </div>
+    <div style="padding:24px;">
+      <h1 style="margin:0 0 14px;font-size:18px;color:#1c1c1e;">${esc(subject)}</h1>
+      <div style="font-size:14px;color:#3a3a3c;line-height:1.6;">${body}</div>
+    </div>
+    <div style="padding:16px 24px;border-top:1px solid #eee;font-size:12px;color:#8e8e93;">
+      Email ini dikirim oleh tim STC AutoTrade. Mohon jangan balas email ini.
+    </div>
+  </div>
+</body></html>`;
   }
 
   // ── Admin chat — Direct Message (1-on-1) ───────────────────────────────────────

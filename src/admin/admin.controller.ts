@@ -135,6 +135,14 @@ export class AdminController {
     return this.svc.upsertConfig(body.key, body.value);
   }
 
+  // ── Broadcast email (super admin only) ─────────────────────────────────────
+  @UseGuards(SuperAdminGuard)
+  @Post('email/send')
+  @HttpCode(200)
+  sendEmail(@Body() body: { target: 'one' | 'all'; email?: string; subject: string; message: string }) {
+    return this.svc.sendBroadcastEmail(body);
+  }
+
   // ── Chat DM antar admin/super-admin ────────────────────────────────────────
   /** Daftar kontak: super→semua admin, admin→super-admin saja. */
   @UseGuards(AdminGuard)

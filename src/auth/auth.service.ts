@@ -651,6 +651,103 @@ export class AuthService implements OnModuleDestroy {
     return code;
   }
 
+  /**
+   * Tembakkan event clickstream "visit" registrasi (auth.registration_page.open
+   * + auth.registration_button.click) ke `POST /clickstream/v1/unreg/event`,
+   * membawa `device_id` + cookie `a=<ref>`. Inilah yang dipakai Stockity untuk
+   * mengikat afiliasi ke device (terbukti dari HAR registrasi yang sukses).
+   * Tanpa ini, sign_up dari device baru tidak ter-atribusi ke referral.
+   *
+   * Best-effort: error diabaikan (registrasi tetap lanjut). Tidak mem-parse
+   * respons karena endpoint mengembalikan 201 (sering tanpa body JSON).
+   */
+  private async fireRegistrationVisit(
+    deviceId: string,
+    referral: string,
+    proxy?: string,
+  ): Promise<void> {
+    const headers: Record<string, string> = {
+      'device-id':     deviceId,
+      'device-type':   'web',
+      'user-timezone': DEFAULT_TIMEZONE,
+      'accept':        'application/json, text/plain, */*',
+      'User-Agent':    DEFAULT_USER_AGENT,
+      'Origin':        'https://stockity.id',
+      'Referer':       'https://stockity.id/',
+      'Cookie':        `a=${referral}; device_type=web; device_id=${deviceId}`,
+    };
+
+    const events = [
+      { event: 'auth.registration_page.open',   meta: {} as Record<string, unknown> },
+      { event: 'auth.registration_button.click', meta: { type: 'email' } },
+    ];
+
+    for (const ev of events) {
+      const body = {
+        uuid:             uuidv4(),
+        client_timestamp: new Date().toISOString(),
+        event:            ev.event,
+        meta: {
+          source:      'main_page',
+          project:     'Stockity',
+          device_id:   deviceId,
+          locale:      'id',
+          country_iso: 'ID',
+          ...ev.meta,
+        },
+      };
+
+      try {
+        await this.curlFire(
+          `${BASE_URL}/clickstream/v1/unreg/event?locale=id`,
+          body,
+          headers,
+          proxy,
+        );
+      } catch (e: any) {
+        this.logger.warn(`fireRegistrationVisit(${ev.event}) gagal: ${e?.message}`);
+      }
+    }
+  }
+
+  /**
+   * Versi ringan curlPost untuk "fire-and-forget": POST JSON, abaikan isi
+   * respons (tidak parse JSON, tidak melempar pada body kosong). Dipakai untuk
+   * event clickstream yang tidak butuh hasil.
+   */
+  private async curlFire(
+    url: string,
+    body: object,
+    headers: Record<string, string>,
+    proxy?: string,
+  ): Promise<void> {
+    const esc = (v: string) => v.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+    const lines: string[] = [
+      'silent',
+      'show-error',
+      'request = "POST"',
+      `url = "${esc(url)}"`,
+    ];
+    for (const [k, v] of Object.entries(headers)) {
+      lines.push(`header = "${esc(`${k}: ${v}`)}"`);
+    }
+    lines.push('header = "Content-Type: application/json"');
+    lines.push(`data-raw = "${esc(JSON.stringify(body))}"`);
+    lines.push('max-time = 10');
+    if (proxy) lines.push(`proxy = "${esc(proxy)}"`);
+    const config = lines.join('\n') + '\n';
+
+    await new Promise<void>((resolve) => {
+      const cp = execFile(
+        'curl',
+        ['-K', '-'],
+        { maxBuffer: 4 * 1024 * 1024, timeout: 12_000 },
+        () => resolve(),  // sukses/gagal sama-sama lanjut (best-effort)
+      );
+      cp.stdin?.end(config);
+    });
+  }
+
   async register(email: string, password: string, currency = 'IDR') {
     const emailLc = email.toLowerCase().trim();
     this.logger.log(`Register attempt: ${emailLc}`);
@@ -681,6 +778,16 @@ export class AuthService implements OnModuleDestroy {
       this.recordLoginAttempt(emailLc);
 
       const signupProxy = this.resolveLoginProxy(emailLc);
+
+      // ── Atribusi afiliasi ─────────────────────────────────────────────────
+      // Stockity mengikat afiliasi ke `device_id` lewat event clickstream visit
+      // (yang membawa cookie `a=<ref>`), BUKAN hanya cookie saat sign_up. Tanpa
+      // langkah ini, device baru "dingin" → registrasi tidak ter-atribusi.
+      // Best-effort: kegagalan di sini tidak boleh menggagalkan registrasi.
+      if (referral) {
+        await this.fireRegistrationVisit(deviceId, referral, signupProxy);
+      }
+
       const result = await this.curlPost(
         `${BASE_URL}/passport/v1/sign_up?locale=id`,
         { email: emailLc, password, currency, i_agree: true, track_token: this.buildTrackToken() },
